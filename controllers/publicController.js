@@ -2,60 +2,39 @@ const ContactMessage = require('../models/ContactMessage');
 const JobPosting = require('../models/JobPosting');
 const JobApplication = require('../models/JobApplication');
 
-// Initial default jobs for auto-seeding MongoDB if collection is empty
-const INITIAL_JOBS = [
-  {
-    title: 'Frontend Developer',
-    department: 'Engineering',
-    location: 'Lahore, Pakistan',
-    employmentType: 'Full-Time',
-    experience: '2-4 Years',
-    description: 'We are seeking a skilled Frontend Developer proficient in React, Next.js, and TypeScript to build scalable enterprise CRM interfaces.',
-    requirements: ['2+ years React experience', 'State management & REST APIs', 'Responsive CSS & UI design'],
-    skills: ['React', 'Next.js', 'TypeScript', 'Tailwind/CSS'],
-    status: 'Open'
-  },
-  {
-    title: 'Backend Developer',
-    department: 'Engineering',
-    location: 'Lahore, Pakistan',
-    employmentType: 'Full-Time',
-    experience: '3-5 Years',
-    description: 'Looking for a Senior Backend Engineer to architect Node.js, Express, and MongoDB microservices for real-time CRM workflows.',
-    requirements: ['Strong Node.js & Express mastery', 'MongoDB schema design & indexing', 'JWT auth & security'],
-    skills: ['Node.js', 'Express', 'MongoDB', 'REST APIs'],
-    status: 'Open'
-  },
-  {
-    title: 'UI/UX Designer',
-    department: 'Design',
-    location: 'Lahore, Pakistan',
-    employmentType: 'Full-Time',
-    experience: '2-3 Years',
-    description: 'Join our design team to craft sleek SaaS user experiences, design tokens, interactive prototypes, and modern component systems.',
-    requirements: ['Proficiency in Figma & Adobe XD', 'SaaS application design portfolio', 'Design system maintenance'],
-    skills: ['Figma', 'Adobe XD', 'UI Design', 'Wireframing'],
-    status: 'Open'
-  },
-  {
-    title: 'HR Executive',
-    department: 'Human Resources',
-    location: 'Lahore, Pakistan',
-    employmentType: 'Full-Time',
-    experience: '1-3 Years',
-    description: 'Manage recruitment pipelines, employee onboarding, attendance tracking, and internal team engagement at NexusCRM.',
-    requirements: ['Degree in HR or business', 'Excellent verbal & written communication', 'Recruitment pipeline tracking'],
-    skills: ['HR Management', 'Communication', 'Recruitment', 'Onboarding'],
-    status: 'Open'
+// Helper validation functions
+const validateFormInput = ({ fullName, email, phone }) => {
+  const nameRegex = /^[A-Za-z\s]+$/;
+  if (fullName && !nameRegex.test(fullName.trim())) {
+    return 'Name must contain only alphabetic letters and spaces.';
   }
-];
 
-// POST /api/public/contact — Save contact form submission to MongoDB
+  const emailRegex = /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,})+$/;
+  if (email && !emailRegex.test(email.trim())) {
+    return 'Please provide a valid email address.';
+  }
+
+  if (phone && phone.trim() !== '') {
+    const phoneRegex = /^[0-9+\-\s]+$/;
+    if (!phoneRegex.test(phone.trim())) {
+      return 'Phone number can only contain numbers, +, - and spaces.';
+    }
+  }
+
+  return null;
+};
+
+// POST /api/public/contact
 const submitContact = async (req, res) => {
   try {
     const { fullName, email, company, phone, subject, message } = req.body;
     if (!fullName || !email || !message) {
       return res.status(400).json({ success: false, message: 'Full name, email, and message are required.' });
+    }
+
+    const validationError = validateFormInput({ fullName, email, phone });
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
     }
 
     const contact = await ContactMessage.create({
@@ -66,28 +45,27 @@ const submitContact = async (req, res) => {
       subject: subject ? subject.trim() : 'General Inquiry',
       message: message.trim()
     });
-
-    return res.status(201).json({
-      success: true,
-      message: 'Thank you! Your message has been received and saved.',
-      data: contact
-    });
+    return res.status(201).json({ success: true, message: 'Thank you! Your message has been received.', data: contact });
   } catch (error) {
     console.error('[Public Contact Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error submitting contact form.' });
   }
 };
 
-// POST /api/public/demo-request — Save demo request form to MongoDB
+// POST /api/public/demo-request
 const submitDemoRequest = async (req, res) => {
   try {
     const { fullName, email, company, phone, numEmployees, message } = req.body;
     if (!fullName || !email) {
-      return res.status(400).json({ success: false, message: 'Full name and email are required for demo requests.' });
+      return res.status(400).json({ success: false, message: 'Full name and email are required.' });
+    }
+
+    const validationError = validateFormInput({ fullName, email, phone });
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
     }
 
     const demoNotes = `[DEMO REQUEST] Employees: ${numEmployees || 'Not specified'}. Details: ${message || 'Personalized CRM Demo'}`;
-
     const contact = await ContactMessage.create({
       fullName: fullName.trim(),
       email: email.trim().toLowerCase(),
@@ -96,27 +74,18 @@ const submitDemoRequest = async (req, res) => {
       subject: 'Request a Demo',
       message: demoNotes
     });
-
-    return res.status(201).json({
-      success: true,
-      message: 'Demo request received successfully! Our sales team will reach out within 24 hours to schedule your demo.',
-      data: contact
-    });
+    return res.status(201).json({ success: true, message: 'Demo request received! Our team will reach out within 24 hours.', data: contact });
   } catch (error) {
     console.error('[Demo Request Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error submitting demo request.' });
   }
 };
 
-// GET /api/public/jobs — Fetch open job postings from MongoDB (auto-seeds defaults if empty)
+
+// GET /api/public/jobs — Public: only published Open jobs
 const getJobs = async (req, res) => {
   try {
-    let count = await JobPosting.countDocuments({ status: 'Open' });
-    if (count === 0) {
-      await JobPosting.insertMany(INITIAL_JOBS);
-    }
-
-    const jobs = await JobPosting.find({ status: 'Open' }).sort({ createdAt: -1 });
+    const jobs = await JobPosting.find({ isPublished: true, status: 'Open' }).sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: jobs.length, data: jobs });
   } catch (error) {
     console.error('[Get Jobs Error]:', error);
@@ -124,12 +93,103 @@ const getJobs = async (req, res) => {
   }
 };
 
-// POST /api/public/applications — Save job application to MongoDB
+// GET /api/public/jobs/all — HR/Admin: ALL jobs including drafts
+const getAllJobs = async (req, res) => {
+  try {
+    const jobs = await JobPosting.find()
+      .populate('createdBy', 'fullName email')
+      .sort({ createdAt: -1 });
+    return res.status(200).json({ success: true, count: jobs.length, data: jobs });
+  } catch (error) {
+    console.error('[Get All Jobs Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error retrieving job postings.' });
+  }
+};
+
+// POST /api/public/jobs — HR: Create a job posting
+const createJob = async (req, res) => {
+  try {
+    const { title, department, location, employmentType, experience, description, requirements, skills, salary, status, deadline, isPublished } = req.body;
+    if (!title || !department) {
+      return res.status(400).json({ success: false, message: 'Title and department are required.' });
+    }
+    const job = await JobPosting.create({
+      title: title.trim(),
+      department: department.trim(),
+      location: location || 'Lahore, Pakistan',
+      employmentType: employmentType || 'Full-Time',
+      experience: experience || '',
+      description: description || '',
+      requirements: Array.isArray(requirements) ? requirements.filter(r => r.trim()) : [],
+      skills: Array.isArray(skills) ? skills.filter(s => s.trim()) : [],
+      salary: salary || '',
+      status: status || 'Draft',
+      isPublished: isPublished === true || isPublished === 'true',
+      deadline: deadline || null,
+      createdBy: req.user?._id || null
+    });
+    return res.status(201).json({ success: true, message: 'Job posting created.', data: job });
+  } catch (error) {
+    console.error('[Create Job Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error creating job posting.' });
+  }
+};
+
+// PATCH /api/public/jobs/:id — HR: Edit / Publish / Unpublish a job
+const updateJob = async (req, res) => {
+  try {
+    const { title, department, location, employmentType, experience, description, requirements, skills, salary, status, deadline, isPublished } = req.body;
+    const job = await JobPosting.findById(req.params.id);
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job posting not found.' });
+    }
+
+    if (title !== undefined) job.title = title.trim();
+    if (department !== undefined) job.department = department.trim();
+    if (location !== undefined) job.location = location;
+    if (employmentType !== undefined) job.employmentType = employmentType;
+    if (experience !== undefined) job.experience = experience;
+    if (description !== undefined) job.description = description;
+    if (requirements !== undefined) job.requirements = Array.isArray(requirements) ? requirements.filter(r => r.trim()) : [];
+    if (skills !== undefined) job.skills = Array.isArray(skills) ? skills.filter(s => s.trim()) : [];
+    if (salary !== undefined) job.salary = salary;
+    if (status !== undefined) job.status = status;
+    if (deadline !== undefined) job.deadline = deadline || null;
+    if (isPublished !== undefined) job.isPublished = isPublished === true || isPublished === 'true';
+
+    await job.save();
+    return res.status(200).json({ success: true, message: 'Job posting updated.', data: job });
+  } catch (error) {
+    console.error('[Update Job Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating job posting.' });
+  }
+};
+
+// DELETE /api/public/jobs/:id — HR: Delete a job posting
+const deleteJob = async (req, res) => {
+  try {
+    const job = await JobPosting.findByIdAndDelete(req.params.id);
+    if (!job) {
+      return res.status(404).json({ success: false, message: 'Job posting not found.' });
+    }
+    return res.status(200).json({ success: true, message: 'Job posting deleted.' });
+  } catch (error) {
+    console.error('[Delete Job Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error deleting job posting.' });
+  }
+};
+
+// POST /api/public/applications — Public: Submit job application
 const submitJobApplication = async (req, res) => {
   try {
-    const { jobId, jobTitle, fullName, email, phone, resumeUrl, coverLetter } = req.body;
-    if (!fullName || !email || !resumeUrl || !jobTitle) {
-      return res.status(400).json({ success: false, message: 'Full name, email, resume link, and job title are required.' });
+    const { jobId, jobTitle, fullName, email, phone, resumeData, resumeFileName, resumeUrl, coverLetter } = req.body;
+
+    if (!fullName || !email || !jobTitle) {
+      return res.status(400).json({ success: false, message: 'Full name, email, and job title are required.' });
+    }
+
+    if (!resumeData && !resumeUrl) {
+      return res.status(400).json({ success: false, message: 'Please upload your resume or provide a resume link.' });
     }
 
     const application = await JobApplication.create({
@@ -138,46 +198,62 @@ const submitJobApplication = async (req, res) => {
       fullName: fullName.trim(),
       email: email.trim().toLowerCase(),
       phone: phone ? phone.trim() : '',
-      resumeUrl: resumeUrl.trim(),
+      resumeData: resumeData || '',
+      resumeFileName: resumeFileName || '',
+      resumeUrl: resumeUrl || '',
       coverLetter: coverLetter ? coverLetter.trim() : ''
     });
 
     return res.status(201).json({
       success: true,
-      message: 'Application submitted successfully! Our HR team will review your application shortly.',
-      data: application
+      message: 'Application submitted! Our HR team will review and contact you soon.',
+      data: { _id: application._id, fullName: application.fullName, jobTitle: application.jobTitle }
     });
   } catch (error) {
-    console.error('[Submit Job Application Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error submitting job application.' });
+    console.error('[Submit Application Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error submitting application.' });
   }
 };
 
-// POST /api/public/jobs — Create a job posting (HR use)
-const createJob = async (req, res) => {
+// PATCH /api/public/applications/:id — HR: Update application status / schedule interview
+const updateApplication = async (req, res) => {
   try {
-    const { title, department, location, employmentType, experience, description, requirements, skills, status } = req.body;
-    if (!title || !department) {
-      return res.status(400).json({ success: false, message: 'Title and department are required.' });
+    const { status, interviewDate, interviewTime, interviewNotes, interviewType } = req.body;
+    const app = await JobApplication.findById(req.params.id);
+    if (!app) {
+      return res.status(404).json({ success: false, message: 'Application not found.' });
     }
 
-    const job = await JobPosting.create({
-      title: title.trim(),
-      department: department.trim(),
-      location: location || 'Remote',
-      employmentType: employmentType || 'Full-Time',
-      experience: experience || '',
-      description: description || '',
-      requirements: Array.isArray(requirements) ? requirements : [],
-      skills: Array.isArray(skills) ? skills : [],
-      status: status || 'Open',
-      createdBy: req.user?._id || null
-    });
+    if (status !== undefined) app.status = status;
+    if (interviewDate !== undefined) app.interviewDate = interviewDate || null;
+    if (interviewTime !== undefined) app.interviewTime = interviewTime || '';
+    if (interviewNotes !== undefined) app.interviewNotes = interviewNotes || '';
+    if (interviewType !== undefined) app.interviewType = interviewType || '';
 
-    return res.status(201).json({ success: true, message: 'Job posting created.', data: job });
+    if (interviewDate && req.user?._id) {
+      app.interviewScheduledBy = req.user._id;
+      app.status = 'Interview Scheduled';
+    }
+
+    await app.save();
+    return res.status(200).json({ success: true, message: 'Application updated.', data: app });
   } catch (error) {
-    console.error('[Create Job Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error creating job posting.' });
+    console.error('[Update Application Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating application.' });
+  }
+};
+
+// DELETE /api/public/applications/:id — HR: Delete application
+const deleteApplication = async (req, res) => {
+  try {
+    const app = await JobApplication.findByIdAndDelete(req.params.id);
+    if (!app) {
+      return res.status(404).json({ success: false, message: 'Application not found.' });
+    }
+    return res.status(200).json({ success: true, message: 'Application deleted.' });
+  } catch (error) {
+    console.error('[Delete Application Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error deleting application.' });
   }
 };
 
@@ -191,13 +267,43 @@ const getContactMessages = async (req, res) => {
   }
 };
 
-// GET /api/public/applications — HR view all job applications
+// GET /api/public/applications — HR view all applications (without resumeData for performance)
 const getJobApplications = async (req, res) => {
   try {
-    const apps = await JobApplication.find().sort({ createdAt: -1 });
+    const { search, status, jobId } = req.query;
+    let query = {};
+    if (status && status !== 'All') query.status = status;
+    if (jobId) query.jobId = jobId;
+
+    let apps = await JobApplication.find(query)
+      .select('-resumeData')   // Exclude large Base64 from list view
+      .sort({ createdAt: -1 });
+
+    if (search && search.trim()) {
+      const term = search.trim().toLowerCase();
+      apps = apps.filter(a =>
+        (a.fullName || '').toLowerCase().includes(term) ||
+        (a.email || '').toLowerCase().includes(term) ||
+        (a.jobTitle || '').toLowerCase().includes(term)
+      );
+    }
+
     return res.status(200).json({ success: true, count: apps.length, data: apps });
   } catch (error) {
-    return res.status(500).json({ success: false, message: 'Server error retrieving job applications.' });
+    return res.status(500).json({ success: false, message: 'Server error retrieving applications.' });
+  }
+};
+
+// GET /api/public/applications/:id — HR view single application (WITH resumeData)
+const getJobApplicationById = async (req, res) => {
+  try {
+    const app = await JobApplication.findById(req.params.id);
+    if (!app) {
+      return res.status(404).json({ success: false, message: 'Application not found.' });
+    }
+    return res.status(200).json({ success: true, data: app });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error retrieving application.' });
   }
 };
 
@@ -205,8 +311,14 @@ module.exports = {
   submitContact,
   submitDemoRequest,
   getJobs,
-  submitJobApplication,
+  getAllJobs,
   createJob,
+  updateJob,
+  deleteJob,
+  submitJobApplication,
+  updateApplication,
+  deleteApplication,
   getContactMessages,
-  getJobApplications
+  getJobApplications,
+  getJobApplicationById
 };

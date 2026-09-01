@@ -100,10 +100,31 @@ const updateProfile = async (req, res) => {
         });
       }
 
-      if (newPassword.length < 6) {
+      if (newPassword.length < 8) {
         return res.status(400).json({
           success: false,
-          message: 'New password must be at least 6 characters long.'
+          message: 'New password must be at least 8 characters long.'
+        });
+      }
+
+      if (!/[A-Z]/.test(newPassword)) {
+        return res.status(400).json({
+          success: false,
+          message: 'New password must contain at least one uppercase letter.'
+        });
+      }
+
+      if (!/[0-9]/.test(newPassword)) {
+        return res.status(400).json({
+          success: false,
+          message: 'New password must contain at least one number.'
+        });
+      }
+
+      if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(newPassword)) {
+        return res.status(400).json({
+          success: false,
+          message: 'New password must contain at least one special character.'
         });
       }
 

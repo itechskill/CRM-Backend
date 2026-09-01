@@ -3,7 +3,8 @@ const router = express.Router();
 const {
   getClients, createClient, deleteClient,
   getDeals, createDeal, updateDeal, deleteDeal,
-  getLeads, createLead, updateLead, deleteLead
+  getLeads, createLead, updateLead, deleteLead,
+  getSalesContacts, createSalesContact, deleteSalesContact
 } = require('../controllers/crmController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -17,5 +18,8 @@ router.route('/deals/:id').patch(updateDeal).delete(deleteDeal);
 
 router.route('/leads').get(getLeads).post(createLead);
 router.route('/leads/:id').patch(updateLead).delete(deleteLead);
+
+router.route('/contacts').get(getSalesContacts).post(createSalesContact);
+router.route('/contacts/:id').delete(deleteSalesContact);
 
 module.exports = router;

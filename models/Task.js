@@ -18,6 +18,14 @@ const TaskSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  assignedToRole: {
+    type: String,
+    default: ''   // e.g. 'hr_manager', 'sales_manager', 'project_manager', 'accountant', 'marketing', 'administration', 'employee'
+  },
+  assignedByName: {
+    type: String,
+    default: ''   // Display name of creator (e.g. 'CEO', 'Project Manager name')
+  },
   status: {
     type: String,
     enum: ['Pending', 'In Progress', 'Under Review', 'Completed', 'Cancelled'],
@@ -33,7 +41,7 @@ const TaskSchema = new mongoose.Schema({
   },
   category: {
     type: String,
-    default: 'Development'
+    default: 'General'
   },
   description: {
     type: String,
@@ -42,6 +50,10 @@ const TaskSchema = new mongoose.Schema({
   hoursLogged: {
     type: Number,
     default: 0
+  },
+  completionReport: {
+    type: String,
+    default: ''
   },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,

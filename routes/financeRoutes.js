@@ -12,7 +12,11 @@ const {
   getPayroll,
   updatePayroll,
   deletePayroll,
-  getFinanceSummary
+  getFinanceSummary,
+  getMaintenanceCharges,
+  createMaintenanceCharge,
+  updateMaintenanceCharge,
+  deleteMaintenanceCharge
 } = require('../controllers/financeController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -25,5 +29,7 @@ router.route('/expenses').get(getExpenses).post(createExpense);
 router.route('/expenses/:id').patch(updateExpense).delete(deleteExpense);
 router.route('/payroll').get(getPayroll);
 router.route('/payroll/:id').patch(updatePayroll).delete(deletePayroll);
+router.route('/maintenance').get(getMaintenanceCharges).post(createMaintenanceCharge);
+router.route('/maintenance/:id').patch(updateMaintenanceCharge).delete(deleteMaintenanceCharge);
 
 module.exports = router;

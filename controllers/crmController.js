@@ -1,7 +1,9 @@
 const Client = require('../models/Client');
 const Deal = require('../models/Deal');
 const Lead = require('../models/Lead');
+const SalesContact = require('../models/SalesContact');
 const { notifyRoleHelper } = require('./notificationController');
+
 
 // CLIENTS API
 const getClients = async (req, res) => {
@@ -239,6 +241,49 @@ const deleteLead = async (req, res) => {
   }
 };
 
+// SALES CONTACTS API
+const getSalesContacts = async (req, res) => {
+  try {
+    const contacts = await SalesContact.find().sort({ createdAt: -1 });
+    return res.status(200).json({ success: true, count: contacts.length, data: contacts });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error retrieving contacts.' });
+  }
+};
+
+const createSalesContact = async (req, res) => {
+  try {
+    const { name, role, company, email, phone, tags, notes, nextFollowUp } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Contact name is required.' });
+
+    const contact = await SalesContact.create({
+      name: name.trim(),
+      role: role ? role.trim() : '',
+      company: company ? company.trim() : '',
+      email: email ? email.trim() : '',
+      phone: phone ? phone.trim() : '',
+      tags: Array.isArray(tags) ? tags : (tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : []),
+      notes: notes || '',
+      nextFollowUp: nextFollowUp || null,
+      createdBy: req.user._id
+    });
+
+    return res.status(201).json({ success: true, message: 'Contact created successfully.', data: contact });
+  } catch (error) {
+    console.error('[Create SalesContact Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error creating contact.' });
+  }
+};
+
+const deleteSalesContact = async (req, res) => {
+  try {
+    await SalesContact.findByIdAndDelete(req.params.id);
+    return res.status(200).json({ success: true, message: 'Contact deleted successfully.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error deleting contact.' });
+  }
+};
+
 module.exports = {
   getClients,
   createClient,
@@ -250,5 +295,8 @@ module.exports = {
   getLeads,
   createLead,
   updateLead,
-  deleteLead
+  deleteLead,
+  getSalesContacts,
+  createSalesContact,
+  deleteSalesContact
 };

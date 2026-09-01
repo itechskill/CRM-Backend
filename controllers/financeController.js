@@ -2,6 +2,7 @@ const Invoice = require('../models/Invoice');
 const Expense = require('../models/Expense');
 const Payroll = require('../models/Payroll');
 const User = require('../models/User');
+const MaintenanceCharge = require('../models/MaintenanceCharge');
 
 // INVOICES API
 const getInvoices = async (req, res) => {
@@ -283,6 +284,72 @@ const getFinanceSummary = async (req, res) => {
   }
 };
 
+// MAINTENANCE CHARGES API
+const getMaintenanceCharges = async (req, res) => {
+  try {
+    const charges = await MaintenanceCharge.find().sort({ createdAt: -1 });
+    return res.status(200).json({ success: true, count: charges.length, data: charges });
+  } catch (error) {
+    console.error('[Get Maintenance Charges Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error retrieving maintenance charges.' });
+  }
+};
+
+const createMaintenanceCharge = async (req, res) => {
+  try {
+    const { name, maintenanceType, description, amount, dueDate, status } = req.body;
+    if (!name || !amount || !dueDate) {
+      return res.status(400).json({ success: false, message: 'Name, amount, and due date are required.' });
+    }
+
+    const charge = await MaintenanceCharge.create({
+      name: name.trim(),
+      maintenanceType: maintenanceType || 'Building Maintenance',
+      description: description || '',
+      amount: Number(amount),
+      dueDate,
+      status: status || 'Pending',
+      createdBy: req.user._id,
+      createdByName: req.user.fullName
+    });
+
+    return res.status(201).json({ success: true, message: 'Maintenance charge created successfully.', data: charge });
+  } catch (error) {
+    console.error('[Create Maintenance Charge Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error creating maintenance charge.' });
+  }
+};
+
+const updateMaintenanceCharge = async (req, res) => {
+  try {
+    const charge = await MaintenanceCharge.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    );
+    if (!charge) {
+      return res.status(404).json({ success: false, message: 'Maintenance charge not found.' });
+    }
+    return res.status(200).json({ success: true, message: 'Maintenance charge updated successfully.', data: charge });
+  } catch (error) {
+    console.error('[Update Maintenance Charge Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating maintenance charge.' });
+  }
+};
+
+const deleteMaintenanceCharge = async (req, res) => {
+  try {
+    const charge = await MaintenanceCharge.findByIdAndDelete(req.params.id);
+    if (!charge) {
+      return res.status(404).json({ success: false, message: 'Maintenance charge not found.' });
+    }
+    return res.status(200).json({ success: true, message: 'Maintenance charge deleted successfully.' });
+  } catch (error) {
+    console.error('[Delete Maintenance Charge Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error deleting maintenance charge.' });
+  }
+};
+
 module.exports = {
   getInvoices,
   createInvoice,
@@ -295,5 +362,9 @@ module.exports = {
   getPayroll,
   updatePayroll,
   deletePayroll,
-  getFinanceSummary
+  getFinanceSummary,
+  getMaintenanceCharges,
+  createMaintenanceCharge,
+  updateMaintenanceCharge,
+  deleteMaintenanceCharge
 };

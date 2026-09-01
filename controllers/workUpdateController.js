@@ -22,7 +22,7 @@ const getWorkUpdates = async (req, res) => {
 // POST /api/work-updates
 const createWorkUpdate = async (req, res) => {
   try {
-    const { project, task, hoursSpent, summary } = req.body;
+    const { project, task, hoursSpent, summary, planned, blockers } = req.body;
 
     if (!hoursSpent || !summary || summary.trim() === '') {
       return res.status(400).json({ success: false, message: 'Hours spent and summary are required.' });
@@ -35,6 +35,8 @@ const createWorkUpdate = async (req, res) => {
       task: task ? task.trim() : '',
       hoursSpent: Number(hoursSpent),
       summary: summary.trim(),
+      planned: planned ? planned.trim() : '',
+      blockers: blockers ? blockers.trim() : '',
       date: req.body.date || new Date(),
       status: 'Submitted'
     });

@@ -29,6 +29,14 @@ const WorkUpdateSchema = new mongoose.Schema({
     required: [true, 'Work summary is required'],
     trim: true
   },
+  planned: {
+    type: String,
+    default: ''
+  },
+  blockers: {
+    type: String,
+    default: ''
+  },
   date: {
     type: Date,
     default: Date.now

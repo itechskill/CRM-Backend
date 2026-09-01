@@ -27,7 +27,26 @@ const createNotificationHelper = async ({ recipient, sender, title, message, typ
  */
 const notifyRoleHelper = async ({ role, sender, title, message, type = 'system', link = '' }) => {
   try {
-    const users = await User.find({ role, status: 'active' }).select('_id');
+    const roleMap = {
+      hr_manager: ['hr_manager', 'hr', 'human_resources'],
+      accountant: ['accountant', 'finance', 'accounting'],
+      sales_manager: ['sales_manager', 'sales'],
+      project_manager: ['project_manager', 'project'],
+      marketing: ['marketing'],
+      administration: ['administration', 'admin'],
+      employee: ['employee']
+    };
+    const targetRoles = roleMap[role] || [role];
+    const deptKeyword = role.replace('_manager', '').replace('_', ' ');
+
+    const users = await User.find({
+      $or: [
+        { role: { $in: targetRoles } },
+        { department: { $regex: new RegExp(deptKeyword, 'i') } }
+      ],
+      status: 'active'
+    }).select('_id');
+
     const notifications = users.map(u => ({
       recipient: u._id,
       sender: sender || null,
@@ -37,6 +56,7 @@ const notifyRoleHelper = async ({ role, sender, title, message, type = 'system',
       link,
       isRead: false
     }));
+
     if (notifications.length > 0) {
       await Notification.insertMany(notifications);
     }

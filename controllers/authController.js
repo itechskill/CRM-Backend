@@ -2,6 +2,7 @@ const User = require('../models/User');
 const generateToken = require('../utils/generateToken');
 const crypto = require('crypto');
 const logAudit = require('../utils/auditLogger');
+const sendEmail = require('../utils/sendEmail');
 
 const PUBLIC_REGISTRATION_ROLES = [
   'administration',
@@ -321,7 +322,7 @@ const getMe = async (req, res) => {
 };
 
 /**
- * @desc    Forgot Password Request (Generate Secure Reset Token)
+ * @desc    Forgot Password Request (Generate Secure Reset Token & Send Email)
  * @route   POST /api/auth/forgot-password
  * @access  Public
  */
@@ -332,42 +333,64 @@ const forgotPassword = async (req, res) => {
     if (!email) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide an email address.'
+        message: 'Please enter your email address.'
+      });
+    }
+
+    const emailRegex = /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,})+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please enter a valid email address.'
       });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
     const user = await User.findOne({ email: normalizedEmail });
 
-    // Generic success response to prevent user email enumeration
-    const genericSuccessResponse = {
-      success: true,
-      message: 'If an account with that email exists, password reset instructions have been generated.'
-    };
-
     if (!user) {
-      return res.status(200).json(genericSuccessResponse);
+      return res.status(404).json({
+        success: false,
+        message: 'No registered account found with this email address.'
+      });
     }
 
-    // Generate unhashed random reset token
+    // Generate cryptographically secure random token (32 bytes = 64 hex chars)
     const resetToken = crypto.randomBytes(32).toString('hex');
 
-    // Hash token and store in resetPasswordToken field in DB
+    // Hash token with SHA-256 and store in resetPasswordToken field in DB
     user.resetPasswordToken = crypto
       .createHash('sha256')
       .update(resetToken)
       .digest('hex');
 
-    // Expiration set to 15 minutes
+    // Expiration set to exactly 15 minutes
     user.resetPasswordExpire = Date.now() + 15 * 60 * 1000;
 
     await user.save();
 
-    console.log(`[Password Reset Token Generated for ${user.email}]: ${resetToken}`);
+    // Construct secure reset link
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const resetLink = `${frontendUrl}/reset-password/${resetToken}`;
+
+    // Send email using Nodemailer
+    await sendEmail({
+      to: user.email,
+      subject: 'NexusCRM - Password Reset Request',
+      resetLink
+    });
+
+    await logAudit({
+      action: 'Password Reset Requested',
+      targetUser: user._id,
+      targetUserName: user.fullName,
+      details: `Password reset link requested for email: ${user.email}`
+    });
 
     return res.status(200).json({
-      ...genericSuccessResponse,
-      resetToken
+      success: true,
+      message: 'Password reset link has been sent to your email address.',
+      resetToken // returned for convenience in dev/testing environments
     });
   } catch (error) {
     console.error('[Forgot Password Error]:', error);
@@ -388,28 +411,40 @@ const resetPassword = async (req, res) => {
     const { password, confirmPassword } = req.body;
     const { token } = req.params;
 
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reset token is required.'
+      });
+    }
+
     if (!password || !confirmPassword) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide both password and confirmPassword.'
+        message: 'Please provide both new password and confirm password.'
       });
     }
 
     if (password !== confirmPassword) {
       return res.status(400).json({
         success: false,
-        message: 'Password and confirmPassword do not match.'
+        message: 'Confirm Password must exactly match New Password.'
       });
     }
 
-    if (password.length < 6) {
+    // Validate password according to existing CRM password requirements:
+    // Minimum 8 characters, at least one uppercase letter, at least one special character
+    const hasUppercase = /[A-Z]/.test(password);
+    const hasSpecial = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password);
+
+    if (password.length < 8 || !hasUppercase || !hasSpecial) {
       return res.status(400).json({
         success: false,
-        message: 'Password must be at least 6 characters long.'
+        message: 'Password must be at least 8 characters long and contain at least one uppercase letter and one special character.'
       });
     }
 
-    // Hash candidate token from URL parameter
+    // Hash incoming token parameter using SHA-256 to compare with database
     const hashedToken = crypto
       .createHash('sha256')
       .update(token)
@@ -424,22 +459,29 @@ const resetPassword = async (req, res) => {
     if (!user) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid or expired password reset token.'
+        message: 'Invalid or expired password reset link. Please request a new link.'
       });
     }
 
     // Update password (pre-save hook will hash with bcrypt!)
     user.password = password;
 
-    // Invalidate token (single-use token)
+    // Immediately clear reset token and expiration date to prevent token reuse
     user.resetPasswordToken = undefined;
     user.resetPasswordExpire = undefined;
 
     await user.save();
 
+    await logAudit({
+      action: 'Password Reset Completed',
+      targetUser: user._id,
+      targetUserName: user.fullName,
+      details: `Password updated successfully for ${user.email}`
+    });
+
     return res.status(200).json({
       success: true,
-      message: 'Password reset successful. You can now log in with your new password.'
+      message: 'Password updated successfully.'
     });
   } catch (error) {
     console.error('[Reset Password Error]:', error);
@@ -449,6 +491,7 @@ const resetPassword = async (req, res) => {
     });
   }
 };
+
 
 module.exports = {
   registerUser,
