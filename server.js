@@ -107,9 +107,9 @@ app.get('/', (req, res) => {
   });
 });
 
-// Start Server
+// Start Server for local development (Vercel manages the HTTP wrapper automatically)
 const PORT = process.env.PORT || 5000;
-if (process.env.NODE_ENV !== 'test') {
+if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
   app.listen(PORT, () => {
     console.log(`[Express] CRM Backend Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
   });
