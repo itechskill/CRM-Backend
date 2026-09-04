@@ -4,7 +4,8 @@ const {
   getClients, createClient, deleteClient,
   getDeals, createDeal, updateDeal, deleteDeal,
   getLeads, createLead, updateLead, deleteLead,
-  getSalesContacts, createSalesContact, deleteSalesContact
+  getSalesContacts, createSalesContact, deleteSalesContact,
+  getSalesSummary
 } = require('../controllers/crmController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -21,5 +22,7 @@ router.route('/leads/:id').patch(updateLead).delete(deleteLead);
 
 router.route('/contacts').get(getSalesContacts).post(createSalesContact);
 router.route('/contacts/:id').delete(deleteSalesContact);
+
+router.route('/sales-summary').get(getSalesSummary);
 
 module.exports = router;

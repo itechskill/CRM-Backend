@@ -57,6 +57,15 @@ const userSchema = new mongoose.Schema(
       trim: true,
       default: ''
     },
+    position: {
+      type: String,
+      trim: true,
+      default: ''
+    },
+    salaryTarget: {
+      type: Number,
+      default: 0
+    },
     profileImage: {
       type: String,
       default: ''

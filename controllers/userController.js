@@ -1,4 +1,16 @@
 const User = require('../models/User');
+const Lead = require('../models/Lead');
+const Deal = require('../models/Deal');
+const Client = require('../models/Client');
+const Project = require('../models/Project');
+const Task = require('../models/Task');
+const Leave = require('../models/Leave');
+const JobApplication = require('../models/JobApplication');
+const Invoice = require('../models/Invoice');
+const Expense = require('../models/Expense');
+const Campaign = require('../models/Campaign');
+const CompanyResource = require('../models/CompanyResource');
+const Notification = require('../models/Notification');
 
 /**
  * @desc    Get current user profile
@@ -80,7 +92,8 @@ const updateProfile = async (req, res) => {
     }
 
     if (profileImage !== undefined) {
-      user.profileImage = profileImage.trim();
+      // Allow empty string to remove profile photo
+      user.profileImage = typeof profileImage === 'string' ? profileImage.trim() : '';
     }
 
     // Optional password change
@@ -175,9 +188,98 @@ const getAllUsers = async (req, res) => {
   }
 };
 
+/**
+ * @desc    Get aggregated live sidebar counts across all portals
+ * @route   GET /api/users/sidebar-counts
+ * @access  Private
+ */
+const getSidebarCounts = async (req, res) => {
+  try {
+    const userId = req.user?._id;
+
+    const [
+      usersCount,
+      employeesCount,
+      pendingRegistrationsCount,
+      pendingLeavesCount,
+      jobAppsCount,
+      leadsCount,
+      dealsCount,
+      wonDealsCount,
+      projectsCount,
+      activeProjectsCount,
+      tasksCount,
+      pendingTasksCount,
+      clientsCount,
+      resourcesCount,
+      invoicesCount,
+      expensesCount,
+      activeCampaignsCount,
+      notificationsCount,
+      proposalsCount,
+      meetingsCount
+    ] = await Promise.all([
+      User.countDocuments({ isApproved: true }),
+      User.countDocuments({ isApproved: true, role: { $ne: 'admin' } }),
+      User.countDocuments({ isApproved: false, status: 'pending' }),
+      Leave.countDocuments({ status: 'Pending' }),
+      JobApplication.countDocuments(),
+      Lead.countDocuments(),
+      Deal.countDocuments(),
+      Deal.countDocuments({ stage: { $in: ['Closed Won', 'Won'] } }),
+      Project.countDocuments(),
+      Project.countDocuments({ status: { $in: ['In Progress', 'Active', 'Ongoing'] } }),
+      Task.countDocuments(),
+      Task.countDocuments({ status: { $ne: 'Completed' } }),
+      Client.countDocuments(),
+      CompanyResource.countDocuments(),
+      Invoice ? Invoice.countDocuments() : Promise.resolve(0),
+      Expense ? Expense.countDocuments() : Promise.resolve(0),
+      Campaign ? Campaign.countDocuments({ status: { $in: ['Active', 'Running', 'Ongoing'] } }) : Promise.resolve(0),
+      userId ? Notification.countDocuments({ recipient: userId, isRead: false }) : Promise.resolve(0),
+      Deal.countDocuments({ stage: 'Proposal' }),
+      Deal.countDocuments({ stage: { $in: ['Negotiation', 'Proposal'] } })
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        users: usersCount,
+        employees: employeesCount || usersCount,
+        pendingRegistrations: pendingRegistrationsCount,
+        pendingLeaves: pendingLeavesCount,
+        jobApplications: jobAppsCount,
+        leads: leadsCount,
+        deals: dealsCount,
+        wonDeals: wonDealsCount,
+        projects: projectsCount,
+        activeProjects: activeProjectsCount,
+        tasks: tasksCount,
+        pendingTasks: pendingTasksCount,
+        clients: clientsCount,
+        resources: resourcesCount,
+        invoices: invoicesCount,
+        expenses: expensesCount,
+        activeCampaigns: activeCampaignsCount,
+        notifications: notificationsCount,
+        proposals: proposalsCount,
+        meetings: meetingsCount
+      }
+    });
+  } catch (error) {
+    console.error('[Get Sidebar Counts Error]:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error retrieving sidebar counts.'
+    });
+  }
+};
+
 module.exports = {
   getProfile,
   updateProfile,
-  getAllUsers
+  getAllUsers,
+  getSidebarCounts
 };
+
 

@@ -284,6 +284,120 @@ const deleteSalesContact = async (req, res) => {
   }
 };
 
+// GET /api/crm/sales-summary — Real Sales Manager Dashboard Data
+const getSalesSummary = async (req, res) => {
+  try {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5);
+    sixMonthsAgo.setDate(1);
+
+    const [leads, deals, clients] = await Promise.all([
+      Lead.find().populate('assignedTo', 'fullName').lean(),
+      Deal.find().lean(),
+      Client.countDocuments()
+    ]);
+
+    const totalLeads = leads.length;
+    const qualifiedLeads = leads.filter(l => ['Qualified', 'Converted', 'Won'].includes(l.status)).length;
+    const wonDeals = deals.filter(d => ['Closed Won', 'Won'].includes(d.stage)).length;
+    const pipelineValue = deals
+      .filter(d => !['Closed Won', 'Closed Lost', 'Won', 'Lost'].includes(d.stage))
+      .reduce((sum, d) => sum + (d.value || 0), 0);
+
+    // Monthly revenue from won deals this month
+    const monthlyRevenue = deals
+      .filter(d => ['Closed Won', 'Won'].includes(d.stage) && new Date(d.updatedAt) >= startOfMonth)
+      .reduce((sum, d) => sum + (d.value || 0), 0);
+
+    // Conversion rate: converted/total leads
+    const convertedLeads = leads.filter(l => ['Converted', 'Won'].includes(l.status)).length;
+    const conversionRate = totalLeads > 0 ? ((convertedLeads / totalLeads) * 100).toFixed(1) : 0;
+
+    // Lead sources breakdown
+    const sourceCounts = {};
+    const sourceColors = { Website: '#2563EB', Referral: '#10B981', 'Social Media': '#F59E0B', LinkedIn: '#0A66C2', Email: '#EC4899', 'Cold Outreach': '#8B5CF6', 'Trade Show': '#F97316', Other: '#94A3B8' };
+    leads.forEach(l => {
+      const src = l.source || 'Other';
+      sourceCounts[src] = (sourceCounts[src] || 0) + 1;
+    });
+    const leadSourcesData = Object.entries(sourceCounts).map(([name, value]) => ({
+      name, value, color: sourceColors[name] || '#64748B'
+    }));
+
+    // Revenue by month (last 6 months, from won deals)
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const revenueByMonth = {};
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date();
+      d.setMonth(d.getMonth() - i);
+      const key = `${d.getFullYear()}-${d.getMonth()}`;
+      revenueByMonth[key] = { month: monthNames[d.getMonth()], actual: 0, target: 200 };
+    }
+    deals
+      .filter(d => ['Closed Won', 'Won'].includes(d.stage))
+      .forEach(d => {
+        const date = new Date(d.updatedAt || d.createdAt);
+        const key = `${date.getFullYear()}-${date.getMonth()}`;
+        if (revenueByMonth[key]) {
+          revenueByMonth[key].actual += Math.round((d.value || 0) / 1000);
+        }
+      });
+    const revenueData = Object.values(revenueByMonth);
+
+    // Pipeline stages grouped by deal stage
+    const stageConfig = [
+      { id: 'Qualification', label: 'QUALIFICATION', headerBg: '#F8FAFC', headerColor: '#334155', badgeBg: '#0F172A' },
+      { id: 'Proposal', label: 'PROPOSAL', headerBg: '#EFF6FF', headerColor: '#1D4ED8', badgeBg: '#2563EB' },
+      { id: 'Negotiation', label: 'NEGOTIATION', headerBg: '#F5F3FF', headerColor: '#7C3AED', badgeBg: '#8B5CF6' },
+      { id: 'Closed Won', label: 'CLOSED WON', headerBg: '#F0FDF4', headerColor: '#15803D', badgeBg: '#16A34A' },
+    ];
+    const activePipelineDeals = deals.filter(d => !['Closed Lost', 'Lost'].includes(d.stage));
+    const pipelineStages = stageConfig.map(stage => {
+      const stageDeals = activePipelineDeals.filter(d => d.stage === stage.id || (stage.id === 'Qualification' && !['Proposal', 'Negotiation', 'Closed Won', 'Won'].includes(d.stage)));
+      return {
+        ...stage,
+        count: stageDeals.length,
+        pipelineValue: `$${Math.round(stageDeals.reduce((s, d) => s + (d.value || 0), 0) / 1000)}k`,
+        deals: stageDeals.slice(0, 4).map(d => ({
+          name: d.clientName || d.title,
+          company: d.clientName || '',
+          value: `$${Math.round((d.value || 0) / 1000)}k`,
+          priority: (d.value || 0) >= 100000 ? 'High' : (d.value || 0) >= 50000 ? 'Medium' : 'Low',
+          initials: (d.clientName || d.title || '').split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase()
+        }))
+      };
+    });
+
+    // Meetings scheduled (from meetings if model exists)
+    const meetingsScheduled = deals.filter(d => d.stage === 'Negotiation' || d.stage === 'Proposal').length;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        kpis: {
+          totalLeads,
+          qualifiedLeads,
+          meetingsScheduled,
+          proposalsSent: deals.filter(d => d.stage === 'Proposal').length,
+          wonClients: wonDeals,
+          conversionRate: `${conversionRate}%`,
+          monthlyRevenue,
+          pipelineValue
+        },
+        revenueData,
+        leadSourcesData,
+        pipelineStages,
+        totalClients: clients
+      }
+    });
+  } catch (error) {
+    console.error('[Sales Summary Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching sales summary.' });
+  }
+};
+
 module.exports = {
   getClients,
   createClient,
@@ -298,5 +412,6 @@ module.exports = {
   deleteLead,
   getSalesContacts,
   createSalesContact,
-  deleteSalesContact
+  deleteSalesContact,
+  getSalesSummary
 };

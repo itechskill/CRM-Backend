@@ -254,8 +254,11 @@ const loginUser = async (req, res) => {
     const token = generateToken(user._id, user.role);
 
     // 6. Update lastLogin timestamp
-    user.lastLogin = new Date();
-    await user.save();
+    try {
+      await User.findByIdAndUpdate(user._id, { lastLogin: new Date() });
+    } catch (saveErr) {
+      console.warn('[Login lastLogin update warn]:', saveErr.message);
+    }
 
     await logAudit({
       action: 'User Logged In',

@@ -146,10 +146,39 @@ const requirePermission = (permission) => {
   };
 };
 
+/**
+ * Middleware to restrict access based on user department.
+ * Used to enforce Sales-only API endpoints for sales employees.
+ * e.g., requireDepartment('Sales')
+ */
+const requireDepartment = (department) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Not authorized. User context missing.'
+      });
+    }
+
+    const userDept = (req.user.department || '').toLowerCase().trim();
+    const requiredDept = department.toLowerCase().trim();
+
+    if (userDept !== requiredDept) {
+      return res.status(403).json({
+        success: false,
+        message: `Access denied. This resource is only available to the ${department} department.`
+      });
+    }
+
+    next();
+  };
+};
+
 module.exports = {
   ROLES,
   PERMISSIONS,
   ROLE_PERMISSIONS,
   requireRole,
-  requirePermission
+  requirePermission,
+  requireDepartment
 };

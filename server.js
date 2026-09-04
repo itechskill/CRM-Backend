@@ -17,6 +17,8 @@ const marketingRoutes = require('./routes/marketingRoutes');
 const resourceRoutes = require('./routes/resourceRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const publicRoutes = require('./routes/publicRoutes');
+const salesEmployeeRoutes = require('./routes/salesEmployeeRoutes');
+const salesManagerTeamRoutes = require('./routes/salesManagerTeamRoutes');
 
 // Load environment variables
 dotenv.config();
@@ -27,20 +29,56 @@ connectDB();
 const app = express();
 
 // Configure CORS for React frontend communication
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:3000',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:5174'
-  ],
-  credentials: true
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    
+    // Allow localhost, configured FRONTEND_URL, and any *.vercel.app deployment
+    if (
+      allowedOrigins.includes(origin) ||
+      origin.endsWith('.vercel.app') ||
+      process.env.NODE_ENV !== 'production'
+    ) {
+      return callback(null, true);
+    }
+    
+    return callback(null, true); // Allow all origins for API access
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Body Parser Middleware
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ limit: '25mb', extended: true }));
+
+// Ensure MongoDB connection for Serverless environments (Vercel)
+app.use(async (req, res, next) => {
+  if (req.path === '/api/health' || req.path === '/') {
+    return next();
+  }
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    console.error('[DB Middleware Error]:', err.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Database connection failed. Please verify MongoDB connection string and network access whitelist.'
+    });
+  }
+});
 
 // Routes
 app.use('/api', healthRoutes);
@@ -58,6 +96,8 @@ app.use('/api/marketing', marketingRoutes);
 app.use('/api/administration', resourceRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/public', publicRoutes);
+app.use('/api/sales-employee', salesEmployeeRoutes);
+app.use('/api/sales-manager', salesManagerTeamRoutes);
 
 // Root Fallback Route
 app.get('/', (req, res) => {
@@ -69,6 +109,10 @@ app.get('/', (req, res) => {
 
 // Start Server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`[Express] CRM Backend Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`[Express] CRM Backend Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
+  });
+}
+
+module.exports = app;

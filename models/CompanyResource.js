@@ -8,8 +8,8 @@ const CompanyResourceSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['Document', 'Policy', 'Software', 'Template', 'Asset', 'Other'],
-    default: 'Document'
+    enum: ['Hardware', 'Document', 'Policy', 'Software', 'Template', 'Asset', 'Other'],
+    default: 'Hardware'
   },
   link: {
     type: String,

@@ -96,11 +96,12 @@ const authorize = (...roles) => {
   };
 };
 
-const { requireRole, requirePermission } = require('./roleMiddleware');
+const { requireRole, requirePermission, requireDepartment } = require('./roleMiddleware');
 
 module.exports = {
   protect,
   authorize,
   requireRole,
-  requirePermission
+  requirePermission,
+  requireDepartment
 };

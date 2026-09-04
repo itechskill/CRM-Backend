@@ -1,6 +1,7 @@
 const ContactMessage = require('../models/ContactMessage');
 const JobPosting = require('../models/JobPosting');
 const JobApplication = require('../models/JobApplication');
+const sendEmail = require('../utils/sendEmail');
 
 // Helper validation functions
 const validateFormInput = ({ fullName, email, phone }) => {
@@ -236,6 +237,50 @@ const updateApplication = async (req, res) => {
     }
 
     await app.save();
+
+    // Send interview notification email to applicant
+    if (interviewDate && app.email) {
+      const formattedDate = new Date(interviewDate).toLocaleDateString('en-US', {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+      });
+      const timeStr = interviewTime ? ` at ${interviewTime}` : '';
+      const typeStr = interviewType ? ` (${interviewType})` : '';
+
+      await sendEmail({
+        to: app.email,
+        subject: `Interview Scheduled — ${app.jobTitle} at NexusCRM`,
+        html: `
+          <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E2E8F0; border-radius: 8px; background-color: #FFFFFF;">
+            <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #F1F5F9;">
+              <h2 style="color: #2563EB; margin: 0;">NexusCRM — Interview Invitation</h2>
+              <p style="color: #64748B; font-size: 14px; margin-top: 4px;">Human Resources Department</p>
+            </div>
+            <div style="padding: 24px 0;">
+              <p style="color: #475569; font-size: 15px; line-height: 1.6;">Dear <strong>${app.fullName}</strong>,</p>
+              <p style="color: #475569; font-size: 15px; line-height: 1.6;">
+                We are pleased to invite you for an interview for the position of <strong>${app.jobTitle}</strong>.
+              </p>
+              <div style="background: #EFF6FF; border: 1px solid #BFDBFE; border-radius: 8px; padding: 16px 20px; margin: 20px 0;">
+                <div style="font-size: 13px; font-weight: 700; color: #1D4ED8; margin-bottom: 10px;">INTERVIEW DETAILS</div>
+                <p style="margin: 4px 0; color: #1E40AF; font-size: 14px;">📅 <strong>Date:</strong> ${formattedDate}</p>
+                ${timeStr ? `<p style="margin: 4px 0; color: #1E40AF; font-size: 14px;">🕐 <strong>Time:</strong> ${interviewTime}</p>` : ''}
+                ${typeStr ? `<p style="margin: 4px 0; color: #1E40AF; font-size: 14px;">📍 <strong>Format:</strong> ${interviewType}</p>` : ''}
+                ${interviewNotes ? `<p style="margin: 8px 0 0; color: #3B82F6; font-size: 13px;">📝 ${interviewNotes}</p>` : ''}
+              </div>
+              <p style="color: #475569; font-size: 14px; line-height: 1.6;">
+                Please reply to this email or contact us if you have any questions. We look forward to speaking with you.
+              </p>
+            </div>
+            <div style="text-align: center; padding-top: 16px; border-top: 1px solid #F1F5F9; color: #94A3B8; font-size: 12px;">
+              &copy; ${new Date().getFullYear()} NexusCRM HR Team. All rights reserved.
+            </div>
+          </div>
+        `
+      });
+
+      console.log(`[Interview Email] Sent to ${app.email} for ${app.jobTitle} on ${formattedDate}${timeStr}`);
+    }
+
     return res.status(200).json({ success: true, message: 'Application updated.', data: app });
   } catch (error) {
     console.error('[Update Application Error]:', error);

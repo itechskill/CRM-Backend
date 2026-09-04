@@ -7,6 +7,8 @@ const JobApplicationSchema = new mongoose.Schema({
   email: { type: String, required: true, trim: true, lowercase: true },
   phone: { type: String, default: '' },
   resumeUrl: { type: String, default: '' },
+  linkedinUrl: { type: String, default: '', trim: true },
+  portfolioUrl: { type: String, default: '', trim: true },
   resumeData: { type: String, default: '' },     // Base64 encoded file
   resumeFileName: { type: String, default: '' }, // Original filename
   coverLetter: { type: String, default: '' },
@@ -21,3 +23,4 @@ const JobApplicationSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 module.exports = mongoose.model('JobApplication', JobApplicationSchema);
+
