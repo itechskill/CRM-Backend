@@ -57,10 +57,12 @@ async function testAPIs() {
     headers: { Authorization: `Bearer ${mgrToken}` }
   });
   const data2 = await res2.json();
-  console.log('/api/sales-manager/dashboard-stats response status:', res2.status, 'success:', data2.success);
-  console.log('Total Team Members:', data2.data?.totalTeamMembers);
-  console.log('Total Leads:', data2.data?.totalLeads);
-  console.log('Won Deals Count:', data2.data?.wonDealsCount, 'Won Deals Value:', data2.data?.wonDealsValue);
+  console.log('--- DASHBOARD STATS METRICS ---');
+  console.log('Total Orders:', data2.data?.totalOrders);
+  console.log('Total Monthly Revenue:', data2.data?.totalMonthlyRevenue);
+  console.log('Total Receivables:', data2.data?.totalReceivables);
+  console.log('Overdue Invoice Amount:', data2.data?.overdueInvoiceAmount);
+  console.log('Team Target Attainment (%):', data2.data?.teamTargetAchievementPct);
 
   // Test /api/sales-manager/team-members
   const res3 = await fetch('http://localhost:5000/api/sales-manager/team-members', {

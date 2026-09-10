@@ -246,7 +246,7 @@ const loginUser = async (req, res) => {
     if (user.status !== 'active') {
       return res.status(403).json({
         success: false,
-        message: 'Your account is not active.'
+        message: 'Your account is inactive. Please contact your administrator.'
       });
     }
 
@@ -379,7 +379,7 @@ const forgotPassword = async (req, res) => {
     // Send email using Nodemailer
     await sendEmail({
       to: user.email,
-      subject: 'NexusCRM - Password Reset Request',
+      subject: 'Fortline CRM - Password Reset Request',
       resetLink
     });
 

@@ -60,7 +60,7 @@ async function testCRMWorkflow() {
       periodType: 'Monthly',
       targetAmount: 75000,
       achievedAmount: 0,
-      currency: 'USD',
+      currency: 'PKR',
       status: 'Active',
       assignedBy: manager._id,
       notes: 'Q4 Enterprise Target'

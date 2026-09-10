@@ -28,7 +28,7 @@ const SalesTargetSchema = new mongoose.Schema(
     },
     currency: {
       type: String,
-      default: 'USD'
+      default: 'PKR'
     },
     status: {
       type: String,
@@ -59,7 +59,7 @@ const SalesTargetSchema = new mongoose.Schema(
 // Virtual: achievement percentage
 SalesTargetSchema.virtual('achievementPercentage').get(function () {
   if (!this.targetAmount || this.targetAmount === 0) return 0;
-  return Math.min(100, Math.round((this.achievedAmount / this.targetAmount) * 100));
+  return Math.round((this.achievedAmount / this.targetAmount) * 100);
 });
 
 SalesTargetSchema.set('toJSON', { virtuals: true });

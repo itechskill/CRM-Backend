@@ -248,11 +248,11 @@ const updateApplication = async (req, res) => {
 
       await sendEmail({
         to: app.email,
-        subject: `Interview Scheduled — ${app.jobTitle} at NexusCRM`,
+        subject: `Interview Scheduled — ${app.jobTitle} at Fortline CRM`,
         html: `
           <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E2E8F0; border-radius: 8px; background-color: #FFFFFF;">
             <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #F1F5F9;">
-              <h2 style="color: #2563EB; margin: 0;">NexusCRM — Interview Invitation</h2>
+              <h2 style="color: #2563EB; margin: 0;">Fortline CRM — Interview Invitation</h2>
               <p style="color: #64748B; font-size: 14px; margin-top: 4px;">Human Resources Department</p>
             </div>
             <div style="padding: 24px 0;">
@@ -272,7 +272,7 @@ const updateApplication = async (req, res) => {
               </p>
             </div>
             <div style="text-align: center; padding-top: 16px; border-top: 1px solid #F1F5F9; color: #94A3B8; font-size: 12px;">
-              &copy; ${new Date().getFullYear()} NexusCRM HR Team. All rights reserved.
+              &copy; ${new Date().getFullYear()} Fortline CRM HR Team. All rights reserved.
             </div>
           </div>
         `

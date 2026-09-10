@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+﻿const mongoose = require('mongoose');
 
 const LeadSchema = new mongoose.Schema({
   name: {
@@ -7,6 +7,10 @@ const LeadSchema = new mongoose.Schema({
     trim: true
   },
   company: {
+    type: String,
+    default: ''
+  },
+  contactPerson: {
     type: String,
     default: ''
   },
@@ -22,7 +26,7 @@ const LeadSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['New', 'Contacted', 'Qualified', 'Unqualified', 'Converted'],
+    enum: ['New', 'Contacted', 'Interested', 'Qualified', 'Converted to Deal', 'Converted', 'Unqualified', 'Lost'],
     default: 'New'
   },
   value: {
@@ -36,6 +40,14 @@ const LeadSchema = new mongoose.Schema({
   campaign: {
     type: String,
     default: ''
+  },
+  requirements: {
+    type: String,
+    default: ''
+  },
+  followUpDate: {
+    type: Date,
+    default: null
   },
   notes: {
     type: String,
@@ -54,4 +66,3 @@ const LeadSchema = new mongoose.Schema({
 });
 
 module.exports = mongoose.model('Lead', LeadSchema);
-

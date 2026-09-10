@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+﻿const mongoose = require('mongoose');
 
 const DealSchema = new mongoose.Schema({
   title: {
@@ -11,6 +11,35 @@ const DealSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
+  company: {
+    type: String,
+    default: ''
+  },
+  contactPerson: {
+    type: String,
+    default: ''
+  },
+  contactEmail: {
+    type: String,
+    trim: true,
+    lowercase: true,
+    default: ''
+  },
+  contactPhone: {
+    type: String,
+    default: ''
+  },
+  requirements: {
+    type: String,
+    default: ''
+  },
+  products: [
+    {
+      name: { type: String, default: '' },
+      quantity: { type: Number, default: 1 },
+      description: { type: String, default: '' }
+    }
+  ],
   value: {
     type: Number,
     required: true,
@@ -29,6 +58,10 @@ const DealSchema = new mongoose.Schema({
   },
   closingDate: {
     type: Date
+  },
+  notes: {
+    type: String,
+    default: ''
   },
   leadId: {
     type: mongoose.Schema.Types.ObjectId,

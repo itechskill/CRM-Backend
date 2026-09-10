@@ -116,6 +116,15 @@ const updateDeal = async (req, res) => {
 
     // Auto-create client & notify Accountant when deal is won
     if (['Closed Won', 'Won'].includes(deal.stage)) {
+      if (deal.leadId) {
+        await Lead.findByIdAndUpdate(deal.leadId, { status: 'Converted' });
+      } else if (deal.clientName) {
+        await Lead.updateMany(
+          { $or: [{ name: deal.clientName }, { company: deal.clientName }], status: { $ne: 'Converted' } },
+          { status: 'Converted' }
+        );
+      }
+
       const existingClient = await Client.findOne({ name: deal.clientName });
       if (!existingClient) {
         await Client.create({
@@ -134,7 +143,7 @@ const updateDeal = async (req, res) => {
         role: 'accountant',
         sender: req.user._id,
         title: 'New Deal Won — Ready for Invoice',
-        message: `Deal "${deal.title}" for ${deal.clientName} ($${(deal.value || 0).toLocaleString()}) was won. Click to generate invoice.`,
+        message: `Deal "${deal.title}" for ${deal.clientName} (Rs. ${(deal.value || 0).toLocaleString()}) was won. Click to generate invoice.`,
         type: 'deal'
       });
     }

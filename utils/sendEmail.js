@@ -36,20 +36,20 @@ const sendEmail = async (options) => {
   });
 
   const mailOptions = {
-    from: `"NexusCRM Security" <${emailUser}>`,
+    from: `"Fortline CRM Security" <${emailUser}>`,
     to: options.to,
-    subject: options.subject || 'NexusCRM Password Reset Request',
+    subject: options.subject || 'Fortline CRM Password Reset Request',
     text: options.text || `Reset your password by following this link: ${options.resetLink}`,
     html: options.html || `
       <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E2E8F0; border-radius: 8px; background-color: #FFFFFF;">
         <div style="text-align: center; padding-bottom: 20px; border-bottom: 1px solid #F1F5F9;">
-          <h2 style="color: #2563EB; margin: 0;">NexusCRM</h2>
+          <h2 style="color: #2563EB; margin: 0;">Fortline CRM</h2>
           <p style="color: #64748B; font-size: 14px; margin-top: 4px;">Enterprise Management System</p>
         </div>
         <div style="padding: 24px 0;">
           <h3 style="color: #1E293B; margin-top: 0;">Password Reset Request</h3>
           <p style="color: #475569; font-size: 15px; line-height: 1.6;">
-            We received a request to reset the password for your NexusCRM account associated with <strong>${options.to}</strong>.
+            We received a request to reset the password for your Fortline CRM account associated with <strong>${options.to}</strong>.
           </p>
           <p style="color: #475569; font-size: 15px; line-height: 1.6;">
             Click the button below to set a new password. This link is valid for <strong>15 minutes</strong>.
@@ -68,7 +68,7 @@ const sendEmail = async (options) => {
           </p>
         </div>
         <div style="text-align: center; padding-top: 16px; border-top: 1px solid #F1F5F9; color: #94A3B8; font-size: 12px;">
-          &copy; ${new Date().getFullYear()} NexusCRM. All rights reserved.
+          &copy; ${new Date().getFullYear()} Fortline CRM. All rights reserved.
         </div>
       </div>
     `

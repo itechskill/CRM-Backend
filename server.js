@@ -103,7 +103,7 @@ app.use('/api/sales-manager', salesManagerTeamRoutes);
 app.get('/', (req, res) => {
   res.status(200).json({
     success: true,
-    message: 'Welcome to NexusCRM Backend API Server'
+    message: 'Welcome to Fortline CRM Backend API Server'
   });
 });
 

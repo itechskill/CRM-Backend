@@ -7,13 +7,14 @@ const ALLOWED_ROLES = [
   'administration',
   'hr_manager',
   'sales_manager',
+  'sales_member',
   'project_manager',
   'marketing',
   'accountant',
   'employee'
 ];
 
-const ACCOUNT_STATUSES = ['pending', 'active', 'rejected', 'suspended'];
+const ACCOUNT_STATUSES = ['pending', 'active', 'inactive', 'deactivated', 'rejected', 'suspended'];
 
 const userSchema = new mongoose.Schema(
   {

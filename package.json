@@ -1,7 +1,7 @@
 {
   "name": "crm-backend",
   "version": "1.0.0",
-  "description": "Backend API service for NexusCRM",
+  "description": "Backend API service for Fortline CRM",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

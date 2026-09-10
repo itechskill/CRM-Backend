@@ -2,27 +2,17 @@ const mongoose = require('mongoose');
 
 const SalesOrderSchema = new mongoose.Schema(
   {
-    orderNumber: {
-      type: String,
-      trim: true,
-      default: ''
-    },
-    clientName: {
-      type: String,
-      required: [true, 'Client name is required'],
-      trim: true
-    },
-    clientEmail: {
-      type: String,
-      trim: true,
-      lowercase: true,
-      default: ''
-    },
-    clientPhone: {
-      type: String,
-      trim: true,
-      default: ''
-    },
+    orderReference: { type: String, trim: true, default: '' },
+    creationDate: { type: Date, default: null },
+    salePerson: { type: String, trim: true, default: '' },
+    fileNo: { type: String, trim: true, default: '' },
+    fileType: { type: String, enum: ['Blue', 'Green', 'Yellow', ''], default: '' },
+    productSummary: { type: String, trim: true, default: '' },
+    orderNumber: { type: String, trim: true, default: '' },
+    clientName: { type: String, required: [true, 'Client name is required'], trim: true },
+    clientEmail: { type: String, trim: true, lowercase: true, default: '' },
+    clientPhone: { type: String, trim: true, default: '' },
+    clientAddress: { type: String, trim: true, default: '' },
     items: [
       {
         description: { type: String, default: '' },
@@ -31,63 +21,81 @@ const SalesOrderSchema = new mongoose.Schema(
         total: { type: Number, default: 0 }
       }
     ],
-    totalAmount: {
-      type: Number,
-      default: 0
-    },
-    discount: {
-      type: Number,
-      default: 0
-    },
-    tax: {
-      type: Number,
-      default: 0
-    },
-    netAmount: {
-      type: Number,
-      default: 0
-    },
-    status: {
+    totalAmount: { type: Number, default: 0 },
+    discount: { type: Number, default: 0 },
+    tax: { type: Number, default: 0 },
+    netAmount: { type: Number, default: 0 },
+    status: { type: String, default: 'Sales Order' },
+    orderDate: { type: Date, default: Date.now },
+    deliveryDate: { type: Date, default: null },
+    notes: { type: String, default: '' },
+    // Stock workflow
+    stockStatus: {
       type: String,
-      enum: ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Delivered', 'Cancelled'],
+      enum: ['Available', 'Purchase Required', 'In Procurement', 'Received', 'In Stock', 'Out of Stock', 'Partial Stock', 'Pending Check'],
+      default: 'Available'
+    },
+    // Auto-updated statuses based on related records
+    deliveryStatus: {
+      type: String,
+      enum: ['Not Delivered', 'Partially Delivered', 'Fully Delivered', 'Delivered', 'Done'],
+      default: 'Not Delivered'
+    },
+    invoiceStatus: {
+      type: String,
+      enum: ['Not Invoiced', 'Partially Invoiced', 'Fully Invoiced', 'Invoiced', 'To Invoice'],
+      default: 'To Invoice'
+    },
+    invoiceNumber: { type: String, default: '' },
+    paymentStatus: {
+      type: String,
+      enum: ['Pending', 'Advance Received', 'Partially Paid', 'Fully Paid', 'Paid', 'Unpaid'],
       default: 'Pending'
     },
-    orderDate: {
-      type: Date,
-      default: Date.now
-    },
-    deliveryDate: {
-      type: Date,
-      default: null
-    },
-    notes: {
-      type: String,
-      default: ''
-    },
-    quotationId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Quotation',
-      default: null
-    },
-    leadId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Lead',
-      default: null
-    },
-    salesPerson: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: true
-    }
+    totalPaid: { type: Number, default: 0 },
+    outstandingBalance: { type: Number, default: 0 },
+    // Linked records
+    quotationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation', default: null },
+    customerPOId: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomerPO', default: null },
+    customerPONumber: { type: String, default: '' },
+    productFileId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductFile', default: null },
+    leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', default: null },
+    salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
   },
   { timestamps: true }
 );
 
-// Auto-generate order number before save
 SalesOrderSchema.pre('save', async function (next) {
-  if (!this.orderNumber) {
-    const count = await mongoose.model('SalesOrder').countDocuments();
-    this.orderNumber = `SO-${String(count + 1).padStart(4, '0')}`;
+  if (!this.orderNumber && !this.orderReference) {
+    const allOrders = await mongoose.model('SalesOrder').find({
+      orderReference: { $regex: /^S\d+$/i }
+    }).select('orderReference').lean();
+    
+    let maxNum = 1724;
+    allOrders.forEach(o => {
+      const match = o.orderReference && o.orderReference.match(/\d+$/);
+      if (match) {
+        const n = parseInt(match[0], 10);
+        if (n > maxNum) maxNum = n;
+      }
+    });
+    
+    const nextRef = 'S0' + String(maxNum + 1);
+    this.orderReference = nextRef;
+    this.orderNumber = nextRef;
+  } else if (!this.orderNumber && this.orderReference) {
+    this.orderNumber = this.orderReference;
+  } else if (!this.orderReference && this.orderNumber) {
+    this.orderReference = this.orderNumber;
+  }
+  
+  if (!this.creationDate) {
+    this.creationDate = this.createdAt || new Date();
+  }
+  // Auto-set outstanding balance
+  if (this.outstandingBalance === 0 && this.netAmount > 0 && this.totalPaid === 0) {
+    this.outstandingBalance = this.netAmount || this.totalAmount || 0;
   }
   next();
 });
