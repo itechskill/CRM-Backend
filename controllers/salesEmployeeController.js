@@ -7,6 +7,7 @@ const FollowUp = require('../models/FollowUp');
 const SalesTarget = require('../models/SalesTarget');
 const SalesActivity = require('../models/SalesActivity');
 const Invoice = require('../models/Invoice');
+const ProformaInvoice = require('../models/ProformaInvoice');
 const Deal = require('../models/Deal');
 const CustomerPO = require('../models/CustomerPO');
 const ProductFile = require('../models/ProductFile');
@@ -2368,6 +2369,277 @@ const deleteMyPayment = async (req, res) => {
   }
 };
 
+// ══════════════════════════════════════════════
+// PROFORMA INVOICES (OPTIONAL STAGE IN SALES WORKFLOW)
+// ══════════════════════════════════════════════
+const getMyProformaInvoices = async (req, res) => {
+  try {
+    const isManager = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
+    const query = isManager ? {} : { createdBy: req.user._id };
+
+    if (req.query.status && req.query.status !== 'all') {
+      query.status = req.query.status;
+    }
+
+    if (req.query.search) {
+      const searchRegex = new RegExp(req.query.search, 'i');
+      query.$or = [
+        { proformaNumber: searchRegex },
+        { salesOrderNumber: searchRegex },
+        { orderReference: searchRegex },
+        { clientName: searchRegex },
+        { customerPONumber: searchRegex }
+      ];
+    }
+
+    const proformas = await ProformaInvoice.find(query)
+      .populate('salesOrder', 'orderReference orderNumber clientName totalAmount netAmount status deliveryStatus paymentStatus')
+      .populate('quotationId', 'quotationNumber')
+      .populate('customerPOId', 'poNumber')
+      .populate('createdBy', 'fullName email')
+      .sort({ createdAt: -1 });
+
+    return res.status(200).json({
+      success: true,
+      count: proformas.length,
+      data: proformas
+    });
+  } catch (error) {
+    console.error('[Get Proforma Invoices Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching proforma invoices.' });
+  }
+};
+
+const createMyProformaInvoice = async (req, res) => {
+  try {
+    const {
+      salesOrderId,
+      salesOrderNumber,
+      clientName,
+      clientEmail,
+      clientPhone,
+      clientAddress,
+      items,
+      totalAmount,
+      discount,
+      tax,
+      netAmount,
+      status,
+      issueDate,
+      dueDate,
+      paymentTerms,
+      deliveryTerms,
+      notes
+    } = req.body;
+
+    if (!salesOrderId) {
+      return res.status(400).json({ success: false, message: 'Sales Order reference is required to create a Proforma Invoice.' });
+    }
+
+    const salesOrder = await SalesOrder.findById(salesOrderId);
+    if (!salesOrder) {
+      return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+
+    const resolvedClientName = clientName?.trim() || salesOrder.clientName || 'Customer';
+    const resolvedItems = Array.isArray(items) && items.length > 0
+      ? items.map(it => {
+          const q = Number(it.quantity) || 1;
+          const u = Number(it.unitPrice) || 0;
+          return {
+            description: it.description || it.product || '',
+            quantity: q,
+            unitPrice: u,
+            total: q * u
+          };
+        })
+      : salesOrder.items.map(it => {
+          const q = Number(it.quantity) || 1;
+          const u = Number(it.unitPrice) || 0;
+          return {
+            description: it.description || '',
+            quantity: q,
+            unitPrice: u,
+            total: q * u
+          };
+        });
+
+    let calculatedSubtotal = 0;
+    resolvedItems.forEach(it => { calculatedSubtotal += it.total; });
+    const disc = discount !== undefined ? Number(discount) || 0 : (salesOrder.discount || 0);
+    const tx = tax !== undefined ? Number(tax) || 0 : (salesOrder.tax || 0);
+    const calculatedNetAmount = Math.max(0, calculatedSubtotal - disc + tx);
+
+    const proforma = await ProformaInvoice.create({
+      salesOrder: salesOrder._id,
+      salesOrderNumber: salesOrder.orderReference || salesOrder.orderNumber || salesOrderNumber || '',
+      orderReference: salesOrder.orderReference || salesOrder.orderNumber || '',
+      quotationId: salesOrder.quotationId || null,
+      customerPOId: salesOrder.customerPOId || null,
+      customerPONumber: salesOrder.customerPONumber || '',
+      productFileId: salesOrder.productFileId || null,
+      clientName: resolvedClientName,
+      clientEmail: clientEmail?.trim() || salesOrder.clientEmail || '',
+      clientPhone: clientPhone?.trim() || salesOrder.clientPhone || '',
+      clientAddress: clientAddress?.trim() || salesOrder.clientAddress || '',
+      items: resolvedItems,
+      totalAmount: calculatedSubtotal,
+      discount: disc,
+      tax: tx,
+      netAmount: calculatedNetAmount,
+      currency: 'PKR',
+      status: status || 'Issued',
+      issueDate: issueDate || new Date(),
+      dueDate: dueDate || null,
+      paymentTerms: paymentTerms?.trim() || 'Advance 100%',
+      deliveryTerms: deliveryTerms?.trim() || 'Ex-Works / Standard Dispatch',
+      notes: notes?.trim() || '',
+      createdBy: req.user._id
+    });
+
+    // Link Proforma Invoice back to Sales Order without deleting or replacing the Sales Order
+    await SalesOrder.findByIdAndUpdate(salesOrder._id, {
+      proformaInvoiceId: proforma._id,
+      proformaInvoiceNumber: proforma.proformaNumber,
+      proformaStatus: proforma.status
+    });
+
+    await logSalesActivity({
+      type: 'Proforma Invoice Created',
+      description: `Created Proforma Invoice ${proforma.proformaNumber} for Sales Order ${salesOrder.orderReference || salesOrder.orderNumber} (Rs. ${proforma.netAmount.toLocaleString()})`,
+      relatedModel: 'SalesOrder',
+      relatedId: salesOrder._id,
+      relatedCustomer: resolvedClientName,
+      salesMemberName: req.user.fullName,
+      performedBy: req.user._id
+    });
+
+    await notifyRoleHelper({
+      role: 'sales_manager',
+      sender: req.user._id,
+      title: 'Proforma Invoice Created',
+      message: `${req.user.fullName} generated Proforma Invoice ${proforma.proformaNumber} for ${resolvedClientName} (Rs. ${proforma.netAmount.toLocaleString()}).`,
+      type: 'sales'
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Proforma Invoice ${proforma.proformaNumber} created successfully.`,
+      data: proforma
+    });
+  } catch (error) {
+    console.error('[Create Proforma Invoice Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error creating proforma invoice.' });
+  }
+};
+
+const updateMyProformaInvoice = async (req, res) => {
+  try {
+    const proforma = await ProformaInvoice.findById(req.params.id);
+    if (!proforma) {
+      return res.status(404).json({ success: false, message: 'Proforma Invoice not found.' });
+    }
+
+    if (!checkOwnership(proforma, 'createdBy', req.user._id, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only update your own proforma invoices.' });
+    }
+
+    const {
+      clientName,
+      clientEmail,
+      clientPhone,
+      clientAddress,
+      items,
+      discount,
+      tax,
+      status,
+      issueDate,
+      dueDate,
+      paymentTerms,
+      deliveryTerms,
+      notes
+    } = req.body;
+
+    if (clientName) proforma.clientName = clientName.trim();
+    if (clientEmail !== undefined) proforma.clientEmail = clientEmail.trim();
+    if (clientPhone !== undefined) proforma.clientPhone = clientPhone.trim();
+    if (clientAddress !== undefined) proforma.clientAddress = clientAddress.trim();
+    if (paymentTerms !== undefined) proforma.paymentTerms = paymentTerms.trim();
+    if (deliveryTerms !== undefined) proforma.deliveryTerms = deliveryTerms.trim();
+    if (notes !== undefined) proforma.notes = notes.trim();
+    if (issueDate) proforma.issueDate = issueDate;
+    if (dueDate !== undefined) proforma.dueDate = dueDate;
+    if (discount !== undefined) proforma.discount = Number(discount) || 0;
+    if (tax !== undefined) proforma.tax = Number(tax) || 0;
+
+    if (Array.isArray(items) && items.length > 0) {
+      proforma.items = items.map(it => {
+        const q = Number(it.quantity) || 1;
+        const u = Number(it.unitPrice) || 0;
+        return {
+          description: it.description || it.product || '',
+          quantity: q,
+          unitPrice: u,
+          total: q * u
+        };
+      });
+      let subtotal = 0;
+      proforma.items.forEach(it => { subtotal += it.total; });
+      proforma.totalAmount = subtotal;
+      proforma.netAmount = Math.max(0, subtotal - proforma.discount + proforma.tax);
+    }
+
+    if (status) {
+      proforma.status = status;
+      if (proforma.salesOrder) {
+        await SalesOrder.findByIdAndUpdate(proforma.salesOrder, { proformaStatus: status });
+      }
+    }
+
+    await proforma.save();
+
+    return res.status(200).json({
+      success: true,
+      message: `Proforma Invoice ${proforma.proformaNumber} updated successfully.`,
+      data: proforma
+    });
+  } catch (error) {
+    console.error('[Update Proforma Invoice Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating proforma invoice.' });
+  }
+};
+
+const deleteMyProformaInvoice = async (req, res) => {
+  try {
+    const proforma = await ProformaInvoice.findById(req.params.id);
+    if (!proforma) {
+      return res.status(404).json({ success: false, message: 'Proforma Invoice not found.' });
+    }
+
+    if (!checkOwnership(proforma, 'createdBy', req.user._id, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own proforma invoices.' });
+    }
+
+    if (proforma.salesOrder) {
+      await SalesOrder.findByIdAndUpdate(proforma.salesOrder, {
+        proformaInvoiceId: null,
+        proformaInvoiceNumber: '',
+        proformaStatus: 'None'
+      });
+    }
+
+    await ProformaInvoice.findByIdAndDelete(req.params.id);
+
+    return res.status(200).json({
+      success: true,
+      message: `Proforma Invoice ${proforma.proformaNumber} deleted.`
+    });
+  } catch (error) {
+    console.error('[Delete Proforma Invoice Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error deleting proforma invoice.' });
+  }
+};
+
 module.exports = {
   getMySalesStats,
   getMyLeads,
@@ -2393,6 +2665,10 @@ module.exports = {
   deleteMyOrder,
   checkOrderStock,
   getAvailableOrdersForDelivery,
+  getMyProformaInvoices,
+  createMyProformaInvoice,
+  updateMyProformaInvoice,
+  deleteMyProformaInvoice,
   getMyDeliveryNotes,
   createMyDeliveryNote,
   updateMyDeliveryNote,
