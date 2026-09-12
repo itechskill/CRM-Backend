@@ -66,7 +66,7 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
       Deal.find().populate('assignedTo', 'fullName email').sort({ createdAt: -1 }),
       Quotation.find().sort({ createdAt: -1 }),
       SalesOrder.find().sort({ createdAt: -1 }),
-      Invoice.find().sort({ createdAt: -1 }),
+      Invoice.find().populate('createdBy', 'fullName email').sort({ createdAt: -1 }),
       SalesTarget.find().populate('employee', 'fullName email').sort({ createdAt: -1 }),
       SalesActivity.find().populate('performedBy', 'fullName profileImage email').sort({ createdAt: -1 }).limit(10),
       Task.find({ status: { $ne: 'Completed' } }).sort({ createdAt: -1 }).limit(10)
@@ -157,6 +157,38 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
       return sum + Math.max(0, outstanding);
     }, 0);
 
+    const overdueList = overdueInvoices.map(i => {
+      const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+      return {
+        _id: i._id,
+        invoiceNumber: i.invoiceNumber,
+        clientName: i.clientName || 'Client',
+        salesRep: i.createdBy?.fullName || i.salePerson || 'Sales Team',
+        dueDate: i.dueDate,
+        issueDate: i.issueDate,
+        amount: Number(i.amount) || 0,
+        paidAmount: Number(i.paidAmount) || 0,
+        remainingBalance: Math.max(0, outstanding),
+        status: i.status || 'Overdue'
+      };
+    });
+
+    const receivablesList = unpaidInvoices.map(i => {
+      const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+      return {
+        _id: i._id,
+        invoiceNumber: i.invoiceNumber,
+        clientName: i.clientName || 'Client',
+        salesRep: i.createdBy?.fullName || i.salePerson || 'Sales Team',
+        dueDate: i.dueDate,
+        issueDate: i.issueDate,
+        amount: Number(i.amount) || 0,
+        paidAmount: Number(i.paidAmount) || 0,
+        remainingBalance: Math.max(0, outstanding),
+        status: i.status || 'Pending'
+      };
+    });
+
     const pendingOrders = orders.filter(o => ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Sales Order'].includes(o.status));
     const orderReceivables = pendingOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
     const totalReceivables = invoiceReceivables > 0 ? invoiceReceivables : orderReceivables;
@@ -226,6 +258,8 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
         paidInvoicesAmount,
         totalReceivables,
         overdueInvoiceAmount,
+        overdueList,
+        receivablesList,
         totalMonthlyRevenue,
         totalTargetAmount,
         totalAchievedTarget,

@@ -1,4 +1,4 @@
-﻿const mongoose = require('mongoose');
+const mongoose = require('mongoose');
 
 const DealSchema = new mongoose.Schema({
   title: {
@@ -77,6 +77,15 @@ const DealSchema = new mongoose.Schema({
   }
 }, {
   timestamps: true
+});
+
+DealSchema.pre('save', function (next) {
+  if (['Won', 'Closed Won'].includes(this.stage)) {
+    this.probability = 100;
+  } else if (this.stage === 'Closed Lost') {
+    this.probability = 0;
+  }
+  next();
 });
 
 module.exports = mongoose.model('Deal', DealSchema);
