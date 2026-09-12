@@ -24,6 +24,10 @@ const {
   createMyOrder,
   updateMyOrder,
   deleteMyOrder,
+  getMyProformaInvoices,
+  createMyProformaInvoice,
+  updateMyProformaInvoice,
+  deleteMyProformaInvoice,
   getMyDeliveryNotes,
   createMyDeliveryNote,
   updateMyDeliveryNote,
@@ -89,6 +93,12 @@ router.get('/orders/:id/stock-check', salesEmployeeGuard, checkOrderStock);
 router.post('/orders', salesEmployeeGuard, createMyOrder);
 router.patch('/orders/:id', salesEmployeeGuard, updateMyOrder);
 router.delete('/orders/:id', salesEmployeeGuard, deleteMyOrder);
+
+// Proforma Invoices (Optional stage: Sales Order -> Proforma Invoice -> Delivery Note)
+router.get('/proforma-invoices', salesEmployeeGuard, getMyProformaInvoices);
+router.post('/proforma-invoices', salesEmployeeGuard, createMyProformaInvoice);
+router.patch('/proforma-invoices/:id', salesEmployeeGuard, updateMyProformaInvoice);
+router.delete('/proforma-invoices/:id', salesEmployeeGuard, deleteMyProformaInvoice);
 
 // Delivery Notes
 router.get('/delivery-notes', salesEmployeeGuard, getMyDeliveryNotes);

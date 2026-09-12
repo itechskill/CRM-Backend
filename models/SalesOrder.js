@@ -59,6 +59,13 @@ const SalesOrderSchema = new mongoose.Schema(
     customerPOId: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomerPO', default: null },
     customerPONumber: { type: String, default: '' },
     productFileId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductFile', default: null },
+    proformaInvoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProformaInvoice', default: null },
+    proformaInvoiceNumber: { type: String, default: '' },
+    proformaStatus: {
+      type: String,
+      enum: ['None', 'Draft', 'Issued', 'Sent', 'Approved', 'Cancelled'],
+      default: 'None'
+    },
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', default: null },
     salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
