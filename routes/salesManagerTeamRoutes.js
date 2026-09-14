@@ -143,15 +143,30 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
 
     // 4. Invoices & Financials
     const totalInvoices = invoices.length;
+    const approvedInvoicesList = invoices.filter(i => ['Approved', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status));
+    const approvedInvoicesCount = approvedInvoicesList.length;
     const paidInvoices = invoices.filter(i => i.status === 'Paid');
-    const paidInvoicesAmount = paidInvoices.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
-    const unpaidInvoices = invoices.filter(i => i.status !== 'Paid' && i.status !== 'Cancelled');
-    const invoiceReceivables = unpaidInvoices.reduce((sum, i) => {
+    const paidInvoicesAmount = invoices.reduce((sum, i) => sum + (Number(i.paidAmount) || (i.status === 'Paid' ? Number(i.amount) : 0)), 0);
+
+    // Receivables: strictly approved / active invoices with remaining unpaid balance
+    const approvedReceivableInvoices = invoices.filter(i =>
+      ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
+      i.status !== 'Paid' &&
+      i.status !== 'Cancelled'
+    );
+    const invoiceReceivables = approvedReceivableInvoices.reduce((sum, i) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
     }, 0);
+    const totalReceivables = invoiceReceivables;
 
-    const overdueInvoices = invoices.filter(i => (i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now)) && i.status !== 'Paid' && i.status !== 'Cancelled');
+    // Overdue: strictly approved invoices past due date with remaining unpaid balance
+    const overdueInvoices = invoices.filter(i => {
+      const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
+      const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
+      const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+      return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
+    });
     const overdueInvoiceAmount = overdueInvoices.reduce((sum, i) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
@@ -173,7 +188,7 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
       };
     });
 
-    const receivablesList = unpaidInvoices.map(i => {
+    const receivablesList = approvedReceivableInvoices.map(i => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return {
         _id: i._id,
@@ -188,10 +203,6 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
         status: i.status || 'Pending'
       };
     });
-
-    const pendingOrders = orders.filter(o => ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Sales Order'].includes(o.status));
-    const orderReceivables = pendingOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
-    const totalReceivables = invoiceReceivables > 0 ? invoiceReceivables : orderReceivables;
 
     const ordersDelivered = orders.filter(o => o.status === 'Delivered');
     const deliveredOrdersValue = ordersDelivered.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);

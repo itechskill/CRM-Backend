@@ -106,11 +106,11 @@ const getMySalesStats = async (req, res) => {
 
     // Invoice stats
     const totalInvoicesCount = invoices.length;
+    const approvedInvoicesList = invoices.filter(i => ['Approved', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status));
+    const approvedInvoicesCount = approvedInvoicesList.length;
+    const approvedInvoicesAmount = approvedInvoicesList.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
     const paidInvoices = invoices.filter(i => i.status === 'Paid');
-    const paidInvoicesAmount = paidInvoices.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
-    const approvedInvoicesAmount = invoices
-      .filter(i => ['Approved', 'Paid', 'Sent', 'Partially Paid'].includes(i.status))
-      .reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
+    const paidInvoicesAmount = invoices.reduce((sum, i) => sum + (Number(i.paidAmount) || (i.status === 'Paid' ? Number(i.amount) : 0)), 0);
 
     // Follow-up stats
     const totalFollowUps = followUps.length;
@@ -128,25 +128,34 @@ const getMySalesStats = async (req, res) => {
     const targetAchievementPct = monthlyTarget > 0 ? Math.round((salesAchieved / monthlyTarget) * 100) : (salesAchieved > 0 ? 100 : 0);
 
     // ── FINANCIALS ──
-    // 1. Receivables: All unpaid invoices or outstanding orders (subtracting already paid amounts)
-    const unpaidInvoices = invoices.filter(i => i.status !== 'Paid' && i.status !== 'Cancelled');
-    const invoiceReceivables = unpaidInvoices.reduce((sum, i) => {
+    // 1. Receivables: Strictly approved / active invoices with unpaid balance (excluding drafts, pending review, submitted, rejected, cancelled, and fully paid)
+    const receivableInvoices = invoices.filter(i =>
+      ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
+      i.status !== 'Paid' &&
+      i.status !== 'Cancelled'
+    );
+    const receivables = receivableInvoices.reduce((sum, i) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
     }, 0);
-    const pendingOrders = orders.filter(o => ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Sales Order'].includes(o.status));
-    const orderReceivables = pendingOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
-    const receivables = invoiceReceivables > 0 ? invoiceReceivables : orderReceivables;
+    const invoiceReceivables = receivables;
+    const orderReceivables = orders
+      .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered'].includes(o.status))
+      .reduce((sum, o) => sum + (Number(o.outstandingBalance != null ? o.outstandingBalance : o.netAmount) || 0), 0);
 
-    // 2. Overdue: Invoices past due date or overdue delivery orders (subtracting already paid amounts)
-    const overdueInvoices = invoices.filter(i => (i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now)) && i.status !== 'Paid' && i.status !== 'Cancelled');
-    const overdueInvoiceAmount = overdueInvoices.reduce((sum, i) => {
+    // 2. Overdue: Strictly approved invoices past due date or marked overdue with unpaid balance
+    const overdueInvoices = invoices.filter(i => {
+      const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
+      const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
+      const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+      return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
+    });
+    const overdueAmount = overdueInvoices.reduce((sum, i) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
     }, 0);
-    const overdueOrders = orders.filter(o => o.deliveryDate && new Date(o.deliveryDate) < now && !['Delivered', 'Cancelled'].includes(o.status));
-    const overdueOrderAmount = overdueOrders.reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
-    const overdueAmount = overdueInvoiceAmount > 0 ? overdueInvoiceAmount : overdueOrderAmount;
+    const overdueInvoiceAmount = overdueAmount;
+    const overdueOrderAmount = 0;
 
     // 3. Salary Target: From employee user record, payroll base/net salary, or standard commission ratio
     const salaryTarget = Number(user?.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(monthlyTarget * 0.1) || 5000;
@@ -210,8 +219,10 @@ const getMySalesStats = async (req, res) => {
           liability,
           netRevenue,
           totalInvoicesCount,
+          approvedInvoicesCount,
           paidInvoicesAmount,
-          unpaidInvoicesCount: unpaidInvoices.length,
+          paidInvoicesCount: paidInvoices.length,
+          unpaidInvoicesCount: receivableInvoices.length,
           overdueInvoicesCount: overdueInvoices.length
         },
         // Flat aliases for backwards compatibility
@@ -232,6 +243,9 @@ const getMySalesStats = async (req, res) => {
         overdueAmount,
         salaryTarget,
         liability,
+        totalInvoicesCount,
+        approvedInvoicesCount,
+        paidInvoicesAmount,
         activeTarget: activeTarget ? { ...activeTarget.toJSON(), achievedAmount: salesAchieved, targetAmount: monthlyTarget } : null,
         // Projects & Tasks
         assignedProjectsCount,
@@ -672,6 +686,12 @@ const createMyInvoice = async (req, res) => {
       dealId,
       dealTitle,
       saleReference,
+      salesOrderId,
+      salesOrderNumber,
+      deliveryNoteId,
+      deliveryNoteNumber,
+      fileNumber,
+      fileType,
       items,
       subtotal,
       tax,
@@ -739,12 +759,20 @@ const createMyInvoice = async (req, res) => {
       dealId: dealId || null,
       dealTitle: dealTitle || '',
       saleReference: saleReference || '',
+      salesOrderId: salesOrderId || null,
+      salesOrderNumber: salesOrderNumber || '',
+      deliveryNoteId: deliveryNoteId || null,
+      deliveryNoteNumber: deliveryNoteNumber || '',
+      fileNumber: fileNumber || '',
+      fileType: fileType || '',
       items: processedItems,
       subtotal: Number(subtotal) || Number(amount),
       tax: Number(tax) || 0,
       taxRate: Number(taxRate) || 0,
       discount: Number(discount) || 0,
       amount: Number(amount),
+      paidAmount: 0,
+      outstandingAmount: Number(amount),
       status: initialStatus,
       paymentTerms: paymentTerms || 'Net 30',
       issueDate: issueDate ? new Date(issueDate) : new Date(),
@@ -854,7 +882,9 @@ const createMyQuotation = async (req, res) => {
       items,
       totalAmount,
       discount,
+      discountPercentage,
       tax,
+      taxPercentage,
       netAmount,
       status,
       validUntil,
@@ -876,7 +906,9 @@ const createMyQuotation = async (req, res) => {
       items: items || (productSummary ? [{ description: productSummary, quantity: 1, unitPrice: Number(totalAmount || netAmount || 0), total: Number(totalAmount || netAmount || 0) }] : []),
       totalAmount: Number(totalAmount) || Number(netAmount) || 0,
       discount: Number(discount) || 0,
+      discountPercentage: Number(discountPercentage) || 0,
       tax: Number(tax) || 0,
+      taxPercentage: Number(taxPercentage) || 0,
       netAmount: Number(netAmount) || Number(totalAmount) || 0,
       status: status || 'Quotation',
       validUntil: validUntil || null,
@@ -921,7 +953,9 @@ const updateMyQuotation = async (req, res) => {
       'items',
       'totalAmount',
       'discount',
+      'discountPercentage',
       'tax',
+      'taxPercentage',
       'netAmount',
       'status',
       'validUntil',
@@ -1578,43 +1612,49 @@ const getSalesTeamMembers = async (req, res) => {
         const ordersAchieved = orders
           .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Sales Order'].includes(o.status))
           .reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
-        const wonDealsValue = deals
-          .filter(d => ['Won', 'Closed Won'].includes(d.stage))
-          .reduce((sum, d) => sum + (Number(d.value) || 0), 0);
-        const approvedInvoicesAmount = invoices
-          .filter(i => ['Approved', 'Paid', 'Sent', 'Partially Paid'].includes(i.status))
-          .reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
+        const wonDeals = deals.filter(d => ['Won', 'Closed Won'].includes(d.stage));
+        const wonDealsValue = wonDeals.reduce((sum, d) => sum + (Number(d.value) || 0), 0);
+        
+        const approvedInvoicesList = invoices.filter(i => ['Approved', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status));
+        const approvedInvoicesAmount = approvedInvoicesList.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
+        const paidInvoicesAmount = invoices.reduce((sum, i) => sum + (Number(i.paidAmount) || (i.status === 'Paid' ? Number(i.amount) : 0)), 0);
 
         const achievedAmount = Math.max(wonDealsValue, ordersAchieved, approvedInvoicesAmount);
         const targetAmount = activeTarget?.targetAmount || (emp.salaryTarget ? emp.salaryTarget * 5 : 50000);
-        const targetPct = targetAmount > 0 ? Math.round((achievedAmount / targetAmount) * 100) : 0;
+        const remainingTarget = Math.max(0, targetAmount - achievedAmount);
+        const targetPct = targetAmount > 0 ? Math.round((achievedAmount / targetAmount) * 100) : (achievedAmount > 0 ? 100 : 0);
 
-        const convertedLeads = leads.filter(l => l.status === 'Converted').length;
+        const convertedLeads = leads.filter(l => l.status === 'Converted' || l.status === 'Converted to Deal').length;
         const pendingLeads = leads.filter(l => ['New', 'Contacted', 'Qualified'].includes(l.status)).length;
         const completedFollowUps = followUps.filter(f => f.status === 'Completed').length;
 
-        // Financials (PKR / Rs.)
-        const unpaidInvoices = invoices.filter(i => i.status !== 'Paid' && i.status !== 'Cancelled');
-        const invoiceReceivables = unpaidInvoices.reduce((sum, i) => {
+        // 1. Receivables: Strictly approved invoices with unpaid balance
+        const receivableInvoices = invoices.filter(i =>
+          ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
+          i.status !== 'Paid' &&
+          i.status !== 'Cancelled'
+        );
+        const receivables = receivableInvoices.reduce((sum, i) => {
           const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
           return sum + Math.max(0, outstanding);
         }, 0);
-        const pendingOrders = orders.filter(o => ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Sales Order'].includes(o.status));
-        const orderReceivables = pendingOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
-        const receivables = invoiceReceivables > 0 ? invoiceReceivables : orderReceivables;
 
-        const overdueInvoices = invoices.filter(i => (i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now)) && i.status !== 'Paid' && i.status !== 'Cancelled');
-        const overdueInvoiceAmount = overdueInvoices.reduce((sum, i) => {
+        // 2. Overdue: Strictly approved invoices past due date or status Overdue with unpaid balance
+        const overdueInvoices = invoices.filter(i => {
+          const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
+          const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
+          const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+          return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
+        });
+        const overdueAmount = overdueInvoices.reduce((sum, i) => {
           const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
           return sum + Math.max(0, outstanding);
         }, 0);
-        const overdueOrders = orders.filter(o => o.deliveryDate && new Date(o.deliveryDate) < now && !['Delivered', 'Cancelled'].includes(o.status));
-        const overdueOrderAmount = overdueOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
-        const overdueAmount = overdueInvoiceAmount > 0 ? overdueInvoiceAmount : overdueOrderAmount;
 
         const salaryTarget = Number(emp.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(targetAmount * 0.1) || 5000;
         const cancelledOrders = orders.filter(o => o.status === 'Cancelled');
         const liability = cancelledOrders.reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
+        const netRevenue = paidInvoicesAmount > 0 ? paidInvoicesAmount : achievedAmount;
 
         return {
           ...emp.toJSON(),
@@ -1625,15 +1665,20 @@ const getSalesTeamMembers = async (req, res) => {
             totalQuotations: quotations.length,
             totalOrders: orders.length,
             totalDeals: deals.length,
-            wonDealsCount: deals.filter(d => ['Won', 'Closed Won'].includes(d.stage)).length,
+            wonDealsCount: wonDeals.length,
+            wonDealsValue,
+            approvedInvoicesCount: approvedInvoicesList.length,
+            paidInvoicesAmount,
             completedFollowUps,
             targetAmount,
             achievedAmount,
+            remainingTarget,
             targetAchievementPct: targetPct,
             receivables,
             overdueAmount,
             salaryTarget,
-            liability
+            liability,
+            netRevenue
           }
         };
       })
@@ -1665,33 +1710,35 @@ const getSalesTeamMemberProfile = async (req, res) => {
     }
 
     const empId = emp._id;
-    const empFirstName = emp.fullName.split(' ')[0];
-    const empRegex = new RegExp(empFirstName, 'i');
 
     const [leads, quotations, orders, deliveryNotes, followUps, targets, activities, invoices, deals, customerPOs, productFiles, payments, payroll] = await Promise.all([
-      Lead.find({ $or: [{ assignedTo: empId }, { createdBy: empId }, { salePerson: empRegex }] }).sort({ createdAt: -1 }),
-      Quotation.find({ $or: [{ createdBy: empId }, { salePerson: empRegex }] }).sort({ creationDate: -1, createdAt: -1 }),
-      SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }, { salePerson: empRegex }] }).sort({ creationDate: -1, createdAt: -1 }),
+      Lead.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }).sort({ createdAt: -1 }),
+      Quotation.find({ createdBy: empId }).sort({ creationDate: -1, createdAt: -1 }),
+      SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }] }).sort({ creationDate: -1, createdAt: -1 }),
       DeliveryNote.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).populate('salesOrder', 'orderNumber orderReference').sort({ createdAt: -1 }),
       FollowUp.find({ createdBy: empId }).populate('lead', 'name company').sort({ scheduledAt: 1 }),
       SalesTarget.find({ employee: empId }).populate('assignedBy', 'fullName').sort({ createdAt: -1 }),
       SalesActivity.find({ performedBy: empId }).sort({ createdAt: -1 }).limit(50),
       Invoice.find({ createdBy: empId }).sort({ createdAt: -1 }),
       Deal.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }).sort({ createdAt: -1 }),
-      CustomerPO.find({ $or: [{ createdBy: empId }, { customerName: empRegex }] }).sort({ createdAt: -1 }),
+      CustomerPO.find({ createdBy: empId }).sort({ createdAt: -1 }),
       ProductFile.find({ createdBy: empId }).sort({ createdAt: -1 }),
       Payment.find({ createdBy: empId }).sort({ createdAt: -1 }),
       Payroll.findOne({ user: empId, month: now.getMonth() + 1, year: now.getFullYear() })
     ]);
 
-    // Performance summary
+    // Lead & Quotation performance
     const totalLeads = leads.length;
     const convertedLeads = leads.filter(l => l.status === 'Converted' || l.status === 'Converted to Deal').length;
     const pendingLeads = leads.filter(l => ['New', 'Contacted', 'Qualified'].includes(l.status)).length;
     const totalQuotations = quotations.length;
+    const acceptedQuotations = quotations.filter(q => q.status === 'Accepted').length;
     const totalOrders = orders.length;
+    const completedOrders = orders.filter(o => o.status === 'Delivered').length;
     const totalDeliveryNotes = deliveryNotes.length;
     const completedFollowUps = followUps.filter(f => f.status === 'Completed').length;
+    
+    // Deals & Invoices
     const totalDeals = deals.length;
     const wonDeals = deals.filter(d => ['Won', 'Closed Won'].includes(d.stage));
     const wonDealsCount = wonDeals.length;
@@ -1699,39 +1746,47 @@ const getSalesTeamMemberProfile = async (req, res) => {
 
     const ordersAchieved = orders
       .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Sales Order'].includes(o.status))
-      .reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
-    const approvedInvoicesAmount = invoices
-      .filter(i => ['Approved', 'Paid', 'Sent', 'Partially Paid'].includes(i.status))
-      .reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
+      .reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
+    const approvedInvoicesList = invoices
+      .filter(i => ['Approved', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status));
+    const approvedInvoicesAmount = approvedInvoicesList.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
+    const paidInvoicesAmount = invoices.reduce((sum, i) => sum + (Number(i.paidAmount) || (i.status === 'Paid' ? Number(i.amount) : 0)), 0);
 
+    // Sales Achieved & Targets
     const salesAchieved = Math.max(wonDealsValue, ordersAchieved, approvedInvoicesAmount);
     const activeTarget = targets.find(t => t.status === 'Active' || t.status === 'Ongoing') || targets[0];
-    const monthlyTarget = activeTarget?.targetAmount || (emp.salaryTarget ? emp.salaryTarget * 5 : 500000);
+    const monthlyTarget = activeTarget?.targetAmount || (emp.salaryTarget ? emp.salaryTarget * 5 : 50000);
     const remainingTarget = Math.max(0, monthlyTarget - salesAchieved);
     const achievementPct = monthlyTarget > 0 ? Math.round((salesAchieved / monthlyTarget) * 100) : (salesAchieved > 0 ? 100 : 0);
 
     // Financial calculations (PKR / Rs.)
-    const unpaidInvoices = invoices.filter(i => i.status !== 'Paid' && i.status !== 'Cancelled');
-    const invoiceReceivables = unpaidInvoices.reduce((sum, i) => {
+    // 1. Receivables: Strictly approved / active invoices with unpaid balance
+    const receivableInvoices = invoices.filter(i =>
+      ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
+      i.status !== 'Paid' &&
+      i.status !== 'Cancelled'
+    );
+    const receivables = receivableInvoices.reduce((sum, i) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
     }, 0);
-    const pendingOrders = orders.filter(o => ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Sales Order'].includes(o.status));
-    const orderReceivables = pendingOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
-    const receivables = invoiceReceivables > 0 ? invoiceReceivables : orderReceivables;
 
-    const overdueInvoices = invoices.filter(i => (i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now)) && i.status !== 'Paid' && i.status !== 'Cancelled');
-    const overdueInvoiceAmount = overdueInvoices.reduce((sum, i) => {
+    // 2. Overdue: Strictly approved invoices past due date or status Overdue with unpaid balance
+    const overdueInvoices = invoices.filter(i => {
+      const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
+      const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
+      const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+      return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
+    });
+    const overdueAmount = overdueInvoices.reduce((sum, i) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
     }, 0);
-    const overdueOrders = orders.filter(o => o.deliveryDate && new Date(o.deliveryDate) < now && !['Delivered', 'Cancelled'].includes(o.status));
-    const overdueOrderAmount = overdueOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
-    const overdueAmount = overdueInvoiceAmount > 0 ? overdueInvoiceAmount : overdueOrderAmount;
 
-    const salaryTarget = Number(emp.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(monthlyTarget * 0.1) || 50000;
+    const salaryTarget = Number(emp.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(monthlyTarget * 0.1) || 5000;
     const cancelledOrders = orders.filter(o => o.status === 'Cancelled');
-    const liability = cancelledOrders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
+    const liability = cancelledOrders.reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
+    const netRevenue = paidInvoicesAmount > 0 ? paidInvoicesAmount : salesAchieved;
 
     return res.status(200).json({
       success: true,
@@ -1742,12 +1797,16 @@ const getSalesTeamMemberProfile = async (req, res) => {
           convertedLeads,
           pendingLeads,
           totalQuotations,
+          acceptedQuotations,
           totalOrders,
+          completedOrders,
           totalDeals,
           wonDealsCount,
           wonDealsValue,
           totalDeliveryNotes,
           completedFollowUps,
+          approvedInvoicesCount: approvedInvoicesList.length,
+          paidInvoicesAmount,
           monthlyTarget,
           salesAchieved,
           remainingTarget,
@@ -1755,7 +1814,8 @@ const getSalesTeamMemberProfile = async (req, res) => {
           receivables,
           overdueAmount,
           salaryTarget,
-          liability
+          liability,
+          netRevenue
         },
         leads,
         quotations,
@@ -2260,11 +2320,86 @@ const getMyPayments = async (req, res) => {
   }
 };
 
+// Helper to synchronize Invoice and SalesOrder balances after payment changes
+const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
+  try {
+    if (invoiceId) {
+      const invoice = await Invoice.findById(invoiceId);
+      if (invoice) {
+        const allPayments = await Payment.find({ invoiceId });
+        const totalPaid = allPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+        const invTotal = Number(invoice.amount) || 0;
+        const outstanding = Math.max(0, invTotal - totalPaid);
+        let invStatus = invoice.status;
+        if (outstanding === 0 && invTotal > 0) {
+          invStatus = 'Paid';
+        } else if (totalPaid > 0) {
+          invStatus = 'Partially Paid';
+        } else if (invStatus === 'Partially Paid' || invStatus === 'Paid') {
+          invStatus = 'Approved';
+        }
+        await Invoice.findByIdAndUpdate(invoiceId, {
+          paidAmount: totalPaid,
+          outstandingAmount: outstanding,
+          status: invStatus
+        });
+      }
+    }
+
+    if (salesOrderId) {
+      const order = await SalesOrder.findById(salesOrderId);
+      if (order) {
+        const allOrderPayments = await Payment.find({ salesOrderId });
+        const totalPaid = allOrderPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+        const orderTotal = Number(order.netAmount) || Number(order.totalAmount) || 0;
+        const outstanding = Math.max(0, orderTotal - totalPaid);
+        let paymentStatus = 'Pending';
+        if (totalPaid === 0) paymentStatus = 'Pending';
+        else if (totalPaid >= orderTotal && orderTotal > 0) paymentStatus = 'Fully Paid';
+        else paymentStatus = 'Partially Paid';
+        await SalesOrder.findByIdAndUpdate(salesOrderId, {
+          totalPaid,
+          outstandingBalance: outstanding,
+          paymentStatus
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[Sync Balances Error]:', err);
+  }
+};
+
 const createMyPayment = async (req, res) => {
   try {
-    const { customerName, salesOrderId, salesOrderNumber, invoiceId, invoiceNumber, paymentDate, amount, paymentType, paymentMethod, notes } = req.body;
-    if (!customerName) return res.status(400).json({ success: false, message: 'Customer name is required.' });
+    let { customerName, salesOrderId, salesOrderNumber, invoiceId, invoiceNumber, paymentDate, amount, paymentType, paymentMethod, notes } = req.body;
+    if (!customerName || !customerName.trim()) return res.status(400).json({ success: false, message: 'Customer name is required.' });
     if (!amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'Valid payment amount is required.' });
+
+    const payAmount = Number(amount);
+
+    // If invoice is linked, auto-resolve sales order and check against overpayment
+    if (invoiceId) {
+      const invoice = await Invoice.findById(invoiceId);
+      if (invoice) {
+        if (!salesOrderId && invoice.salesOrderId) {
+          salesOrderId = invoice.salesOrderId;
+          salesOrderNumber = invoice.salesOrderNumber || invoice.saleReference || salesOrderNumber;
+        }
+        if (!invoiceNumber && invoice.invoiceNumber) {
+          invoiceNumber = invoice.invoiceNumber;
+        }
+        const invTotal = Number(invoice.amount) || 0;
+        const currentPaid = Number(invoice.paidAmount) || 0;
+        const currentRemaining = Math.max(0, invTotal - currentPaid);
+
+        if (payAmount > currentRemaining + 0.01) {
+          return res.status(400).json({
+            success: false,
+            message: `Payment amount (Rs. ${payAmount.toLocaleString()}) exceeds the invoice's remaining receivable of Rs. ${currentRemaining.toLocaleString()}.`
+          });
+        }
+      }
+    }
 
     const payment = await Payment.create({
       customerName: customerName.trim(),
@@ -2273,47 +2408,19 @@ const createMyPayment = async (req, res) => {
       invoiceId: invoiceId || null,
       invoiceNumber: invoiceNumber || '',
       paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
-      amount: Number(amount),
+      amount: payAmount,
       paymentType: paymentType || 'Partial',
       paymentMethod: paymentMethod || 'Bank Transfer',
       notes: notes || '',
       createdBy: req.user._id
     });
 
-    // Auto-update Sales Order payment status
-    if (salesOrderId) {
-      const order = await SalesOrder.findById(salesOrderId);
-      if (order) {
-        const allPayments = await Payment.find({ salesOrderId });
-        const totalPaid = allPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-        const orderTotal = Number(order.netAmount) || Number(order.totalAmount) || 0;
-        const outstanding = Math.max(0, orderTotal - totalPaid);
-        let paymentStatus = 'Pending';
-        if (totalPaid === 0) paymentStatus = 'Pending';
-        else if (payment.paymentType === 'Advance' && totalPaid < orderTotal) paymentStatus = 'Advance Received';
-        else if (totalPaid >= orderTotal) paymentStatus = 'Fully Paid';
-        else paymentStatus = 'Partially Paid';
-        await SalesOrder.findByIdAndUpdate(salesOrderId, { totalPaid, outstandingBalance: outstanding, paymentStatus });
-      }
-    }
-
-    // Update Invoice paid amount if linked
-    if (invoiceId) {
-      const invoice = await Invoice.findById(invoiceId);
-      if (invoice) {
-        const allPayments = await Payment.find({ invoiceId });
-        const totalPaid = allPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-        const outstanding = Math.max(0, Number(invoice.amount) - totalPaid);
-        let invStatus = invoice.status;
-        if (totalPaid >= Number(invoice.amount)) invStatus = 'Paid';
-        else if (totalPaid > 0) invStatus = 'Partially Paid';
-        await Invoice.findByIdAndUpdate(invoiceId, { paidAmount: totalPaid, outstandingAmount: outstanding, status: invStatus });
-      }
-    }
+    // Auto-update Invoice and Sales Order payment status and outstanding balances
+    await syncInvoiceAndOrderBalances(invoiceId, salesOrderId);
 
     await logSalesActivity({
       type: 'Payment Recorded',
-      description: `Recorded ${paymentType || 'Partial'} payment of Rs. ${Number(amount).toLocaleString()} from ${customerName}`,
+      description: `Recorded ${paymentType || 'Partial'} payment of Rs. ${payAmount.toLocaleString()} from ${customerName}`,
       relatedModel: 'Payment',
       relatedId: payment._id,
       relatedCustomer: customerName,
@@ -2325,7 +2432,7 @@ const createMyPayment = async (req, res) => {
       role: 'sales_manager',
       sender: req.user._id,
       title: 'Payment Recorded',
-      message: `${req.user.fullName} recorded a payment of Rs. ${Number(amount).toLocaleString()} from ${customerName} (${paymentType || 'Partial'}).`,
+      message: `${req.user.fullName} recorded a payment of Rs. ${payAmount.toLocaleString()} from ${customerName} (${paymentType || 'Partial'}).`,
       type: 'sales'
     });
 
@@ -2344,9 +2451,28 @@ const updateMyPayment = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied. You can only edit your own payments.' });
     }
 
-    const allowedFields = ['customerName', 'paymentDate', 'amount', 'paymentType', 'paymentMethod', 'notes', 'invoiceNumber', 'salesOrderNumber'];
-    allowedFields.forEach(field => { if (req.body[field] !== undefined) payment[field] = req.body[field]; });
+    const oldInvoiceId = payment.invoiceId;
+    const oldSalesOrderId = payment.salesOrderId;
+
+    const allowedFields = ['customerName', 'paymentDate', 'amount', 'paymentType', 'paymentMethod', 'notes', 'invoiceNumber', 'salesOrderNumber', 'invoiceId', 'salesOrderId'];
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        if (field === 'amount') payment[field] = Number(req.body[field]);
+        else payment[field] = req.body[field];
+      }
+    });
+
     await payment.save();
+
+    // Re-sync balances
+    await syncInvoiceAndOrderBalances(payment.invoiceId || oldInvoiceId, payment.salesOrderId || oldSalesOrderId);
+    if (oldInvoiceId && String(oldInvoiceId) !== String(payment.invoiceId)) {
+      await syncInvoiceAndOrderBalances(oldInvoiceId, null);
+    }
+    if (oldSalesOrderId && String(oldSalesOrderId) !== String(payment.salesOrderId)) {
+      await syncInvoiceAndOrderBalances(null, oldSalesOrderId);
+    }
+
     return res.status(200).json({ success: true, message: 'Payment updated.', data: payment });
   } catch (error) {
     console.error('[Update Payment Error]:', error);
@@ -2361,7 +2487,14 @@ const deleteMyPayment = async (req, res) => {
     if (!checkOwnership(payment, 'createdBy', req.user._id, req.user)) {
       return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own payments.' });
     }
+    const invId = payment.invoiceId;
+    const soId = payment.salesOrderId;
+
     await Payment.findByIdAndDelete(req.params.id);
+
+    // Re-sync balances after deletion
+    await syncInvoiceAndOrderBalances(invId, soId);
+
     return res.status(200).json({ success: true, message: 'Payment deleted.' });
   } catch (error) {
     console.error('[Delete Payment Error]:', error);
@@ -2419,10 +2552,11 @@ const createMyProformaInvoice = async (req, res) => {
       clientEmail,
       clientPhone,
       clientAddress,
-      items,
       totalAmount,
       discount,
+      discountPercentage,
       tax,
+      taxPercentage,
       netAmount,
       status,
       issueDate,
@@ -2466,8 +2600,11 @@ const createMyProformaInvoice = async (req, res) => {
 
     let calculatedSubtotal = 0;
     resolvedItems.forEach(it => { calculatedSubtotal += it.total; });
-    const disc = discount !== undefined ? Number(discount) || 0 : (salesOrder.discount || 0);
-    const tx = tax !== undefined ? Number(tax) || 0 : (salesOrder.tax || 0);
+    const discPct = discountPercentage !== undefined ? Number(discountPercentage) || 0 : (salesOrder.discountPercentage || 0);
+    const disc = discount !== undefined ? Number(discount) || 0 : (salesOrder.discount || (discPct > 0 ? (calculatedSubtotal * discPct) / 100 : 0));
+    const taxableBase = Math.max(0, calculatedSubtotal - disc);
+    const txPct = taxPercentage !== undefined ? Number(taxPercentage) || 0 : (salesOrder.taxPercentage || 0);
+    const tx = tax !== undefined ? Number(tax) || 0 : (salesOrder.tax || (txPct > 0 ? (taxableBase * txPct) / 100 : 0));
     const calculatedNetAmount = Math.max(0, calculatedSubtotal - disc + tx);
 
     const proforma = await ProformaInvoice.create({
@@ -2485,7 +2622,9 @@ const createMyProformaInvoice = async (req, res) => {
       items: resolvedItems,
       totalAmount: calculatedSubtotal,
       discount: disc,
+      discountPercentage: discPct,
       tax: tx,
+      taxPercentage: txPct,
       netAmount: calculatedNetAmount,
       currency: 'PKR',
       status: status || 'Issued',
@@ -2551,7 +2690,9 @@ const updateMyProformaInvoice = async (req, res) => {
       clientAddress,
       items,
       discount,
+      discountPercentage,
       tax,
+      taxPercentage,
       status,
       issueDate,
       dueDate,
@@ -2570,7 +2711,9 @@ const updateMyProformaInvoice = async (req, res) => {
     if (issueDate) proforma.issueDate = issueDate;
     if (dueDate !== undefined) proforma.dueDate = dueDate;
     if (discount !== undefined) proforma.discount = Number(discount) || 0;
+    if (discountPercentage !== undefined) proforma.discountPercentage = Number(discountPercentage) || 0;
     if (tax !== undefined) proforma.tax = Number(tax) || 0;
+    if (taxPercentage !== undefined) proforma.taxPercentage = Number(taxPercentage) || 0;
 
     if (Array.isArray(items) && items.length > 0) {
       proforma.items = items.map(it => {
