@@ -32,13 +32,18 @@ const DeliveryNoteSchema = new mongoose.Schema(
     ],
     status: {
       type: String,
-      enum: ['Draft', 'Waiting', 'Ready', 'Done', 'Cancelled', 'Returned', 'Pending', 'Dispatched', 'In Transit', 'Partially Delivered', 'Fully Delivered', 'Delivered'],
+      enum: ['Draft', 'Created', 'Waiting', 'Ready', 'Confirmed', 'Done', 'Cancelled', 'Returned', 'Pending', 'Dispatched', 'In Transit', 'Partially Delivered', 'Fully Delivered', 'Delivered'],
       default: 'Ready'
     },
     deliveryDate: { type: Date, default: null },
     receivedBy: { type: String, trim: true, default: '' },
     notes: { type: String, default: '' },
     isPartial: { type: Boolean, default: false },
+    isStockDeducted: { type: Boolean, default: false },
+    invoiced: { type: Boolean, default: false },
+    invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
+    invoiceNumber: { type: String, default: '' },
+    invoicedAt: { type: Date, default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
   },
   { timestamps: true }

@@ -284,6 +284,68 @@ const getFinanceSummary = async (req, res) => {
   }
 };
 
+// GET /api/finance/reports/full — Comprehensive Finance Data
+const getFullFinanceReports = async (req, res) => {
+  try {
+    const invoices = await Invoice.find();
+    const expenses = await Expense.find();
+    const payrolls = await Payroll.find();
+    const maintenance = await MaintenanceCharge.find();
+
+    // P&L Logic
+    const revenue = invoices.filter(i => i.status === 'Paid').reduce((s, i) => s + (i.amount || 0), 0);
+    const expensesCost = expenses.filter(e => e.status === 'Paid' || e.status === 'Approved').reduce((s, e) => s + (e.amount || 0), 0);
+    const payrollCost = payrolls.reduce((s, p) => s + (p.netPay || 0), 0);
+    const maintenanceCost = maintenance.filter(m => m.status === 'Paid' || m.status === 'Approved').reduce((s, m) => s + (m.amount || 0), 0);
+
+    const totalCost = expensesCost + payrollCost + maintenanceCost;
+    const netProfit = revenue - totalCost;
+
+    // Balance Sheet
+    const receivables = invoices.filter(i => i.status === 'Pending' || i.status === 'Overdue').reduce((s, i) => s + (i.amount || 0), 0);
+    const payables = expenses.filter(e => e.status === 'Pending').reduce((s, e) => s + (e.amount || 0), 0) +
+                     maintenance.filter(m => m.status === 'Pending').reduce((s, m) => s + (m.amount || 0), 0);
+                     
+    // Simplistic cash flow approximation (Paid Invoices - Paid/Approved Expenses/Maintenance)
+    const cashOnHand = revenue - expensesCost - maintenanceCost - payrollCost;
+
+    const expenseCategories = {
+      Software: expenses.filter(e => e.category === 'Software').reduce((s, e) => s + (e.amount || 0), 0),
+      Marketing: expenses.filter(e => e.category === 'Marketing').reduce((s, e) => s + (e.amount || 0), 0),
+      Travel: expenses.filter(e => e.category === 'Travel').reduce((s, e) => s + (e.amount || 0), 0),
+      OfficeSupplies: expenses.filter(e => e.category === 'Office Supplies').reduce((s, e) => s + (e.amount || 0), 0),
+      Utilities: expenses.filter(e => e.category === 'Utilities').reduce((s, e) => s + (e.amount || 0), 0),
+      Salaries: payrollCost,
+      Other: expenses.filter(e => e.category === 'Other').reduce((s, e) => s + (e.amount || 0), 0),
+    };
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        revenue,
+        expensesCost,
+        payrollCost,
+        maintenanceCost,
+        totalCost,
+        netProfit,
+        receivables,
+        payables,
+        cashOnHand,
+        expenseCategories,
+        counts: {
+          invoices: invoices.length,
+          expenses: expenses.length,
+          payrolls: payrolls.length,
+          maintenance: maintenance.length
+        }
+      }
+    });
+  } catch (error) {
+    console.error('[Get Full Finance Reports Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error generating finance reports.' });
+  }
+};
+
 // MAINTENANCE CHARGES API
 const getMaintenanceCharges = async (req, res) => {
   try {
@@ -363,6 +425,7 @@ module.exports = {
   updatePayroll,
   deletePayroll,
   getFinanceSummary,
+  getFullFinanceReports,
   getMaintenanceCharges,
   createMaintenanceCharge,
   updateMaintenanceCharge,

@@ -13,6 +13,7 @@ const {
   updatePayroll,
   deletePayroll,
   getFinanceSummary,
+  getFullFinanceReports,
   getMaintenanceCharges,
   createMaintenanceCharge,
   updateMaintenanceCharge,
@@ -23,6 +24,7 @@ const { protect } = require('../middleware/authMiddleware');
 router.use(protect);
 
 router.get('/summary', getFinanceSummary);
+router.get('/reports/full', getFullFinanceReports);
 router.route('/invoices').get(getInvoices).post(createInvoice);
 router.route('/invoices/:id').patch(updateInvoice).delete(deleteInvoice);
 router.route('/expenses').get(getExpenses).post(createExpense);

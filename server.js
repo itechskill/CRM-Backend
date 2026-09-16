@@ -24,7 +24,9 @@ const salesManagerTeamRoutes = require('./routes/salesManagerTeamRoutes');
 dotenv.config();
 
 // Connect to Database
-connectDB();
+connectDB().catch((err) => {
+  console.warn('[MongoDB Startup Notice]: Initial DB connection pending/retrying in background.');
+});
 
 const app = express();
 

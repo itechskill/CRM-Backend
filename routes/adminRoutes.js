@@ -6,6 +6,8 @@ const {
   approveRegistrationRequest,
   rejectRegistrationRequest,
   updateUserPassword,
+  updateUserEmail,
+  resetUserPassword,
   updateUserRole,
   updateUserStatus,
   updateUserDepartment,
@@ -13,7 +15,11 @@ const {
   createCeoAccount,
   getExecutiveSummary,
   getDirectoryUsers,
-  getUserProfileDetails
+  getUserProfileDetails,
+  getOrgUsers,
+  getOrgUserPerformance,
+  getOrgDepartmentStats,
+  getOrgMonthlyPerformance
 } = require('../controllers/adminController');
 const { protect, authorize } = require('../middleware/authMiddleware');
 
@@ -25,6 +31,12 @@ router.get('/executive-summary', authorize('admin', 'ceo'), getExecutiveSummary)
 // GET /api/admin/directory & profile details (Admin & CEO)
 router.get('/directory', authorize('admin', 'ceo', 'administration', 'hr_manager'), getDirectoryUsers);
 router.get('/directory/:id', authorize('admin', 'ceo', 'administration', 'hr_manager'), getUserProfileDetails);
+
+// Centralized Organization Monitoring Routes (Admin & CEO)
+router.get('/org/users', authorize('admin', 'ceo'), getOrgUsers);
+router.get('/org/users/:id/performance', authorize('admin', 'ceo'), getOrgUserPerformance);
+router.get('/org/departments', authorize('admin', 'ceo'), getOrgDepartmentStats);
+router.get('/org/monthly', authorize('admin', 'ceo'), getOrgMonthlyPerformance);
 
 // Remaining routes require Admin role
 router.use(authorize('admin'));
@@ -39,6 +51,8 @@ router.delete('/registration-requests/:id', deleteUser);
 // User Management
 router.delete('/users/:id', deleteUser);
 router.patch('/users/:id/password', updateUserPassword);
+router.patch('/users/:id/reset-password', resetUserPassword);
+router.patch('/users/:id/email', updateUserEmail);
 router.patch('/users/:id/role', updateUserRole);
 router.patch('/users/:id/status', updateUserStatus);
 router.patch('/users/:id/department', updateUserDepartment);

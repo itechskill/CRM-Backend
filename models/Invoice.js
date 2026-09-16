@@ -32,17 +32,25 @@ const InvoiceSchema = new mongoose.Schema({
   outstandingAmount: { type: Number, default: 0, min: 0 },
   status: {
     type: String,
-    enum: ['Draft', 'Pending Review', 'Submitted', 'Approved', 'Rejected', 'Sent', 'Paid', 'Partially Paid', 'Overdue', 'Cancelled'],
-    default: 'Pending Review'
+    enum: ['Draft', 'Pending Finance Finalization', 'Pending Review', 'Submitted', 'Approved', 'Finalized', 'Rejected', 'Sent', 'Paid', 'Partially Paid', 'Overdue', 'Cancelled'],
+    default: 'Draft'
   },
+  isDraft: { type: Boolean, default: true },
+  invoiceType: { type: String, enum: ['GST Invoice', 'Cash Invoice', 'Standard', 'Commercial', ''], default: '' },
   paymentTerms: { type: String, default: 'Net 30' },
   issueDate: { type: Date, default: Date.now },
   dueDate: { type: Date, required: true },
   description: { type: String, default: '' },
   notes: { type: String, default: '' },
+  departmentResponsible: { type: String, default: 'Accounts' },
+  salePerson: { type: String, default: '' },
+  salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   reviewedAt: { type: Date },
+  finalizedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  finalizedByName: { type: String, default: '' },
+  finalizedAt: { type: Date, default: null },
   rejectionReason: { type: String, default: '' }
 }, {
   timestamps: true
