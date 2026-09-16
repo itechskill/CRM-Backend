@@ -56,11 +56,12 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
     ] = await Promise.all([
       User.find({
         $or: [
-          { role: 'sales_member' },
-          { role: 'employee', department: { $regex: /^sales$/i } },
-          { department: { $regex: /^sales$/i } }
+          { role: { $in: ['employee', 'sales_rep', 'sales_member'] }, department: { $regex: /^sales$/i } },
+          { role: { $in: ['sales_rep', 'sales_member'] } },
+          { department: { $regex: /^sales$/i } },
+          { position: { $regex: /sales/i } }
         ],
-        role: { $nin: ['admin', 'ceo', 'hr_manager', 'accountant', 'sales_manager'] }
+        role: { $nin: ['admin', 'ceo', 'hr_manager', 'accountant', 'sales_manager', 'administration', 'project_manager', 'marketing'] }
       }).select('-password'),
       Lead.find().populate('assignedTo', 'fullName email').sort({ createdAt: -1 }),
       Deal.find().populate('assignedTo', 'fullName email').sort({ createdAt: -1 }),
@@ -365,20 +366,40 @@ router.post('/invite-member', managerGuard, async (req, res) => {
       });
     }
 
+    const reqPos = (position && position.trim()) ? position.trim() : 'Sales Representative';
+    const isSalesPerson = reqPos.toLowerCase().includes('person') || req.body.role === 'sales_person' || req.body.role === 'sales_member';
+    const assignedRole = isSalesPerson ? 'sales_person' : 'sales_rep';
+    const assignedPosition = isSalesPerson ? 'Sales Person' : 'Sales Representative';
+    const targetVal = Number(salaryTarget || req.body.target) || 0;
+
     const newUser = new User({
       fullName: fullName.trim(),
       email: normalizedEmail,
       phone: phone ? phone.trim() : '',
-      position: position ? position.trim() : 'Sales Representative',
-      salaryTarget: Number(salaryTarget) || 0,
+      position: assignedPosition,
+      salaryTarget: targetVal,
       password: password,
-      role: 'sales_member',
+      role: assignedRole,
       department: 'Sales',
       status: 'pending',
       isApproved: false
     });
 
     await newUser.save();
+
+    if (targetVal > 0) {
+      await SalesTarget.create({
+        employee: newUser._id,
+        targetAmount: targetVal,
+        period: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),
+        periodType: 'Monthly',
+        currency: 'PKR',
+        status: 'Active',
+        assignedBy: req.user._id,
+        startDate: new Date(),
+        endDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0)
+      }).catch(err => console.error('[Create SalesTarget Error]:', err.message));
+    }
 
     // Notify System Admin
     await notifyRoleHelper({
@@ -458,8 +479,11 @@ router.post('/assign-lead', managerGuard, async (req, res) => {
 
     const employee = await User.findOne({
       _id: employeeId,
-      role: 'employee',
-      department: { $regex: /^sales$/i },
+      $or: [
+        { role: { $in: ['employee', 'sales_rep', 'sales_person', 'sales_member'] }, department: { $regex: /^sales$/i } },
+        { role: { $in: ['sales_rep', 'sales_person', 'sales_member'] } },
+        { department: { $regex: /^sales$/i } }
+      ],
       status: 'active'
     });
 
@@ -528,8 +552,11 @@ router.post('/assign-followup', managerGuard, async (req, res) => {
 
     const employee = await User.findOne({
       _id: employeeId,
-      role: 'employee',
-      department: { $regex: /^sales$/i },
+      $or: [
+        { role: { $in: ['employee', 'sales_rep', 'sales_person', 'sales_member'] }, department: { $regex: /^sales$/i } },
+        { role: { $in: ['sales_rep', 'sales_person', 'sales_member'] } },
+        { department: { $regex: /^sales$/i } }
+      ],
       status: 'active'
     });
 
@@ -580,8 +607,11 @@ router.post('/targets', managerGuard, async (req, res) => {
 
     const employee = await User.findOne({
       _id: employeeId,
-      role: 'employee',
-      department: { $regex: /^sales$/i }
+      $or: [
+        { role: { $in: ['employee', 'sales_rep', 'sales_person', 'sales_member'] }, department: { $regex: /^sales$/i } },
+        { role: { $in: ['sales_rep', 'sales_person', 'sales_member'] } },
+        { department: { $regex: /^sales$/i } }
+      ]
     });
 
     if (!employee) {

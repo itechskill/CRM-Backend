@@ -29,7 +29,7 @@ const QuotationSchema = new mongoose.Schema(
     netAmount: { type: Number, default: 0 },
     status: {
       type: String,
-      enum: ['Draft', 'Quotation', 'Sent', 'Under Review', 'Accepted', 'Rejected', 'Expired'],
+      enum: ['Draft', 'Quotation', 'Sent', 'Under Review', 'Accepted', 'Rejected', 'Expired', 'Converted to Sales Order', 'Converted to Customer PO', 'Converted'],
       default: 'Draft'
     },
     validUntil: { type: Date, default: null },
@@ -38,6 +38,9 @@ const QuotationSchema = new mongoose.Schema(
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', default: null },
     dealId: { type: mongoose.Schema.Types.ObjectId, ref: 'Deal', default: null },
     customerPOId: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomerPO', default: null },
+    salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
+    salesOrderNumber: { type: String, default: '' },
+    convertedAt: { type: Date, default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
   },
   { timestamps: true }

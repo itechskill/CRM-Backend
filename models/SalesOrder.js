@@ -66,6 +66,36 @@ const SalesOrderSchema = new mongoose.Schema(
       enum: ['None', 'Draft', 'Issued', 'Sent', 'Approved', 'Cancelled'],
       default: 'None'
     },
+    customerOverdueAtCreation: { type: Number, default: 0 },
+    requiresFinanceApproval: { type: Boolean, default: false },
+    financeApprovedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    financeApprovedByName: { type: String, default: '' },
+    financeApprovedAt: { type: Date, default: null },
+    financeRejectionReason: { type: String, default: '' },
+    deliveryNoteId: { type: mongoose.Schema.Types.ObjectId, ref: 'DeliveryNote', default: null },
+    deliveryNoteNumber: { type: String, default: '' },
+    invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
+    // Department Handoff & Audit Trail
+    workflowStatus: {
+      type: String,
+      default: 'Sales Order Created'
+    },
+    departmentResponsible: {
+      type: String,
+      default: 'Sales'
+    },
+    workflowHistory: [
+      {
+        user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+        userName: { type: String, default: '' },
+        department: { type: String, default: '' },
+        action: { type: String, default: '' },
+        previousStatus: { type: String, default: '' },
+        newStatus: { type: String, default: '' },
+        timestamp: { type: Date, default: Date.now },
+        notes: { type: String, default: '' }
+      }
+    ],
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', default: null },
     salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }

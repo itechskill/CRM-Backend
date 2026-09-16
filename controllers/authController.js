@@ -8,10 +8,14 @@ const PUBLIC_REGISTRATION_ROLES = [
   'administration',
   'hr_manager',
   'sales_manager',
+  'sales_member',
+  'sales_person',
   'project_manager',
   'marketing',
   'accountant',
-  'employee'
+  'employee',
+  'support',
+  'finance'
 ];
 
 /**
@@ -146,13 +150,35 @@ const registerUser = async (req, res) => {
     }
 
     // 8. Create new user with pending status & isApproved = false
+    const isSalesRole = ['sales_member', 'sales_person'].includes(normalizedRole);
+    const defaultPosition = isSalesRole
+      ? 'Sales Person'
+      : (req.body.position ? req.body.position.trim() : '');
+
+    const roleDepartmentMap = {
+      'sales_person': 'Sales',
+      'sales_member': 'Sales',
+      'sales_manager': 'Sales',
+      'support': 'Customer Support',
+      'accountant': 'Accounting',
+      'finance': 'Finance',
+      'project_manager': 'Development',
+      'hr_manager': 'HR',
+      'marketing': 'Marketing',
+      'administration': 'Administration',
+      'employee': 'General'
+    };
+
+    const resolvedDepartment = (department && department.trim()) || roleDepartmentMap[normalizedRole] || (isSalesRole ? 'Sales' : 'General');
+
     const newUser = new User({
       fullName: fullName.trim(),
       email: normalizedEmail,
       phone: phone ? phone.trim() : '',
       password,
       role: normalizedRole,
-      department: department ? department.trim() : '',
+      position: defaultPosition,
+      department: resolvedDepartment,
       employeeId: employeeId && employeeId.trim() !== '' ? employeeId.trim() : undefined,
       status: 'pending',
       isApproved: false
@@ -495,6 +521,85 @@ const resetPassword = async (req, res) => {
   }
 };
 
+/**
+ * @desc    Change password for authenticated logged-in user
+ * @route   PUT /api/auth/update-password
+ * @access  Private (All authenticated roles)
+ */
+const updatePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Current password and new password are required.'
+      });
+    }
+
+    // Complexity Validation: 8+ chars, 1 uppercase, 1 number, 1 special character
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must be at least 8 characters long.'
+      });
+    }
+    if (!/[A-Z]/.test(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must contain at least one uppercase letter (A-Z).'
+      });
+    }
+    if (!/[0-9]/.test(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must contain at least one number (0-9).'
+      });
+    }
+    if (!/[!@#$%^&*(),.?":{}|<>\-_~]/.test(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must contain at least one special character (!@#$%^&*...).'
+      });
+    }
+
+    const user = await User.findById(req.user._id).select('+password');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    const isMatch = await user.matchPassword(currentPassword);
+    if (!isMatch) {
+      return res.status(400).json({
+        success: false,
+        message: 'Incorrect current password. Please enter your valid current password.'
+      });
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    await logAudit({
+      action: 'Password Changed',
+      performedBy: user._id,
+      performedByName: user.fullName,
+      targetUser: user._id,
+      targetUserName: user.fullName,
+      details: `Password changed successfully for user ${user.email}`
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password changed successfully. Your old password has expired and the new password is now active.'
+    });
+  } catch (error) {
+    console.error('[Update Password Error]:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error updating password.'
+    });
+  }
+};
 
 module.exports = {
   registerUser,
@@ -502,5 +607,6 @@ module.exports = {
   logoutUser,
   getMe,
   forgotPassword,
-  resetPassword
+  resetPassword,
+  updatePassword
 };

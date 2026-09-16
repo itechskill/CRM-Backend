@@ -1,4 +1,4 @@
-﻿const mongoose = require('mongoose');
+const mongoose = require('mongoose');
 
 const CustomerPOSchema = new mongoose.Schema(
   {
@@ -7,6 +7,8 @@ const CustomerPOSchema = new mongoose.Schema(
     customerName: { type: String, required: [true, 'Customer name is required'], trim: true },
     quotationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation', default: null },
     quotationNumber: { type: String, trim: true, default: '' },
+    productFileId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductFile', default: null },
+    salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
     amount: { type: Number, default: 0 },
     notes: { type: String, default: '' },
     uploadedDocument: { type: String, default: '' },

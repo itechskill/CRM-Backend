@@ -68,7 +68,7 @@ const getMySalesStats = async (req, res) => {
       FollowUp.find({ createdBy: userId }),
       SalesTarget.find({ employee: userId }).sort({ createdAt: -1 }),
       User.findById(userId),
-      Invoice.find({ createdBy: userId }),
+      Invoice.find({ $or: [{ salesPerson: userId }, { createdBy: userId }] }),
       Payroll.findOne({ user: userId, month: now.getMonth() + 1, year: now.getFullYear() }),
       Attendance.find({ user: userId, date: { $gte: startOfMonth } }),
       Leave.find({ user: userId, createdAt: { $gte: startOfMonth } }),
@@ -90,11 +90,11 @@ const getMySalesStats = async (req, res) => {
 
     // Order stats
     const totalOrders = orders.length;
-    const completedOrders = orders.filter(o => o.status === 'Delivered').length;
-    const totalOrdersValue = orders.reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
+    const completedOrders = orders.filter(o => o.status === 'Delivered' || o.status === 'Completed').length;
+    const totalOrdersValue = orders.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
     const ordersAchieved = orders
-      .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Sales Order'].includes(o.status))
-      .reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
+      .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed', 'Finance Approved', 'Sales Order'].includes(o.status))
+      .reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
 
     // Deal stats
     const totalDeals = deals.length;
@@ -106,7 +106,7 @@ const getMySalesStats = async (req, res) => {
 
     // Invoice stats
     const totalInvoicesCount = invoices.length;
-    const approvedInvoicesList = invoices.filter(i => ['Approved', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status));
+    const approvedInvoicesList = invoices.filter(i => ['Approved', 'Finalized', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status) || (!i.isDraft && i.status !== 'Draft' && i.status !== 'Cancelled'));
     const approvedInvoicesCount = approvedInvoicesList.length;
     const approvedInvoicesAmount = approvedInvoicesList.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
     const paidInvoices = invoices.filter(i => i.status === 'Paid');
@@ -118,7 +118,6 @@ const getMySalesStats = async (req, res) => {
     const pendingFollowUps = totalFollowUps - completedFollowUps;
 
     // ── LEGIT SALES ACHIEVED ──
-    // Computed dynamically from won deals, confirmed/delivered orders, and approved invoices
     const salesAchieved = Math.max(wonDealsValue, ordersAchieved, approvedInvoicesAmount);
 
     // ── TARGET QUOTA ──
@@ -128,9 +127,9 @@ const getMySalesStats = async (req, res) => {
     const targetAchievementPct = monthlyTarget > 0 ? Math.round((salesAchieved / monthlyTarget) * 100) : (salesAchieved > 0 ? 100 : 0);
 
     // ── FINANCIALS ──
-    // 1. Receivables: Strictly approved / active invoices with unpaid balance (excluding drafts, pending review, submitted, rejected, cancelled, and fully paid)
+    // 1. Receivables: Strictly approved / finalized invoices with unpaid balance
     const receivableInvoices = invoices.filter(i =>
-      ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
+      (['Approved', 'Finalized', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) || (!i.isDraft && i.status !== 'Draft')) &&
       i.status !== 'Paid' &&
       i.status !== 'Cancelled'
     );
@@ -140,12 +139,12 @@ const getMySalesStats = async (req, res) => {
     }, 0);
     const invoiceReceivables = receivables;
     const orderReceivables = orders
-      .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered'].includes(o.status))
-      .reduce((sum, o) => sum + (Number(o.outstandingBalance != null ? o.outstandingBalance : o.netAmount) || 0), 0);
+      .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Completed', 'Finance Approved'].includes(o.status))
+      .reduce((sum, o) => sum + (Number(o.outstandingBalance != null ? o.outstandingBalance : (o.netAmount || o.totalAmount)) || 0), 0);
 
-    // 2. Overdue: Strictly approved invoices past due date or marked overdue with unpaid balance
+    // 2. Overdue: Strictly approved / finalized invoices past due date or marked overdue with unpaid balance
     const overdueInvoices = invoices.filter(i => {
-      const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
+      const isApproved = ['Approved', 'Finalized', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) || (!i.isDraft && i.status !== 'Draft');
       const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
@@ -631,21 +630,24 @@ const getMyInvoices = async (req, res) => {
     const userId = req.user._id;
     const { status, search } = req.query;
 
-    const query = { createdBy: userId };
+    const isGlobal = ['admin', 'ceo', 'accountant', 'finance', 'sales_manager'].includes(req.user.role) ||
+      ['accounts', 'finance', 'administration'].includes((req.user.department || '').toLowerCase());
+    const query = isGlobal ? {} : { createdBy: userId };
     if (status && status !== 'all') {
       query.status = status;
     }
 
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ invoiceNumber: regex }, { clientName: regex }, { dealTitle: regex }, { saleReference: regex }];
+      query.$or = [{ invoiceNumber: regex }, { clientName: regex }, { dealTitle: regex }, { saleReference: regex }, { salePerson: regex }];
     }
 
     const [invoices, eligibleDeals, eligibleOrders] = await Promise.all([
       Invoice.find(query)
         .populate('dealId', 'title value stage clientName contactEmail contactPhone')
-        .populate('createdBy', 'fullName email')
-        .populate('reviewedBy', 'fullName email')
+        .populate('createdBy', 'fullName email position role')
+        .populate('reviewedBy', 'fullName email position role')
+        .populate('salesPerson', 'fullName email position role')
         .sort({ createdAt: -1 }),
       Deal.find({
         assignedTo: userId,
@@ -748,7 +750,25 @@ const createMyInvoice = async (req, res) => {
       }];
     }
 
-    const initialStatus = status || 'Pending Review';
+    const initialStatus = status || 'Draft';
+    const isDraft = initialStatus === 'Draft' || initialStatus === 'Pending Finance Finalization' || req.body.isDraft !== false;
+
+    let resolvedSalePerson = req.body.salePerson || '';
+    let resolvedSalesPersonId = null;
+    let resolvedDeliveryNoteId = deliveryNoteId || null;
+    let resolvedDeliveryNoteNumber = deliveryNoteNumber || '';
+
+    if (salesOrderId) {
+      const linkedSo = await SalesOrder.findById(salesOrderId);
+      if (linkedSo) {
+        resolvedSalePerson = resolvedSalePerson || linkedSo.salePerson || '';
+        resolvedSalesPersonId = linkedSo.salesPerson || linkedSo.createdBy || null;
+        if (!resolvedDeliveryNoteId && linkedSo.deliveryNoteId) {
+          resolvedDeliveryNoteId = linkedSo.deliveryNoteId;
+          resolvedDeliveryNoteNumber = linkedSo.deliveryNoteNumber || '';
+        }
+      }
+    }
 
     const invoice = await Invoice.create({
       invoiceNumber,
@@ -761,8 +781,8 @@ const createMyInvoice = async (req, res) => {
       saleReference: saleReference || '',
       salesOrderId: salesOrderId || null,
       salesOrderNumber: salesOrderNumber || '',
-      deliveryNoteId: deliveryNoteId || null,
-      deliveryNoteNumber: deliveryNoteNumber || '',
+      deliveryNoteId: resolvedDeliveryNoteId,
+      deliveryNoteNumber: resolvedDeliveryNoteNumber,
       fileNumber: fileNumber || '',
       fileType: fileType || '',
       items: processedItems,
@@ -774,17 +794,42 @@ const createMyInvoice = async (req, res) => {
       paidAmount: 0,
       outstandingAmount: Number(amount),
       status: initialStatus,
+      isDraft: isDraft,
+      invoiceType: req.body.invoiceType || 'Standard',
       paymentTerms: paymentTerms || 'Net 30',
       issueDate: issueDate ? new Date(issueDate) : new Date(),
       dueDate: new Date(dueDate),
       description: description || '',
       notes: notes || '',
+      salePerson: resolvedSalePerson || req.user.fullName || '',
+      salesPerson: resolvedSalesPersonId || (req.user.department === 'Sales' ? req.user._id : null),
+      departmentResponsible: 'Accounts',
       createdBy: req.user._id
     });
 
+    // Mark linked Delivery Note as invoiced (removes DN from Accounts Pending Draft Invoices queue)
+    if (resolvedDeliveryNoteId) {
+      await DeliveryNote.findByIdAndUpdate(resolvedDeliveryNoteId, {
+        invoiced: true,
+        invoiceId: invoice._id,
+        invoiceNumber: invoiceNumber,
+        invoicedAt: new Date()
+      });
+    }
+
+    // Update Sales Order linkage
+    if (salesOrderId) {
+      await SalesOrder.findByIdAndUpdate(salesOrderId, {
+        invoiceId: invoice._id,
+        invoiceNumber: invoiceNumber,
+        invoiceStatus: 'To Invoice',
+        workflowStatus: 'Draft Invoice Created'
+      });
+    }
+
     await logSalesActivity({
       type: 'Invoice Created',
-      description: `Generated invoice ${invoiceNumber} for ${invoice.clientName} ($${Number(invoice.amount).toLocaleString()}) - Status: ${initialStatus}`,
+      description: `Generated ${isDraft ? 'Draft ' : ''}invoice ${invoiceNumber} for ${invoice.clientName} (PKR ${Number(invoice.amount).toLocaleString()}) - Status: ${initialStatus}`,
       relatedModel: 'Invoice',
       relatedId: invoice._id,
       performedBy: req.user._id
@@ -823,6 +868,445 @@ const createMyInvoice = async (req, res) => {
 // QUOTATIONS
 // ══════════════════════════════════════════════
 // ══════════════════════════════════════════════
+// CUSTOMER OVERDUE HELPER & QUOTATION CONVERSION
+// ══════════════════════════════════════════════
+const calculateCustomerOverdue = async (clientName) => {
+  if (!clientName || !clientName.trim()) return { isOverdue: false, overdueAmount: 0, overdueInvoices: [] };
+  const trimmed = clientName.trim();
+  const now = new Date();
+
+  // Strictly check finalized, non-draft invoices that are past dueDate with an outstanding balance
+  const invoices = await Invoice.find({
+    clientName: { $regex: new RegExp('^' + trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') },
+    isDraft: { $ne: true },
+    status: { $nin: ['Draft', 'Pending Finance Finalization', 'Cancelled'] },
+    dueDate: { $lt: now }
+  });
+
+  let overdueAmount = 0;
+  const overdueInvoices = [];
+  invoices.forEach(inv => {
+    const amt = Number(inv.amount) || 0;
+    const paid = Number(inv.paidAmount) || 0;
+    const remaining = Math.max(0, amt - paid);
+    if (remaining > 0) {
+      overdueAmount += remaining;
+      overdueInvoices.push({
+        _id: inv._id,
+        invoiceNumber: inv.invoiceNumber,
+        amount: amt,
+        paidAmount: paid,
+        remaining,
+        dueDate: inv.dueDate
+      });
+    }
+  });
+
+  return {
+    isOverdue: overdueAmount > 0,
+    overdueAmount,
+    overdueInvoices
+  };
+};
+
+const checkCustomerOverdueApi = async (req, res) => {
+  try {
+    const { clientName } = req.query;
+    const result = await calculateCustomerOverdue(clientName);
+    return res.status(200).json({ success: true, ...result });
+  } catch (error) {
+    console.error('[Check Customer Overdue Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error checking customer overdue status.' });
+  }
+};
+
+/**
+ * @desc    Convert Quotation to Customer Purchase Order (PO)
+ * @route   POST /api/sales-employee/quotations/:id/convert-to-po
+ */
+const convertQuotationToCustomerPO = async (req, res) => {
+  try {
+    const quotation = await Quotation.findById(req.params.id);
+    if (!quotation) {
+      return res.status(404).json({ success: false, message: 'Quotation not found.' });
+    }
+
+    const { poNumber, poDate, notes, uploadedDocument, documentName } = req.body;
+    const netAmt = Number(quotation.netAmount) || Number(quotation.totalAmount) || 0;
+
+    const po = await CustomerPO.create({
+      poNumber: poNumber?.trim() || '',
+      poDate: poDate ? new Date(poDate) : new Date(),
+      customerName: quotation.clientName,
+      quotationId: quotation._id,
+      quotationNumber: quotation.orderReference || quotation.quotationNumber || '',
+      amount: netAmt,
+      notes: notes || quotation.notes || '',
+      uploadedDocument: uploadedDocument || '',
+      documentName: documentName || '',
+      status: 'Received',
+      createdBy: req.user._id
+    });
+
+    // Mark quotation as converted to Customer PO so it is removed from active quotations
+    quotation.status = 'Converted to Customer PO';
+    quotation.customerPOId = po._id;
+    quotation.convertedAt = new Date();
+    await quotation.save();
+
+    await logSalesActivity({
+      type: 'Quotation Converted to Customer PO',
+      description: `Converted Quotation ${quotation.orderReference || quotation.quotationNumber} to Customer PO ${po.poNumber}`,
+      relatedModel: 'CustomerPO',
+      relatedId: po._id,
+      relatedCustomer: po.customerName,
+      salesMemberName: req.user.fullName,
+      performedBy: req.user._id
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Quotation ${quotation.orderReference || quotation.quotationNumber} successfully converted to Customer PO ${po.poNumber}!`,
+      data: { po, quotation }
+    });
+  } catch (error) {
+    console.error('[Convert Quotation to PO Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error converting quotation to customer PO.' });
+  }
+};
+
+/**
+ * @desc    Convert Customer PO to Product File (Blue/Green/Yellow)
+ * @route   POST /api/sales-employee/customer-pos/:id/convert-to-file
+ */
+const convertCustomerPOToProductFile = async (req, res) => {
+  try {
+    const po = await CustomerPO.findById(req.params.id);
+    if (!po) {
+      return res.status(404).json({ success: false, message: 'Customer PO not found.' });
+    }
+
+    const { fileNumber, fileType, products, notes } = req.body;
+
+    let quoteItems = [];
+    let quotationNumber = po.quotationNumber || '';
+    if (po.quotationId) {
+      const q = await Quotation.findById(po.quotationId);
+      if (q) {
+        quotationNumber = q.orderReference || q.quotationNumber || quotationNumber;
+        if (q.items && q.items.length) {
+          quoteItems = q.items.map(it => ({
+            name: it.description || 'Item',
+            quantity: it.quantity || 1,
+            unit: 'pcs',
+            description: it.description || ''
+          }));
+        }
+      }
+    }
+
+    const file = await ProductFile.create({
+      fileNumber: fileNumber?.trim() || '',
+      fileType: fileType || 'Blue',
+      customerName: po.customerName,
+      quotationId: po.quotationId || null,
+      quotationNumber: quotationNumber,
+      customerPOId: po._id,
+      customerPONumber: po.poNumber || '',
+      products: Array.isArray(products) && products.length > 0 ? products : quoteItems,
+      notes: notes || po.notes || '',
+      status: 'Active',
+      createdBy: req.user._id
+    });
+
+    // Mark PO as Processed so it is removed from active POs list
+    po.status = 'Processed';
+    await po.save();
+
+    await logSalesActivity({
+      type: 'Customer PO Converted to Product File',
+      description: `Converted Customer PO ${po.poNumber} to ${file.fileType} File ${file.fileNumber || file._id}`,
+      relatedModel: 'ProductFile',
+      relatedId: file._id,
+      relatedCustomer: file.customerName,
+      salesMemberName: req.user.fullName,
+      performedBy: req.user._id
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Customer PO ${po.poNumber} converted to Product File ${file.fileNumber || file._id}!`,
+      data: { file, po }
+    });
+  } catch (error) {
+    console.error('[Convert PO to File Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error converting customer PO to product file.' });
+  }
+};
+
+/**
+ * @desc    Convert Product File to Sales Order (auto links Quotation + PO + File & moves to Finance)
+ * @route   POST /api/sales-employee/product-files/:id/convert-to-order
+ */
+const convertProductFileToSalesOrder = async (req, res) => {
+  try {
+    const file = await ProductFile.findById(req.params.id);
+    if (!file) {
+      return res.status(404).json({ success: false, message: 'Product file not found.' });
+    }
+
+    const { orderReference, clientAddress, clientEmail, clientPhone, items, totalAmount, discount, tax, netAmount, deliveryDate, notes, stockStatus } = req.body;
+
+    // Check overdue balance of customer
+    const overdueInfo = await calculateCustomerOverdue(file.customerName);
+    const requiresApproval = overdueInfo.isOverdue;
+
+    let quoteRef = null;
+    let netAmt = Number(netAmount) || Number(totalAmount) || 0;
+    let orderItems = Array.isArray(items) && items.length > 0 ? items : [];
+
+    if (file.quotationId) {
+      quoteRef = await Quotation.findById(file.quotationId);
+      if (quoteRef && (!netAmt || netAmt === 0)) {
+        netAmt = Number(quoteRef.netAmount) || Number(quoteRef.totalAmount) || 0;
+      }
+      if (quoteRef && orderItems.length === 0 && quoteRef.items && quoteRef.items.length) {
+        orderItems = quoteRef.items;
+      }
+    }
+
+    if (orderItems.length === 0 && file.products && file.products.length) {
+      orderItems = file.products.map(p => ({
+        description: p.description || p.name,
+        quantity: p.quantity || 1,
+        unitPrice: netAmt / (p.quantity || 1) || 0,
+        total: netAmt || 0
+      }));
+    }
+
+    const order = await SalesOrder.create({
+      orderReference: orderReference?.trim() || (quoteRef ? quoteRef.orderReference : '') || '',
+      clientName: file.customerName,
+      clientAddress: clientAddress || (quoteRef ? quoteRef.clientAddress : '') || '',
+      salePerson: req.user.fullName,
+      fileNo: file.fileNumber || '',
+      fileType: file.fileType || '',
+      productSummary: orderItems.map(i => i.description).filter(Boolean).join(', ') || 'Standard Order Items',
+      clientEmail: clientEmail || (quoteRef ? quoteRef.clientEmail : '') || '',
+      clientPhone: clientPhone || (quoteRef ? quoteRef.clientPhone : '') || '',
+      items: orderItems,
+      totalAmount: Number(totalAmount) || netAmt,
+      discount: Number(discount) || 0,
+      tax: Number(tax) || 0,
+      netAmount: netAmt,
+      outstandingBalance: netAmt,
+      totalPaid: 0,
+      status: 'Pending Finance Approval',
+      workflowStatus: 'Pending Finance Overdue Check',
+      departmentResponsible: 'Finance',
+      customerOverdueAtCreation: overdueInfo.overdueAmount,
+      requiresFinanceApproval: true,
+      stockStatus: stockStatus || 'Available',
+      deliveryStatus: 'Not Delivered',
+      invoiceStatus: 'Not Invoiced',
+      paymentStatus: 'Pending',
+      deliveryDate: deliveryDate ? new Date(deliveryDate) : null,
+      creationDate: new Date(),
+      orderDate: new Date(),
+      notes: notes || file.notes || '',
+      quotationId: file.quotationId || (quoteRef ? quoteRef._id : null),
+      customerPOId: file.customerPOId || null,
+      customerPONumber: file.customerPONumber || '',
+      productFileId: file._id,
+      salesPerson: req.user._id,
+      createdBy: req.user._id,
+      workflowHistory: [
+        {
+          user: req.user._id,
+          userName: req.user.fullName,
+          department: 'Sales',
+          action: 'Sales Order Created',
+          previousStatus: 'None',
+          newStatus: 'Pending Finance Overdue Check',
+          timestamp: new Date(),
+          notes: `Created from Product File ${file.fileNumber || file._id}. Auto-routed to Finance for overdue check.`
+        }
+      ]
+    });
+
+    // Mark Product File as Completed so it is removed from active files list
+    file.status = 'Completed';
+    file.salesOrderId = order._id;
+    file.salesOrderNumber = order.orderNumber || order.orderReference;
+    await file.save();
+
+    // If quotation linked, mark converted
+    if (file.quotationId) {
+      await Quotation.findByIdAndUpdate(file.quotationId, {
+        status: 'Converted to Sales Order',
+        salesOrderId: order._id,
+        salesOrderNumber: order.orderNumber || order.orderReference,
+        convertedAt: new Date()
+      });
+    }
+
+    // If Customer PO linked, mark processed
+    if (file.customerPOId) {
+      await CustomerPO.findByIdAndUpdate(file.customerPOId, {
+        status: 'Processed',
+        salesOrderId: order._id
+      });
+    }
+
+    await logSalesActivity({
+      type: 'Product File Converted to Sales Order',
+      description: `Converted Product File ${file.fileNumber || file._id} to Sales Order ${order.orderNumber || order.orderReference}`,
+      relatedModel: 'SalesOrder',
+      relatedId: order._id,
+      relatedCustomer: order.clientName,
+      salesMemberName: req.user.fullName,
+      performedBy: req.user._id
+    });
+
+    // Notify Finance Department
+    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
+      type: 'finance',
+      title: 'Sales Order Created — Pending Overdue Check',
+      message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} (Rs. ${netAmt.toLocaleString()}) created. Customer overdue balance: PKR ${overdueInfo.overdueAmount.toLocaleString()}.`,
+      link: '/finance/invoices'
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Product File ${file.fileNumber || file._id} successfully converted to Sales Order ${order.orderNumber || order.orderReference} and moved to Finance for overdue check!`,
+      data: { order, file }
+    });
+  } catch (error) {
+    console.error('[Convert File to Order Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error converting product file to sales order.' });
+  }
+};
+
+/**
+ * @desc    Convert Quotation to Sales Order (removes quotation from active list)
+ * @route   POST /api/sales-employee/quotations/:id/convert-to-order
+ */
+const convertQuotationToSalesOrder = async (req, res) => {
+  try {
+    const quotation = await Quotation.findById(req.params.id);
+    if (!quotation) {
+      return res.status(404).json({ success: false, message: 'Quotation not found.' });
+    }
+
+    if (quotation.status === 'Converted to Sales Order' || quotation.status === 'Converted') {
+      return res.status(400).json({
+        success: false,
+        message: 'This quotation has already been converted to a Sales Order.',
+        salesOrderId: quotation.salesOrderId,
+        salesOrderNumber: quotation.salesOrderNumber
+      });
+    }
+
+    const { deliveryDate, notes, stockStatus } = req.body;
+
+    // Check overdue balance of customer using finalized invoices only
+    const overdueInfo = await calculateCustomerOverdue(quotation.clientName);
+    const requiresApproval = overdueInfo.isOverdue;
+    const netAmt = Number(quotation.netAmount) || Number(quotation.totalAmount) || 0;
+
+    const order = await SalesOrder.create({
+      orderReference: req.body.orderReference || quotation.orderReference || '',
+      clientName: quotation.clientName,
+      clientAddress: quotation.clientAddress || '',
+      salePerson: quotation.salePerson || req.user.fullName,
+      fileNo: quotation.fileNo || '',
+      fileType: quotation.fileType || '',
+      productSummary: quotation.productSummary || '',
+      clientEmail: quotation.clientEmail || '',
+      clientPhone: quotation.clientPhone || '',
+      items: quotation.items && quotation.items.length > 0 ? quotation.items : [{
+        description: quotation.productSummary || 'Standard Scope Item',
+        quantity: 1,
+        unitPrice: netAmt,
+        total: netAmt
+      }],
+      totalAmount: Number(quotation.totalAmount) || netAmt,
+      discount: Number(quotation.discount) || 0,
+      tax: Number(quotation.tax) || 0,
+      netAmount: netAmt,
+      outstandingBalance: netAmt,
+      totalPaid: 0,
+      status: 'Pending Finance Approval',
+      workflowStatus: 'Pending Finance Overdue Check',
+      departmentResponsible: 'Finance',
+      customerOverdueAtCreation: overdueInfo.overdueAmount,
+      requiresFinanceApproval: true,
+      stockStatus: stockStatus || 'Available',
+      deliveryStatus: 'Not Delivered',
+      invoiceStatus: 'Not Invoiced',
+      paymentStatus: 'Pending',
+      deliveryDate: deliveryDate ? new Date(deliveryDate) : (quotation.validUntil || null),
+      creationDate: new Date(),
+      orderDate: new Date(),
+      notes: notes || quotation.notes || '',
+      quotationId: quotation._id,
+      leadId: quotation.leadId || null,
+      customerPOId: quotation.customerPOId || null,
+      salesPerson: req.user._id,
+      createdBy: req.user._id,
+      workflowHistory: [
+        {
+          user: req.user._id,
+          userName: req.user.fullName,
+          department: 'Sales',
+          action: 'Sales Order Created',
+          previousStatus: 'None',
+          newStatus: 'Pending Finance Overdue Check',
+          timestamp: new Date(),
+          notes: `Created from Quotation ${quotation.orderReference || quotation.quotationNumber}. Auto-routed to Finance for overdue verification.`
+        }
+      ]
+    });
+
+    // Mark quotation as Converted to Sales Order (preserves record in DB for history/audit)
+    quotation.status = 'Converted to Sales Order';
+    quotation.salesOrderId = order._id;
+    quotation.salesOrderNumber = order.orderNumber || order.orderReference;
+    quotation.convertedAt = new Date();
+    await quotation.save();
+
+    await logSalesActivity({
+      type: 'Quotation Converted',
+      description: `Converted Quotation ${quotation.orderReference || quotation.quotationNumber} to Sales Order ${order.orderNumber || order.orderReference}`,
+      relatedModel: 'SalesOrder',
+      relatedId: order._id,
+      relatedCustomer: quotation.clientName,
+      salesMemberName: req.user.fullName,
+      performedBy: req.user._id
+    });
+
+    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
+      type: 'finance',
+      title: 'Sales Order Requires Finance Approval',
+      message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} requires Finance approval due to customer overdue check (Overdue: PKR ${overdueInfo.overdueAmount.toLocaleString()}).`,
+      link: '/finance/invoices'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Quotation successfully converted to Sales Order ${order.orderNumber || order.orderReference}! Order moved to Finance for overdue check.`,
+      data: {
+        order,
+        quotation
+      }
+    });
+  } catch (error) {
+    console.error('[Convert Quotation Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error converting quotation.' });
+  }
+};
+
+// ══════════════════════════════════════════════
 // QUOTATIONS
 // ══════════════════════════════════════════════
 /**
@@ -841,7 +1325,12 @@ const getMyQuotations = async (req, res) => {
       query.createdBy = req.user._id;
     }
 
-    if (status && status !== 'all') {
+    // Pending workflow: 'active' filter excludes converted quotations
+    if (status === 'active' || !status) {
+      query.status = { $nin: ['Converted to Customer PO', 'Converted to Sales Order', 'Converted', 'Rejected', 'Expired'] };
+    } else if (status === 'converted') {
+      query.status = { $in: ['Converted to Customer PO', 'Converted to Sales Order', 'Converted'] };
+    } else if (status && status !== 'all') {
       query.status = status;
     }
 
@@ -998,38 +1487,80 @@ const updateMyQuotation = async (req, res) => {
 const getMyOrders = async (req, res) => {
   try {
     const { status, search, employeeId } = req.query;
-    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
-    const query = {};
+    const isGlobalAccess = ['sales_manager', 'admin', 'ceo', 'support', 'accountant', 'finance'].includes(req.user.role) ||
+      ['support', 'accounts', 'finance', 'administration'].includes((req.user.department || '').toLowerCase());
+    
+    const conditions = [];
 
-    if (isManagerOrAdmin) {
-      if (employeeId) query.createdBy = employeeId;
+    if (isGlobalAccess) {
+      if (employeeId) conditions.push({ createdBy: employeeId });
     } else {
-      query.$or = [{ createdBy: req.user._id }, { salesPerson: req.user._id }];
+      conditions.push({
+        $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }]
+      });
     }
 
-    if (status && status !== 'all') {
-      query.status = status;
+    // Pending workflow: 'active' filter shows orders pending action by Sales (including rejected ones awaiting salesperson action)
+    if (status === 'active' || status === 'pending') {
+      conditions.push({
+        workflowStatus: { $nin: ['Sent to Support', 'Delivery Note Created', 'Delivery Note Confirmed', 'Sent to Accounts', 'Draft Invoice Created', 'Sent to Finance', 'Pending Finance Finalization', 'Completed'] }
+      });
+    } else if (status === 'pending_finance') {
+      conditions.push({
+        $or: [
+          { status: 'Pending Finance Overdue Check' },
+          { workflowStatus: 'Pending Finance Overdue Check' },
+          { workflowStatus: 'Pending Finance Approval' },
+          { departmentResponsible: 'Finance' }
+        ]
+      });
+    } else if (status === 'finance_approved') {
+      conditions.push({
+        $or: [
+          { status: 'Finance Approved' },
+          { workflowStatus: 'Finance Approved' },
+          { departmentResponsible: 'Support' }
+        ]
+      });
+    } else if (status === 'rejected') {
+      conditions.push({
+        $or: [
+          { status: 'Rejected' },
+          { status: 'Sales Order Rejected due to overdue amount' },
+          { workflowStatus: 'Finance Rejected' }
+        ]
+      });
+    } else if (status === 'sent_to_support') {
+      conditions.push({
+        workflowStatus: { $in: ['Sent to Support', 'Delivery Note Created', 'Delivery Note Confirmed', 'Sent to Accounts', 'Draft Invoice Created', 'Sent to Finance', 'Pending Finance Finalization', 'Completed'] }
+      });
+    } else if (status && status !== 'all') {
+      conditions.push({ status: status });
     }
 
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      const searchOr = [
-        { orderReference: regex },
-        { orderNumber: regex },
-        { clientName: regex },
-        { salePerson: regex },
-        { productSummary: regex },
-        { fileNo: regex }
-      ];
-      if (query.$or) {
-        query.$and = [{ $or: query.$or }, { $or: searchOr }];
-        delete query.$or;
-      } else {
-        query.$or = searchOr;
-      }
+      conditions.push({
+        $or: [
+          { orderReference: regex },
+          { orderNumber: regex },
+          { clientName: regex },
+          { salePerson: regex },
+          { productSummary: regex },
+          { fileNo: regex }
+        ]
+      });
     }
 
-    const orders = await SalesOrder.find(query).sort({ creationDate: -1, createdAt: -1 });
+    const query = conditions.length > 0 ? { $and: conditions } : {};
+
+    const orders = await SalesOrder.find(query)
+      .populate('createdBy', 'fullName email position role department')
+      .populate('salesPerson', 'fullName email position role department')
+      .populate('financeApprovedBy', 'fullName email')
+      .populate('deliveryNoteId', 'deliveryNumber deliveryNoteNumber status invoiced')
+      .populate('invoiceId', 'invoiceNumber amount status isDraft')
+      .sort({ creationDate: -1, createdAt: -1 });
     return res.status(200).json({ success: true, count: orders.length, data: orders });
   } catch (error) {
     console.error('[Get Orders Error]:', error);
@@ -1072,6 +1603,10 @@ const createMyOrder = async (req, res) => {
 
     if (!clientName) return res.status(400).json({ success: false, message: 'Customer/Client name is required.' });
 
+    // Check customer overdue balance
+    const overdueInfo = await calculateCustomerOverdue(clientName);
+    const requiresApproval = overdueInfo.isOverdue;
+
     const netAmt = Number(netAmount) || Number(totalAmount) || 0;
     const order = await SalesOrder.create({
       orderReference: orderReference?.trim() || '',
@@ -1090,7 +1625,10 @@ const createMyOrder = async (req, res) => {
       netAmount: netAmt,
       outstandingBalance: netAmt,
       totalPaid: 0,
-      status: status || 'Sales Order',
+      status: requiresApproval ? 'Pending Finance Approval' : (status || 'Sales Order'),
+      workflowStatus: requiresApproval ? 'Pending Finance Approval' : 'Sales Order Created',
+      customerOverdueAtCreation: overdueInfo.overdueAmount,
+      requiresFinanceApproval: requiresApproval,
       stockStatus: stockStatus || 'Available',
       deliveryStatus: 'Not Delivered',
       invoiceStatus: 'Not Invoiced',
@@ -1107,6 +1645,16 @@ const createMyOrder = async (req, res) => {
       salesPerson: req.user._id,
       createdBy: req.user._id
     });
+
+    // Link the Quotation if provided, mark as Converted
+    if (quotationId) {
+      await Quotation.findByIdAndUpdate(quotationId, {
+        status: 'Converted to Sales Order',
+        salesOrderId: order._id,
+        salesOrderNumber: order.orderNumber || order.orderReference,
+        convertedAt: new Date()
+      });
+    }
 
     // Link the CustomerPO to this order if provided
     if (customerPOId) {
@@ -1127,6 +1675,15 @@ const createMyOrder = async (req, res) => {
       performedBy: req.user._id
     });
 
+    if (requiresApproval) {
+      await notifyRoleHelper(['finance', 'admin', 'ceo'], {
+        type: 'finance',
+        title: 'Sales Order Requires Finance Approval',
+        message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} requires Finance approval due to overdue balance (PKR ${overdueInfo.overdueAmount.toLocaleString()}).`,
+        link: '/finance/invoices'
+      });
+    }
+
     // Notify Sales Manager
     await notifyRoleHelper({
       role: 'sales_manager',
@@ -1140,6 +1697,100 @@ const createMyOrder = async (req, res) => {
   } catch (error) {
     console.error('[Create Order Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error creating order.' });
+  }
+};
+
+/**
+ * @desc    Finance review (approve or reject) a sales order with overdue customer
+ * @route   POST /api/sales-employee/orders/:id/finance-review
+ */
+const financeReviewSalesOrder = async (req, res) => {
+  try {
+    const action = (req.body.action || req.body.decision || '').toLowerCase().trim(); // 'approve' or 'reject'
+    const reason = req.body.reason || req.body.notes || '';
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+    if (action === 'approve') {
+      order.requiresFinanceApproval = false;
+      order.financeApprovedBy = req.user._id;
+      order.financeApprovedByName = req.user.fullName;
+      order.financeApprovedAt = new Date();
+      order.workflowStatus = 'Finance Approved';
+      order.status = 'Finance Approved';
+      order.departmentResponsible = 'Support'; // Move to Support for Delivery Note creation
+      order.workflowHistory.push({
+        user: req.user._id,
+        userName: req.user.fullName,
+        department: 'Finance',
+        action: 'Finance Approved (Moved to Support for DN)',
+        previousStatus: 'Pending Finance Overdue Check',
+        newStatus: 'Finance Approved',
+        timestamp: new Date(),
+        notes: reason || 'Customer overdue check approved. Routed to Support Department for Delivery Note (DN).'
+      });
+    } else if (action === 'reject') {
+      order.workflowStatus = 'Finance Rejected';
+      order.status = 'Rejected';
+      order.departmentResponsible = 'Sales'; // Return to Sales representative
+      order.financeRejectionReason = reason || 'Rejected by Finance due to customer overdue amount.';
+      order.workflowHistory.push({
+        user: req.user._id,
+        userName: req.user.fullName,
+        department: 'Finance',
+        action: 'Sales Order Rejected due to overdue amount',
+        previousStatus: 'Pending Finance Overdue Check',
+        newStatus: 'Rejected',
+        timestamp: new Date(),
+        notes: reason || 'Rejected by Finance due to customer overdue amount. Returned to Sales.'
+      });
+    } else {
+      return res.status(400).json({ success: false, message: 'Action/decision must be "approve" or "reject".' });
+    }
+
+    await order.save();
+
+    await logSalesActivity({
+      type: action === 'approve' ? 'Order Approved by Finance' : 'Order Rejected by Finance',
+      description: `Sales Order ${order.orderNumber || order.orderReference} ${action}d by Finance (${req.user.fullName})`,
+      relatedModel: 'SalesOrder',
+      relatedId: order._id,
+      performedBy: req.user._id
+    });
+
+    // Notify the sales representative
+    if (order.salesPerson || order.createdBy) {
+      const recipientId = order.salesPerson || order.createdBy;
+      await createNotificationHelper({
+        recipient: recipientId,
+        sender: req.user._id,
+        title: action === 'approve' ? 'Sales Order Approved by Finance' : 'Sales Order Rejected due to overdue amount',
+        message: action === 'approve'
+          ? `Finance (${req.user.fullName}) approved Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName}. It has been forwarded to Support for Delivery Note creation.`
+          : `Finance (${req.user.fullName}) rejected Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} due to customer overdue amount.${reason ? ` Reason: ${reason}` : ''}`,
+        type: 'finance',
+        link: '/employee/sales/orders'
+      });
+    }
+
+    // Notify Support Department on approval
+    if (action === 'approve') {
+      await notifyRoleHelper(['support', 'operations', 'admin'], {
+        type: 'order',
+        title: 'New Sales Order for Delivery Note (DN)',
+        message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} approved by Finance and ready for Delivery Note (DN) creation.`,
+        link: '/employee/sales/delivery-notes'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Sales Order ${order.orderNumber || order.orderReference} ${action}d successfully.`,
+      data: order
+    });
+  } catch (error) {
+    console.error('[Finance Review Order Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error reviewing sales order.' });
   }
 };
 
@@ -1284,8 +1935,10 @@ const checkOrderStock = async (req, res) => {
  */
 const getAvailableOrdersForDelivery = async (req, res) => {
   try {
+    // Support Pending Queue: Sales Orders sent to support without Delivery Notes
     const orders = await SalesOrder.find({
-      deliveryStatus: { $in: ['Not Delivered', 'Partially Delivered'] }
+      workflowStatus: { $in: ['Sent to Support', 'Support Reviewing'] },
+      $or: [{ deliveryNoteId: { $exists: false } }, { deliveryNoteId: null }]
     }).sort({ createdAt: -1 });
 
     return res.status(200).json({ success: true, count: orders.length, data: orders });
@@ -1300,8 +1953,13 @@ const getAvailableOrdersForDelivery = async (req, res) => {
 // ══════════════════════════════════════════════
 const getMyDeliveryNotes = async (req, res) => {
   try {
-    const notes = await DeliveryNote.find({ createdBy: req.user._id })
-      .populate('salesOrder', 'orderNumber orderReference clientName netAmount items')
+    const isPrivilegedOrDept = ['admin', 'ceo', 'support', 'accountant', 'finance', 'sales_manager'].includes(req.user.role) ||
+      ['support', 'accounts', 'finance', 'sales'].includes((req.user.department || '').toLowerCase());
+    const filter = isPrivilegedOrDept
+      ? {}
+      : { $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }] };
+    const notes = await DeliveryNote.find(filter)
+      .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount items clientEmail clientPhone clientAddress fileNo fileType salePerson')
       .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: notes.length, data: notes });
   } catch (error) {
@@ -1337,6 +1995,23 @@ const createMyDeliveryNote = async (req, res) => {
 
     const dnStatus = status || 'Done';
 
+    // Auto-populate items from Sales Order if not provided
+    let dnItems = items || [];
+    if (dnItems.length === 0 && salesOrderId) {
+      const parentSo = await SalesOrder.findById(salesOrderId);
+      if (parentSo && parentSo.items && parentSo.items.length > 0) {
+        dnItems = parentSo.items.map(it => ({
+          product: it.description || 'Delivered Product',
+          description: it.description || '',
+          demand: Number(it.quantity) || 1,
+          quantity: Number(it.quantity) || 1,
+          unit: 'Units',
+          availability: 'Available',
+          totalOrderedQty: Number(it.quantity) || 1
+        }));
+      }
+    }
+
     const deliveryNote = await DeliveryNote.create({
       salesOrder: salesOrderId || null,
       salesOrderNumber: salesOrderNumber || '',
@@ -1354,37 +2029,47 @@ const createMyDeliveryNote = async (req, res) => {
       productAvailability: productAvailability || 'Available',
       starred: !!starred,
       deliveryDate: deliveryDate || scheduledDate || new Date(),
-      items: items || [],
+      items: dnItems,
       notes: notes || '',
       status: dnStatus,
       isPartial: !!isPartial,
+      invoiced: false,
       createdBy: req.user._id
     });
 
-    // Deduct actual delivered quantities from InventoryItem stock in MongoDB
-    if (items && Array.isArray(items)) {
-      for (const item of items) {
+    // Deduct actual delivered quantities from InventoryItem stock in MongoDB if status is Done/Confirmed
+    let isDeducted = false;
+    if ((dnStatus === 'Done' || dnStatus === 'Confirmed' || dnStatus === 'Delivered') && dnItems && Array.isArray(dnItems)) {
+      for (const item of dnItems) {
         const pName = (item.product || item.description || '').trim();
         const delQty = Number(item.quantity) || 1;
         if (pName && delQty > 0) {
           const inv = await InventoryItem.findOne({
-            name: { $regex: new RegExp(pName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }
+            name: { $regex: new RegExp('^' + pName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') }
           });
           if (inv) {
             inv.quantityOnHand = Math.max(0, inv.quantityOnHand - delQty);
             await inv.save();
+            isDeducted = true;
           }
         }
       }
     }
+    if (isDeducted) {
+      deliveryNote.isStockDeducted = true;
+      await deliveryNote.save();
+    }
 
-    // Auto-update Sales Order delivery status
+    // Auto-update Sales Order delivery status and link Delivery Note (removes SO from Support Pending Queue)
     if (salesOrderId) {
       const deliveryStatusUpdate = isPartial ? 'Partially Delivered' : 'Fully Delivered';
       const soStatusUpdate = isPartial ? 'Processing' : 'Delivered';
       await SalesOrder.findByIdAndUpdate(salesOrderId, {
         deliveryStatus: deliveryStatusUpdate,
-        status: soStatusUpdate
+        status: soStatusUpdate,
+        deliveryNoteId: deliveryNote._id,
+        deliveryNoteNumber: deliveryNote.deliveryNoteNumber || deliveryNote.deliveryNumber,
+        workflowStatus: 'Delivery Note Created'
       });
     }
 
@@ -1590,8 +2275,13 @@ const getSalesTeamMembers = async (req, res) => {
   try {
     const now = new Date();
     const salesEmployees = await User.find({
-      role: 'employee',
-      department: { $regex: /^sales$/i }
+      $or: [
+        { role: { $in: ['employee', 'sales_rep', 'sales_member'] }, department: { $regex: /^sales$/i } },
+        { role: { $in: ['sales_rep', 'sales_member'] } },
+        { department: { $regex: /^sales$/i } },
+        { position: { $regex: /sales/i } }
+      ],
+      role: { $nin: ['admin', 'ceo', 'hr_manager', 'accountant', 'administration', 'project_manager', 'marketing', 'sales_manager'] }
     }).select('-password').sort({ fullName: 1 });
 
     // Attach full stats & financial calculations for each member
@@ -2058,7 +2748,14 @@ const getMyCustomerPOs = async (req, res) => {
       query.createdBy = req.user._id;
     }
 
-    if (status && status !== 'all') query.status = status;
+    if (status === 'active' || !status) {
+      query.status = { $nin: ['Processed'] };
+    } else if (status === 'processed') {
+      query.status = 'Processed';
+    } else if (status && status !== 'all') {
+      query.status = status;
+    }
+
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       query.$or = [{ poNumber: regex }, { customerName: regex }, { quotationNumber: regex }];
@@ -2157,7 +2854,7 @@ const deleteMyCustomerPO = async (req, res) => {
 // ══════════════════════════════════════════════
 const getMyProductFiles = async (req, res) => {
   try {
-    const { fileType, search, employeeId } = req.query;
+    const { status, fileType, search, employeeId } = req.query;
     const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
     const query = {};
 
@@ -2165,6 +2862,14 @@ const getMyProductFiles = async (req, res) => {
       if (employeeId) query.createdBy = employeeId;
     } else {
       query.createdBy = req.user._id;
+    }
+
+    if (status === 'active' || !status) {
+      query.status = { $nin: ['Completed', 'Cancelled'] };
+    } else if (status === 'completed') {
+      query.status = 'Completed';
+    } else if (status && status !== 'all') {
+      query.status = status;
     }
 
     if (fileType && fileType !== 'all') query.fileType = fileType;
@@ -2298,7 +3003,8 @@ const deleteMyProductFile = async (req, res) => {
 const getMyPayments = async (req, res) => {
   try {
     const { salesOrderId, search, employeeId } = req.query;
-    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
+    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo', 'finance', 'accountant'].includes(req.user.role) ||
+      ['finance', 'accounts', 'administration'].includes((req.user.department || '').toLowerCase());
     const query = {};
 
     if (isManagerOrAdmin) {
@@ -2312,7 +3018,7 @@ const getMyPayments = async (req, res) => {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       query.$or = [{ paymentRefNumber: regex }, { customerName: regex }, { salesOrderNumber: regex }];
     }
-    const payments = await Payment.find(query).populate('createdBy', 'fullName email').sort({ createdAt: -1 });
+    const payments = await Payment.find(query).populate('createdBy', 'fullName email position role department').sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: payments.length, data: payments });
   } catch (error) {
     console.error('[Get Payments Error]:', error);
@@ -2783,6 +3489,750 @@ const deleteMyProformaInvoice = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────
+// Department Handoff & Departmental Controllers
+// ─────────────────────────────────────────────
+
+const getDateRangeFilter = (filter, startDate, endDate, dateField = 'createdAt') => {
+  if (!filter || filter === 'all') return null;
+  const now = new Date();
+  let start, end;
+  if (filter === 'today') {
+    start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+  } else if (filter === 'week' || filter === 'this_week') {
+    const day = now.getDay();
+    const diff = now.getDate() - day + (day === 0 ? -6 : 1); // Monday
+    start = new Date(now.getFullYear(), now.getMonth(), diff, 0, 0, 0, 0);
+    end = new Date();
+  } else if (filter === 'month' || filter === 'this_month') {
+    start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    end = new Date();
+  } else if (filter === 'last_month') {
+    start = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+    end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+  } else if (filter === 'year' || filter === 'this_year') {
+    start = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+    end = new Date();
+  } else if (filter === 'custom' && startDate && endDate) {
+    start = new Date(startDate);
+    end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+  } else {
+    return null;
+  }
+  return { [dateField]: { $gte: start, $lte: end } };
+};
+
+const sendOrderToSupport = async (req, res) => {
+  try {
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+
+    if (!order.clientName || !order.netAmount) {
+      return res.status(400).json({ success: false, message: 'Sales Order is incomplete.' });
+    }
+
+    // Strictly enforce Finance approval if customer has overdue balance
+    if (order.requiresFinanceApproval && order.workflowStatus !== 'Finance Approved') {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot send order to Support: Order requires Finance approval due to customer overdue balance (PKR ${Number(order.customerOverdueAtCreation || 0).toLocaleString()}).`
+      });
+    }
+
+    const prevStatus = order.workflowStatus || 'Sales Order Created';
+    order.workflowStatus = 'Sent to Support';
+    order.status = 'Sent to Support';
+    order.departmentResponsible = 'Support';
+    order.workflowHistory.push({
+      user: req.user._id,
+      userName: req.user.fullName,
+      department: 'Sales',
+      action: 'Sent to Support',
+      previousStatus: prevStatus,
+      newStatus: 'Sent to Support',
+      timestamp: new Date(),
+      notes: req.body.notes || 'Order sent to Support Department for fulfillment.'
+    });
+
+    await order.save();
+
+    await logSalesActivity({
+      type: 'Order Sent to Support',
+      description: `Sales Order ${order.orderReference || order.orderNumber} sent to Support by ${req.user.fullName}.`,
+      relatedModel: 'SalesOrder',
+      relatedId: order._id,
+      performedBy: req.user._id
+    });
+
+    await notifyRoleHelper(['support', 'admin', 'ceo'], {
+      type: 'order',
+      title: 'New Sales Order Sent to Support',
+      message: `Sales Order ${order.orderReference || order.orderNumber} is ready for delivery processing.`,
+      link: '/support/orders'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Sales Order ${order.orderReference || order.orderNumber} successfully sent to Support.`,
+      data: order
+    });
+  } catch (error) {
+    console.error('[Send Order To Support Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error sending order to support.' });
+  }
+};
+
+/**
+ * @desc    Send / route Sales Order to Finance for Overdue check
+ * @route   POST /api/sales-employee/orders/:id/send-to-finance
+ */
+const sendSalesOrderToFinance = async (req, res) => {
+  try {
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+
+    // Check customer overdue status in real-time
+    const overdueInfo = await calculateCustomerOverdue(order.clientName || order.customerName);
+
+    const prevStatus = order.status || order.workflowStatus || 'Sales Order';
+    order.departmentResponsible = 'Finance';
+    order.workflowStatus = 'Pending Finance Overdue Check';
+    order.status = 'Pending Finance Overdue Check';
+    order.requiresFinanceApproval = true;
+    order.customerOverdueAtCreation = overdueInfo.overdueAmount;
+    order.financeApprovedBy = null;
+    order.financeApprovedByName = '';
+    order.financeApprovedAt = null;
+
+    order.workflowHistory.push({
+      user: req.user._id,
+      userName: req.user.fullName,
+      department: 'Sales',
+      action: 'Sent to Finance for Overdue Verification',
+      previousStatus: prevStatus,
+      newStatus: 'Pending Finance Overdue Check',
+      timestamp: new Date(),
+      notes: req.body.notes || `Routed to Finance for overdue balance check (Current overdue: PKR ${overdueInfo.overdueAmount.toLocaleString()}).`
+    });
+
+    await order.save();
+
+    await logSalesActivity({
+      type: 'Order Sent to Finance',
+      description: `Sales Order ${order.orderNumber || order.orderReference} sent to Finance by ${req.user.fullName} for overdue check`,
+      relatedModel: 'SalesOrder',
+      relatedId: order._id,
+      performedBy: req.user._id
+    });
+
+    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
+      type: 'finance',
+      title: 'Sales Order Awaiting Overdue Approval',
+      message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} sent by ${req.user.fullName} is awaiting Finance overdue verification (Overdue: PKR ${overdueInfo.overdueAmount.toLocaleString()}).`,
+      link: '/finance/invoices'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Sales Order ${order.orderNumber || order.orderReference} successfully sent to Finance for overdue verification!`,
+      data: order
+    });
+  } catch (error) {
+    console.error('[Send Sales Order to Finance Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error sending order to Finance.' });
+  }
+};
+
+const getSupportStats = async (req, res) => {
+  try {
+    const { filter, startDate, endDate } = req.query;
+    const dateFilter = getDateRangeFilter(filter, startDate, endDate, 'createdAt');
+
+    // Total orders sent to Support (in period if filtered)
+    const orderQuery = {
+      $or: [
+        { departmentResponsible: 'Support' },
+        {
+          workflowStatus: {
+            $in: [
+              'Finance Approved',
+              'Sent to Support',
+              'Support Reviewing',
+              'Delivery Note Created',
+              'Delivery Note Confirmed',
+              'Sent to Accounts',
+              'Draft Invoice Created',
+              'Sent to Finance',
+              'Pending Finance Finalization',
+              'Completed'
+            ]
+          }
+        }
+      ]
+    };
+    if (dateFilter) {
+      orderQuery.$and = [{ $or: orderQuery.$or }, dateFilter];
+      delete orderQuery.$or;
+    }
+    const ordersReceived = await SalesOrder.countDocuments(orderQuery);
+
+    // Total delivery notes created (in period if filtered)
+    const dnQuery = {};
+    if (dateFilter) Object.assign(dnQuery, dateFilter);
+    const deliveryNotesCount = await DeliveryNote.countDocuments(dnQuery);
+
+    // Active pending queue: Sales Orders in Support that DO NOT have a Delivery Note yet
+    const ordersPendingDelivery = await SalesOrder.countDocuments({
+      $or: [
+        { departmentResponsible: 'Support' },
+        { workflowStatus: { $in: ['Sent to Support', 'Support Reviewing', 'Finance Approved'] } }
+      ],
+      deliveryNoteId: null
+    });
+
+    const deliveryNotesPending = await DeliveryNote.countDocuments({ status: { $nin: ['Done', 'Delivered', 'Cancelled'] } });
+    const completedDeliveries = await DeliveryNote.countDocuments({ status: { $in: ['Done', 'Delivered'] } });
+
+    const totalInventoryItems = await InventoryItem.countDocuments();
+    const lowStockCount = await InventoryItem.countDocuments({ status: 'Low Stock' });
+    const outOfStockCount = await InventoryItem.countDocuments({ status: 'Out of Stock' });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ordersReceived,
+        ordersPendingDelivery,
+        deliveryNotesCount,
+        deliveryNotesPending,
+        completedDeliveries,
+        totalInventoryItems,
+        lowStockCount,
+        outOfStockCount
+      }
+    });
+  } catch (error) {
+    console.error('[Get Support Stats Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching support stats.' });
+  }
+};
+
+const getInventoryItems = async (req, res) => {
+  try {
+    const { search, status } = req.query;
+    const query = {};
+    if (status && status !== 'all') query.status = status;
+    if (search && search.trim()) {
+      const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      query.$or = [{ name: regex }, { sku: regex }, { category: regex }, { location: regex }];
+    }
+    const items = await InventoryItem.find(query).sort({ updatedAt: -1 });
+    return res.status(200).json({ success: true, count: items.length, data: items });
+  } catch (error) {
+    console.error('[Get Inventory Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching inventory.' });
+  }
+};
+
+const createOrUpdateInventoryItem = async (req, res) => {
+  try {
+    const { id, name, sku, category, unit, quantityOnHand, minStockLevel, unitPrice, location, description } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Product name is required.' });
+
+    let item;
+    if (id) {
+      item = await InventoryItem.findByIdAndUpdate(
+        id,
+        { name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, unitPrice: Number(unitPrice) || 0, location, description },
+        { new: true, runValidators: true }
+      );
+    } else {
+      item = await InventoryItem.create({
+        name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, unitPrice: Number(unitPrice) || 0, location, description
+      });
+    }
+
+    return res.status(200).json({ success: true, data: item });
+  } catch (error) {
+    console.error('[Save Inventory Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error saving inventory item.' });
+  }
+};
+
+const confirmDeliveryNoteWithInventory = async (req, res) => {
+  try {
+    const deliveryNote = await DeliveryNote.findById(req.params.id);
+    if (!deliveryNote) {
+      return res.status(404).json({ success: false, message: 'Delivery Note not found.' });
+    }
+
+    if (deliveryNote.status === 'Done' || deliveryNote.status === 'Delivered') {
+      return res.status(400).json({ success: false, message: 'Delivery Note is already confirmed.' });
+    }
+
+    if (!deliveryNote.isStockDeducted && deliveryNote.items && deliveryNote.items.length > 0) {
+      for (const item of deliveryNote.items) {
+        const qtyToDeduct = Number(item.quantity) || Number(item.demand) || 1;
+        const itemName = item.product || item.description || '';
+
+        let invItem = await InventoryItem.findOne({
+          $or: [
+            { name: new RegExp('^' + itemName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') },
+            { description: new RegExp(itemName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }
+          ]
+        });
+
+        if (invItem) {
+          const newQty = Math.max(0, (invItem.quantityOnHand || 0) - qtyToDeduct);
+          invItem.quantityOnHand = newQty;
+          invItem.reservedQuantity = Math.max(0, (invItem.reservedQuantity || 0) - qtyToDeduct);
+          await invItem.save();
+        }
+      }
+      deliveryNote.isStockDeducted = true;
+    }
+
+    deliveryNote.status = 'Done';
+    deliveryNote.deliveryDate = new Date();
+    deliveryNote.receivedBy = req.body.receivedBy || req.user.fullName;
+    await deliveryNote.save();
+
+    if (deliveryNote.salesOrder) {
+      const order = await SalesOrder.findById(deliveryNote.salesOrder);
+      if (order) {
+        const prevStatus = order.workflowStatus || 'Sent to Support';
+        order.deliveryStatus = 'Fully Delivered';
+        order.workflowStatus = 'Sent to Accounts';
+        order.status = 'Delivery Note Confirmed';
+        order.departmentResponsible = 'Accounts';
+        order.workflowHistory.push({
+          user: req.user._id,
+          userName: req.user.fullName,
+          department: 'Support',
+          action: 'Delivery Note Confirmed',
+          previousStatus: prevStatus,
+          newStatus: 'Sent to Accounts',
+          timestamp: new Date(),
+          notes: `Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} confirmed.`
+        });
+        await order.save();
+      }
+    }
+
+    await notifyRoleHelper(['accountant', 'accounts', 'admin', 'ceo'], {
+      type: 'invoice',
+      title: 'Delivery Note Confirmed - Ready for Invoice',
+      message: `Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} confirmed. Order is ready for Draft Invoicing.`,
+      link: '/accounts/orders-ready'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} confirmed and stock updated.`,
+      data: deliveryNote
+    });
+  } catch (error) {
+    console.error('[Confirm Delivery Note Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error confirming delivery note.' });
+  }
+};
+
+/**
+ * @desc    Get pending Delivery Notes awaiting Draft Invoice in Accounts
+ * @route   GET /api/sales-employee/accounts/pending-delivery-notes
+ */
+const getAccountsPendingDeliveryNotes = async (req, res) => {
+  try {
+    const deliveryNotes = await DeliveryNote.find({
+      invoiced: { $ne: true },
+      status: { $nin: ['Cancelled', 'Draft'] }
+    }).populate('salesOrder').sort({ createdAt: -1 });
+
+    return res.status(200).json({
+      success: true,
+      count: deliveryNotes.length,
+      data: deliveryNotes
+    });
+  } catch (error) {
+    console.error('[Get Accounts Pending Delivery Notes Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching pending delivery notes.' });
+  }
+};
+
+const getAccountsStats = async (req, res) => {
+  try {
+    const { filter, startDate, endDate } = req.query;
+    const dateFilter = getDateRangeFilter(filter, startDate, endDate, 'createdAt');
+
+    // Confirmed DNs received from Support (in period if filtered)
+    const dnReceivedQuery = { status: { $in: ['Done', 'Confirmed', 'Delivered', 'Ready'] } };
+    if (dateFilter) Object.assign(dnReceivedQuery, dateFilter);
+    const dnsReceived = await DeliveryNote.countDocuments(dnReceivedQuery);
+
+    // Draft invoices created in period
+    const invCreatedQuery = {};
+    if (dateFilter) Object.assign(invCreatedQuery, dateFilter);
+    const draftsCreated = await Invoice.countDocuments(invCreatedQuery);
+
+    // Active pending queue: Delivery Notes not yet invoiced
+    const pendingDns = await DeliveryNote.find({
+      invoiced: { $ne: true },
+      status: { $nin: ['Cancelled', 'Draft'] }
+    }).populate('salesOrder');
+
+    const pendingDraftsCount = pendingDns.length;
+    let pendingAmount = 0;
+    pendingDns.forEach(dn => {
+      if (dn.salesOrder && (dn.salesOrder.netAmount || dn.salesOrder.totalAmount)) {
+        pendingAmount += Number(dn.salesOrder.netAmount || dn.salesOrder.totalAmount || 0);
+      } else if (dn.items && dn.items.length > 0) {
+        dn.items.forEach(it => {
+          pendingAmount += (Number(it.quantity) || 1) * (Number(it.unitPrice) || 0);
+        });
+      }
+    });
+
+    // Draft invoices
+    const draftInvoicesList = await Invoice.find({
+      $or: [{ isDraft: true }, { status: { $in: ['Draft', 'Pending Finance Finalization'] } }]
+    });
+    const draftInvoicesCount = draftInvoicesList.length;
+    const draftAmount = draftInvoicesList.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
+
+    const totalInvoices = await Invoice.countDocuments();
+    const approvedInvoices = await Invoice.countDocuments({
+      status: { $in: ['Finalized', 'Approved', 'Sent', 'Paid', 'Partially Paid'] }
+    });
+
+    const finalizedInvoices = await Invoice.find({ status: { $nin: ['Draft', 'Cancelled'] }, isDraft: { $ne: true } });
+    let outstandingAmount = 0;
+    let paidAmount = 0;
+    let overdueAmount = 0;
+    const now = new Date();
+
+    finalizedInvoices.forEach(inv => {
+      const amt = Number(inv.amount) || 0;
+      const pd = Number(inv.paidAmount) || 0;
+      const rem = Math.max(0, amt - pd);
+      paidAmount += pd;
+      outstandingAmount += rem;
+      if (rem > 0 && inv.dueDate && new Date(inv.dueDate) < now) {
+        overdueAmount += rem;
+      }
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        dnsReceived,
+        draftsCreated,
+        pendingDrafts: pendingDraftsCount,
+        pendingAmount,
+        draftAmount,
+        ordersAwaitingInvoice: pendingDraftsCount,
+        confirmedDeliveryNotes: dnsReceived,
+        totalInvoices,
+        draftInvoices: draftInvoicesCount,
+        approvedInvoices,
+        outstandingAmount,
+        paidAmount,
+        overdueAmount
+      }
+    });
+  } catch (error) {
+    console.error('[Get Accounts Stats Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching accounts stats.' });
+  }
+};
+
+const sendInvoiceToFinance = async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) {
+      return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    const prevStatus = invoice.status;
+    const wasReturned = !!invoice.rejectionReason;
+    invoice.status = 'Pending Finance Finalization';
+    invoice.isDraft = true;
+    invoice.departmentResponsible = 'Finance';
+    invoice.reviewedBy = req.user._id;
+    invoice.reviewedAt = new Date();
+    invoice.rejectionReason = ''; // Clear previous rejection reason upon resubmission
+    await invoice.save();
+
+    if (invoice.salesOrderId) {
+      const order = await SalesOrder.findById(invoice.salesOrderId);
+      if (order) {
+        const orderPrev = order.workflowStatus || 'Sent to Accounts';
+        order.workflowStatus = 'Pending Finance Finalization';
+        order.invoiceStatus = 'Fully Invoiced';
+        order.invoiceNumber = invoice.invoiceNumber;
+        order.departmentResponsible = 'Finance';
+        order.workflowHistory.push({
+          user: req.user._id,
+          userName: req.user.fullName,
+          department: 'Accounts',
+          action: wasReturned ? 'Resubmitted to Finance after revision' : 'Sent to Finance',
+          previousStatus: orderPrev,
+          newStatus: 'Pending Finance Finalization',
+          timestamp: new Date(),
+          notes: req.body.notes || (wasReturned ? `Draft Invoice ${invoice.invoiceNumber} revised and resubmitted to Finance.` : `Draft Invoice ${invoice.invoiceNumber} submitted to Finance for finalization.`)
+        });
+        await order.save();
+      }
+    }
+
+    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
+      type: 'finance',
+      title: wasReturned ? 'Revised Draft Invoice Resubmitted to Finance' : 'Draft Invoice Submitted to Finance',
+      message: wasReturned
+        ? `Draft Invoice ${invoice.invoiceNumber} for ${invoice.clientName} was revised by Accounts and resubmitted for finalization.`
+        : `Draft Invoice ${invoice.invoiceNumber} for ${invoice.clientName} submitted by Accounts for finalization.`,
+      link: '/finance/invoices'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Draft Invoice ${invoice.invoiceNumber} successfully ${wasReturned ? 'resubmitted' : 'sent'} to Finance!`,
+      data: invoice
+    });
+  } catch (error) {
+    console.error('[Send Invoice to Finance Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error sending invoice to finance.' });
+  }
+};
+
+/**
+ * @desc    Finance returns a draft invoice back to Accounts with comments/corrections
+ * @route   POST /api/sales-employee/invoices/:id/return-to-accounts
+ */
+const returnInvoiceToAccounts = async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+
+    const reason = req.body.reason || req.body.comment || req.body.notes || 'Revision requested by Finance.';
+    invoice.status = 'Draft';
+    invoice.isDraft = true;
+    invoice.departmentResponsible = 'Accounts';
+    invoice.rejectionReason = reason;
+    await invoice.save();
+
+    if (invoice.salesOrderId) {
+      const order = await SalesOrder.findById(invoice.salesOrderId);
+      if (order) {
+        const orderPrev = order.workflowStatus || 'Pending Finance Finalization';
+        order.workflowStatus = 'Draft Invoice Revision Required';
+        order.departmentResponsible = 'Accounts';
+        order.workflowHistory.push({
+          user: req.user._id,
+          userName: req.user.fullName,
+          department: 'Finance',
+          action: 'Draft Invoice Returned to Accounts for Revision',
+          previousStatus: orderPrev,
+          newStatus: 'Draft Invoice Revision Required',
+          timestamp: new Date(),
+          notes: reason
+        });
+        await order.save();
+      }
+    }
+
+    await logSalesActivity({
+      type: 'Invoice Returned to Accounts',
+      description: `Draft Invoice ${invoice.invoiceNumber} returned to Accounts by Finance (${req.user.fullName}) for revision. Reason: ${reason}`,
+      relatedModel: 'Invoice',
+      relatedId: invoice._id,
+      performedBy: req.user._id
+    });
+
+    await notifyRoleHelper(['accountant', 'accounts', 'admin'], {
+      type: 'invoice',
+      title: `Draft Invoice ${invoice.invoiceNumber} Returned for Revision`,
+      message: `Finance (${req.user.fullName}) returned Invoice ${invoice.invoiceNumber} for ${invoice.clientName} to Accounts. Comment: "${reason}". Please review, edit, and resubmit.`,
+      link: '/accounts/invoices'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Draft Invoice ${invoice.invoiceNumber} returned back to Accounts with comment: "${reason}".`,
+      data: invoice
+    });
+  } catch (error) {
+    console.error('[Return Invoice to Accounts Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error returning invoice to Accounts.' });
+  }
+};
+
+/**
+ * @desc    Finalize a draft invoice into GST Invoice or Cash Invoice
+ * @route   POST /api/sales-employee/invoices/:id/finalize
+ */
+const finalizeInvoice = async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+
+    const { invoiceType } = req.body; // 'GST Invoice' | 'Cash Invoice'
+    invoice.status = 'Finalized';
+    invoice.isDraft = false;
+    invoice.invoiceType = invoiceType || 'GST Invoice';
+    invoice.finalizedBy = req.user._id;
+    invoice.finalizedByName = req.user.fullName;
+    invoice.finalizedAt = new Date();
+    invoice.departmentResponsible = 'Finance';
+    await invoice.save();
+
+    if (invoice.salesOrderId) {
+      await SalesOrder.findByIdAndUpdate(invoice.salesOrderId, {
+        workflowStatus: 'Completed',
+        status: 'Completed',
+        invoiceStatus: 'Fully Invoiced'
+      });
+    }
+
+    await logSalesActivity({
+      type: 'Invoice Finalized',
+      description: `Invoice ${invoice.invoiceNumber} finalized as ${invoice.invoiceType} by ${req.user.fullName}.`,
+      relatedModel: 'Invoice',
+      relatedId: invoice._id,
+      performedBy: req.user._id
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Invoice ${invoice.invoiceNumber} finalized successfully as ${invoice.invoiceType}.`,
+      data: invoice
+    });
+  } catch (error) {
+    console.error('[Finalize Invoice Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error finalizing invoice.' });
+  }
+};
+
+const getFinanceStats = async (req, res) => {
+  try {
+    const { filter, startDate, endDate } = req.query;
+    const dateFilter = getDateRangeFilter(filter, startDate, endDate, 'createdAt');
+
+    // Received draft invoices from Accounts (in period)
+    const receivedQuery = {
+      status: { $in: ['Pending Finance Finalization', 'Submitted', 'Finalized', 'Approved', 'Paid', 'Partially Paid'] }
+    };
+    if (dateFilter) Object.assign(receivedQuery, dateFilter);
+    const draftInvoicesReceived = await Invoice.countDocuments(receivedQuery);
+
+    // Finalized invoices (in period)
+    const finalDateFilter = getDateRangeFilter(filter, startDate, endDate, 'finalizedAt');
+    const finalizedQuery = {
+      $or: [{ status: 'Finalized' }, { isDraft: false }]
+    };
+    if (finalDateFilter) Object.assign(finalizedQuery, finalDateFilter);
+    const invoicesFinalized = await Invoice.countDocuments(finalizedQuery);
+
+    // Current pending draft invoices in queue
+    const pendingDrafts = await Invoice.find({
+      status: { $in: ['Pending Finance Finalization', 'Submitted'] }
+    });
+    const pendingDraftsCount = pendingDrafts.length;
+    const pendingAmount = pendingDrafts.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
+
+    // Finalized invoices totals
+    const finalizedList = await Invoice.find({
+      status: { $nin: ['Draft', 'Pending Finance Finalization', 'Cancelled'] },
+      isDraft: { $ne: true }
+    });
+    const finalizedAmount = finalizedList.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
+    const totalPaid = finalizedList.reduce((sum, inv) => sum + (Number(inv.paidAmount) || 0), 0);
+    const outstandingReceivables = Math.max(0, finalizedAmount - totalPaid);
+
+    const now = new Date();
+    let overdueAmount = 0;
+    finalizedList.forEach(inv => {
+      const rem = Math.max(0, (Number(inv.amount) || 0) - (Number(inv.paidAmount) || 0));
+      if (rem > 0 && inv.dueDate && new Date(inv.dueDate) < now) {
+        overdueAmount += rem;
+      }
+    });
+
+    const totalPaymentsCount = await Payment.countDocuments();
+    const advancePaymentsCount = await Payment.countDocuments({ paymentType: 'Advance' });
+    const partialPaymentsCount = await Payment.countDocuments({ paymentType: 'Partial' });
+    const fullPaymentsCount = await Payment.countDocuments({ paymentType: 'Full' });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        draftInvoicesReceived,
+        invoicesFinalized,
+        pendingDrafts: pendingDraftsCount,
+        pendingAmount,
+        finalizedAmount,
+        totalInvoices: await Invoice.countDocuments(),
+        approvedInvoices: invoicesFinalized,
+        totalInvoicedAmount: finalizedAmount,
+        totalPaid,
+        outstandingReceivables,
+        overdueAmount,
+        totalPaymentsCount,
+        advancePaymentsCount,
+        partialPaymentsCount,
+        fullPaymentsCount
+      }
+    });
+  } catch (error) {
+    console.error('[Get Finance Stats Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching finance stats.' });
+  }
+};
+
+const getFinanceReceivables = async (req, res) => {
+  try {
+    const invoices = await Invoice.find({
+      status: { $nin: ['Draft', 'Cancelled'] }
+    }).sort({ dueDate: 1 });
+
+    const now = new Date();
+    const receivables = invoices.map(inv => {
+      const total = Number(inv.amount) || 0;
+      const paid = Number(inv.paidAmount) || 0;
+      const remaining = Math.max(0, total - paid);
+      const isOverdue = remaining > 0 && inv.dueDate && new Date(inv.dueDate) < now;
+      return {
+        _id: inv._id,
+        invoiceNumber: inv.invoiceNumber,
+        clientName: inv.clientName,
+        customerEmail: inv.customerEmail,
+        salesOrderNumber: inv.salesOrderNumber || inv.saleReference || '',
+        deliveryNoteNumber: inv.deliveryNoteNumber || '',
+        amount: total,
+        paidAmount: paid,
+        remainingReceivable: remaining,
+        issueDate: inv.issueDate,
+        dueDate: inv.dueDate,
+        status: remaining === 0 ? 'Paid' : (paid > 0 ? 'Partially Paid' : (isOverdue ? 'Overdue' : 'Pending')),
+        isOverdue
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      count: receivables.length,
+      data: receivables
+    });
+  } catch (error) {
+    console.error('[Get Finance Receivables Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching receivables.' });
+  }
+};
+
 module.exports = {
   getMySalesStats,
   getMyLeads,
@@ -2802,10 +4252,17 @@ module.exports = {
   createMyQuotation,
   updateMyQuotation,
   deleteMyQuotation,
+  convertQuotationToSalesOrder,
+  convertQuotationToCustomerPO,
+  convertCustomerPOToProductFile,
+  convertProductFileToSalesOrder,
+  calculateCustomerOverdue,
+  checkCustomerOverdueApi,
   getMyOrders,
   createMyOrder,
   updateMyOrder,
   deleteMyOrder,
+  financeReviewSalesOrder,
   checkOrderStock,
   getAvailableOrdersForDelivery,
   getMyProformaInvoices,
@@ -2835,5 +4292,18 @@ module.exports = {
   updateMyPayment,
   deleteMyPayment,
   getSalesTeamMembers,
-  getSalesTeamMemberProfile
+  getSalesTeamMemberProfile,
+  sendOrderToSupport,
+  sendSalesOrderToFinance,
+  getSupportStats,
+  getInventoryItems,
+  createOrUpdateInventoryItem,
+  confirmDeliveryNoteWithInventory,
+  getAccountsStats,
+  getAccountsPendingDeliveryNotes,
+  sendInvoiceToFinance,
+  returnInvoiceToAccounts,
+  finalizeInvoice,
+  getFinanceStats,
+  getFinanceReceivables
 };

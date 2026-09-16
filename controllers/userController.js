@@ -40,6 +40,8 @@ const getProfile = async (req, res) => {
   }
 };
 
+const logAudit = require('../utils/auditLogger');
+
 /**
  * @desc    Update current user permitted profile details
  * @route   PATCH /api/users/me
@@ -57,6 +59,7 @@ const updateProfile = async (req, res) => {
 
     const {
       fullName,
+      email,
       phone,
       profileImage,
       currentPassword,
@@ -85,6 +88,44 @@ const updateProfile = async (req, res) => {
     // Update permitted fields if provided
     if (fullName && fullName.trim() !== '') {
       user.fullName = fullName.trim();
+    }
+
+    // Email update with format & uniqueness check
+    if (email && email.trim() !== '') {
+      const normalizedEmail = email.toLowerCase().trim();
+      const emailRegex = /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,})+$/;
+      if (!emailRegex.test(normalizedEmail)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please enter a valid email address.'
+        });
+      }
+
+      if (normalizedEmail !== user.email) {
+        const existingUser = await User.findOne({
+          email: normalizedEmail,
+          _id: { $ne: user._id }
+        });
+
+        if (existingUser) {
+          return res.status(409).json({
+            success: false,
+            message: 'An account with this email address already exists.'
+          });
+        }
+
+        const oldEmail = user.email;
+        user.email = normalizedEmail;
+
+        await logAudit({
+          action: 'User Email Updated',
+          performedBy: req.user._id,
+          performedByName: user.fullName,
+          targetUser: user._id,
+          targetUserName: user.fullName,
+          details: `User ${user.fullName} updated profile email from ${oldEmail} to ${user.email}`
+        });
+      }
     }
 
     if (phone !== undefined) {
@@ -142,6 +183,15 @@ const updateProfile = async (req, res) => {
       }
 
       user.password = newPassword;
+
+      await logAudit({
+        action: 'Password Updated',
+        performedBy: req.user._id,
+        performedByName: user.fullName,
+        targetUser: user._id,
+        targetUserName: user.fullName,
+        details: `User ${user.fullName} changed password via profile management`
+      });
     }
 
     await user.save();

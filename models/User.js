@@ -8,10 +8,14 @@ const ALLOWED_ROLES = [
   'hr_manager',
   'sales_manager',
   'sales_member',
+  'sales_rep',
+  'sales_person',
   'project_manager',
   'marketing',
   'accountant',
-  'employee'
+  'employee',
+  'support',
+  'finance'
 ];
 
 const ACCOUNT_STATUSES = ['pending', 'active', 'inactive', 'deactivated', 'rejected', 'suspended'];
@@ -127,6 +131,14 @@ const userSchema = new mongoose.Schema(
     timestamps: true
   }
 );
+
+// Normalize position for new sales_person accounts without altering existing sales representative accounts
+userSchema.pre('save', function (next) {
+  if (this.role === 'sales_person' || (this.isNew && !this.position && this.role === 'sales_member')) {
+    this.position = 'Sales Person';
+  }
+  next();
+});
 
 // Hash password using bcrypt before saving
 userSchema.pre('save', async function (next) {
