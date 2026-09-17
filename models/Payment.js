@@ -21,6 +21,8 @@ const PaymentSchema = new mongoose.Schema(
       default: 'Bank Transfer'
     },
     notes: { type: String, default: '' },
+    salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    salePerson: { type: String, trim: true, default: '' },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
   },
   { timestamps: true }

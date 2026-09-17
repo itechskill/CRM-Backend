@@ -71,11 +71,14 @@ const {
   returnInvoiceToAccounts,
   finalizeInvoice,
   getFinanceStats,
-  getFinanceReceivables
+  getFinanceReceivables,
+  recordGoodsReceivedInOffice,
+  recordBLInput,
+  issueSupplierPO
 } = require('../controllers/salesEmployeeController');
 
 // All Departmental Roles, Admin & CEO access departmental CRM endpoints
-const salesEmployeeGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
+const salesEmployeeGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'logistics', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
 
 // Dashboard stats
 router.get('/stats', salesEmployeeGuard, getMySalesStats);
@@ -121,6 +124,9 @@ router.post('/orders', salesEmployeeGuard, createMyOrder);
 router.post('/orders/:id/send-to-support', salesEmployeeGuard, sendOrderToSupport);
 router.post('/orders/:id/send-to-finance', salesEmployeeGuard, sendSalesOrderToFinance);
 router.post('/orders/:id/finance-review', salesEmployeeGuard, financeReviewSalesOrder);
+router.post('/orders/:id/goods-received', salesEmployeeGuard, recordGoodsReceivedInOffice);
+router.post('/orders/:id/bl-input', salesEmployeeGuard, recordBLInput);
+router.post('/orders/:id/issue-supplier-po', salesEmployeeGuard, issueSupplierPO);
 router.patch('/orders/:id', salesEmployeeGuard, updateMyOrder);
 router.delete('/orders/:id', salesEmployeeGuard, deleteMyOrder);
 

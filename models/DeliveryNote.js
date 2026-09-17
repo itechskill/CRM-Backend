@@ -37,6 +37,11 @@ const DeliveryNoteSchema = new mongoose.Schema(
     },
     deliveryDate: { type: Date, default: null },
     receivedBy: { type: String, trim: true, default: '' },
+    fileType: { type: String, enum: ['Blue', 'Green', 'Yellow', ''], default: '' },
+    supplierPoNumber: { type: String, trim: true, default: '' },
+    blNumber: { type: String, trim: true, default: '' },
+    shipmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shipment', default: null },
+    shipmentNumber: { type: String, trim: true, default: '' },
     notes: { type: String, default: '' },
     isPartial: { type: Boolean, default: false },
     isStockDeducted: { type: Boolean, default: false },
@@ -44,6 +49,8 @@ const DeliveryNoteSchema = new mongoose.Schema(
     invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
     invoiceNumber: { type: String, default: '' },
     invoicedAt: { type: Date, default: null },
+    salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    salePerson: { type: String, trim: true, default: '' },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
   },
   { timestamps: true }

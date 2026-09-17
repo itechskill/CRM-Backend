@@ -652,7 +652,17 @@ router.post('/targets', managerGuard, async (req, res) => {
       performedByName: req.user.fullName,
       targetUser: employee._id,
       targetUserName: employee.fullName,
-      details: `Assigned target of ${targetAmount} ${currency || 'PKR'} for ${target.period} to ${employee.fullName}`
+      details: `Assigned target of PKR ${Number(targetAmount).toLocaleString()} for ${target.period} to ${employee.fullName}`
+    });
+
+    const { createNotificationHelper } = require('../controllers/notificationController');
+    await createNotificationHelper({
+      recipient: employee._id,
+      sender: req.user._id,
+      title: 'New Sales Target Assigned',
+      message: `Sales Manager (${req.user.fullName}) assigned you a sales target of PKR ${Number(targetAmount).toLocaleString()} for ${target.period}.`,
+      type: 'sales',
+      link: '/employee/sales/sales_targets'
     });
 
     return res.status(201).json({
