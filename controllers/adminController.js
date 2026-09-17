@@ -14,6 +14,7 @@ const Quotation = require('../models/Quotation');
 const CustomerPO = require('../models/CustomerPO');
 const DeliveryNote = require('../models/DeliveryNote');
 const Payment = require('../models/Payment');
+const Shipment = require('../models/Shipment');
 const JobPosting = require('../models/JobPosting');
 const JobApplication = require('../models/JobApplication');
 const AuditLog = require('../models/AuditLog');
@@ -1522,7 +1523,8 @@ const getOrgDepartmentStats = async (req, res) => {
       leaves,
       attendance,
       jobPostings,
-      jobApplications
+      jobApplications,
+      shipments
     ] = await Promise.all([
       User.find().select('-password').lean(),
       SalesOrder.find().lean(),
@@ -1536,7 +1538,8 @@ const getOrgDepartmentStats = async (req, res) => {
       Leave.find().lean(),
       Attendance.find().sort({ date: -1 }).limit(500).lean(),
       JobPosting.find().lean(),
-      JobApplication.find().lean()
+      JobApplication.find().lean(),
+      Shipment.find().lean()
     ]);
 
     // Department Users
@@ -1545,6 +1548,7 @@ const getOrgDepartmentStats = async (req, res) => {
     const accountsUsers = users.filter(u => u.role === 'accountant' || (u.department && u.department.toLowerCase().includes('account')));
     const financeUsers = users.filter(u => u.role === 'finance' || (u.department && u.department.toLowerCase().includes('finance')));
     const hrUsers = users.filter(u => ['hr_manager', 'administration'].includes(u.role) || (u.department && u.department.toLowerCase().includes('hr')));
+    const logisticsUsers = users.filter(u => u.role === 'logistics' || (u.department && u.department.toLowerCase().includes('logistic')));
 
     // --- SALES STATS ---
     const wonDeals = deals.filter(d => ['Closed Won', 'Won'].includes(d.stage));
@@ -1559,6 +1563,14 @@ const getOrgDepartmentStats = async (req, res) => {
     const inTransitDNs = deliveryNotes.filter(d => ['In Transit', 'Dispatched'].includes(d.status)).length;
     const pendingDNs = deliveryNotes.filter(d => ['Ready', 'Draft', 'Waiting', 'Pending', 'Created'].includes(d.status)).length;
     const supportScore = deliveryNotes.length > 0 ? Math.min(100, Math.round((confirmedDNs / deliveryNotes.length) * 100)) : 0;
+
+    // --- LOGISTICS STATS ---
+    const inTransitShipments = shipments.filter(s => s.status === 'In Transit').length;
+    const receivedShipments = shipments.filter(s => s.receivedInOffice || s.status === 'Received in Office').length;
+    const pendingShipments = shipments.filter(s => ['PO Issued', 'Shipment Pending', 'Booked', 'Dispatched'].includes(s.status) && !s.receivedInOffice).length;
+    const delayedShipments = shipments.filter(s => s.status === 'Delayed').length;
+    const blueFileOrders = salesOrders.filter(o => o.fileType === 'Blue');
+    const logisticsScore = shipments.length > 0 ? Math.min(100, Math.round((receivedShipments / shipments.length) * 100)) : 100;
 
     // --- ACCOUNTS STATS ---
     const totalInvoiced = invoices.reduce((sum, i) => sum + (i.amount || 0), 0);
@@ -1621,6 +1633,24 @@ const getOrgDepartmentStats = async (req, res) => {
         },
         records: {
           deliveryNotes: deliveryNotes.slice(0, 50)
+        }
+      },
+      logistics: {
+        name: 'Logistics',
+        userCount: logisticsUsers.length,
+        users: logisticsUsers,
+        score: logisticsScore,
+        kpis: {
+          totalShipments: shipments.length,
+          inTransitShipments,
+          receivedShipments,
+          pendingShipments,
+          delayedShipments,
+          blueFileOrders: blueFileOrders.length
+        },
+        records: {
+          shipments: shipments.slice(0, 50),
+          blueFileOrders: blueFileOrders.slice(0, 50)
         }
       },
       accounts: {

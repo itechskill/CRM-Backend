@@ -3,11 +3,29 @@ const Expense = require('../models/Expense');
 const Payroll = require('../models/Payroll');
 const User = require('../models/User');
 const MaintenanceCharge = require('../models/MaintenanceCharge');
+const InventoryItem = require('../models/InventoryItem');
 
 // INVOICES API
 const getInvoices = async (req, res) => {
   try {
-    const invoices = await Invoice.find().sort({ createdAt: -1 });
+    const { search } = req.query;
+    let query = {};
+    if (search && search.trim()) {
+      const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      query.$or = [
+        { invoiceNumber: regex },
+        { clientName: regex },
+        { salePerson: regex },
+        { salesOrderNumber: regex },
+        { deliveryNoteNumber: regex },
+        { invoiceType: regex },
+        { status: regex }
+      ];
+    }
+    const invoices = await Invoice.find(query)
+      .populate('salesPerson', 'fullName email')
+      .populate('createdBy', 'fullName email department')
+      .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: invoices.length, data: invoices });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error retrieving invoices.' });
@@ -79,23 +97,35 @@ const getExpenses = async (req, res) => {
 
 const createExpense = async (req, res) => {
   try {
-    const { title, category, amount, notes } = req.body;
+    const { title, category, amount, notes, date, submittedBy, submittedByName, department } = req.body;
     if (!title || !amount) {
-      return res.status(400).json({ success: false, message: 'Title and amount are required.' });
+      return res.status(400).json({ success: false, message: 'Expense title and amount are required.' });
+    }
+
+    let userSubmitterId = submittedBy || req.user._id;
+    let userSubmitterName = submittedByName || req.user.fullName;
+
+    if (submittedBy && !submittedByName) {
+      const u = await User.findById(submittedBy);
+      if (u) {
+        userSubmitterName = u.fullName;
+      }
     }
 
     const expense = await Expense.create({
       title: title.trim(),
       category: category || 'Office Supplies',
       amount: Number(amount),
-      submittedBy: req.user._id,
-      submittedByName: req.user.fullName,
-      notes: notes || '',
+      date: date ? new Date(date) : new Date(),
+      submittedBy: userSubmitterId,
+      submittedByName: userSubmitterName,
+      notes: notes ? `${department ? `[${department}] ` : ''}${notes}`.trim() : (department ? `[${department}]` : ''),
       status: 'Pending'
     });
 
-    return res.status(201).json({ success: true, message: 'Expense submitted successfully.', data: expense });
+    return res.status(201).json({ success: true, message: 'Expense saved successfully to database.', data: expense });
   } catch (error) {
+    console.error('[Create Expense Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error creating expense.' });
   }
 };
@@ -132,28 +162,28 @@ const getPayroll = async (req, res) => {
     const month = Number(req.query.month) || now.getMonth() + 1;
     const year = Number(req.query.year) || now.getFullYear();
 
-    // Get all active non-admin employees
-    const employees = await User.find({ status: 'active', role: { $nin: ['admin'] } })
-      .select('fullName email department role employeeId')
+    // Get all active legitimate employees (excluding admin and ceo)
+    const employees = await User.find({ status: 'active', role: { $nin: ['admin', 'ceo'] } })
+      .select('fullName email department role employeeId salary')
       .sort({ fullName: 1 });
 
     // Get existing payroll records for this month/year
     const existingPayrolls = await Payroll.find({ month, year })
-      .populate('user', 'fullName email department role employeeId');
+      .populate('user', 'fullName email department role employeeId salary');
 
     const existingUserIds = new Set(existingPayrolls.map(p => p.user?._id?.toString()));
 
-    // Auto-create missing payroll records with $0 defaults
+    // Auto-create missing payroll records with $0/user salary defaults
     const toCreate = employees
       .filter(emp => !existingUserIds.has(emp._id.toString()))
       .map(emp => ({
         user: emp._id,
         month,
         year,
-        baseSalary: 0,
+        baseSalary: Number(emp.salary) || 0,
         bonus: 0,
         taxDeduction: 0,
-        netPay: 0,
+        netPay: Number(emp.salary) || 0,
         status: 'Pending'
       }));
 
@@ -163,7 +193,7 @@ const getPayroll = async (req, res) => {
 
     // Re-fetch all payroll for this period
     const payrolls = await Payroll.find({ month, year })
-      .populate('user', 'fullName email department role employeeId')
+      .populate('user', 'fullName email department role employeeId salary')
       .sort({ createdAt: -1 });
 
     return res.status(200).json({
@@ -284,31 +314,42 @@ const getFinanceSummary = async (req, res) => {
   }
 };
 
-// GET /api/finance/reports/full — Comprehensive Finance Data
+// GET /api/finance/reports/full — Comprehensive Multi-Statement Finance Data
 const getFullFinanceReports = async (req, res) => {
   try {
     const invoices = await Invoice.find();
     const expenses = await Expense.find();
     const payrolls = await Payroll.find();
     const maintenance = await MaintenanceCharge.find();
+    const inventoryItems = await InventoryItem.find();
 
-    // P&L Logic
-    const revenue = invoices.filter(i => i.status === 'Paid').reduce((s, i) => s + (i.amount || 0), 0);
-    const expensesCost = expenses.filter(e => e.status === 'Paid' || e.status === 'Approved').reduce((s, e) => s + (e.amount || 0), 0);
+    // Invoices breakdown
+    const totalInvoicedAmount = invoices.reduce((s, i) => s + (i.amount || 0), 0);
+    const paidInvoices = invoices.filter(i => i.status === 'Paid');
+    const revenue = paidInvoices.reduce((s, i) => s + (i.amount || 0), 0);
+    const pendingInvoices = invoices.filter(i => i.status === 'Pending' || i.status === 'Overdue');
+    const receivables = pendingInvoices.reduce((s, i) => s + (i.amount || 0), 0);
+
+    // Expenses breakdown
+    const approvedExpenses = expenses.filter(e => e.status === 'Paid' || e.status === 'Approved');
+    const expensesCost = approvedExpenses.reduce((s, e) => s + (e.amount || 0), 0);
+    const pendingExpenses = expenses.filter(e => e.status === 'Pending');
+    const pendingExpensesCost = pendingExpenses.reduce((s, e) => s + (e.amount || 0), 0);
+
+    // Payroll breakdown
     const payrollCost = payrolls.reduce((s, p) => s + (p.netPay || 0), 0);
+    const totalTaxWithheld = payrolls.reduce((s, p) => s + (p.taxDeduction || 0), 0);
+    const totalBonus = payrolls.reduce((s, p) => s + (p.bonus || 0), 0);
+    const pendingPayrollCost = payrolls.filter(p => p.status === 'Pending').reduce((s, p) => s + (p.netPay || 0), 0);
+
+    // Maintenance charges breakdown
     const maintenanceCost = maintenance.filter(m => m.status === 'Paid' || m.status === 'Approved').reduce((s, m) => s + (m.amount || 0), 0);
+    const pendingMaintenanceCost = maintenance.filter(m => m.status === 'Pending').reduce((s, m) => s + (m.amount || 0), 0);
 
-    const totalCost = expensesCost + payrollCost + maintenanceCost;
-    const netProfit = revenue - totalCost;
+    // Inventory Asset valuation
+    const inventoryValue = inventoryItems.reduce((s, item) => s + ((item.quantityOnHand || 0) * (item.unitPrice || 0)), 0);
 
-    // Balance Sheet
-    const receivables = invoices.filter(i => i.status === 'Pending' || i.status === 'Overdue').reduce((s, i) => s + (i.amount || 0), 0);
-    const payables = expenses.filter(e => e.status === 'Pending').reduce((s, e) => s + (e.amount || 0), 0) +
-                     maintenance.filter(m => m.status === 'Pending').reduce((s, m) => s + (m.amount || 0), 0);
-                     
-    // Simplistic cash flow approximation (Paid Invoices - Paid/Approved Expenses/Maintenance)
-    const cashOnHand = revenue - expensesCost - maintenanceCost - payrollCost;
-
+    // Categorized expenses
     const expenseCategories = {
       Software: expenses.filter(e => e.category === 'Software').reduce((s, e) => s + (e.amount || 0), 0),
       Marketing: expenses.filter(e => e.category === 'Marketing').reduce((s, e) => s + (e.amount || 0), 0),
@@ -319,24 +360,57 @@ const getFullFinanceReports = async (req, res) => {
       Other: expenses.filter(e => e.category === 'Other').reduce((s, e) => s + (e.amount || 0), 0),
     };
 
+    const cogsTotal = maintenanceCost + (expenseCategories.Software || 0);
+    const opexTotal = (expenseCategories.Salaries || 0) + (expenseCategories.Marketing || 0) + (expenseCategories.Travel || 0) + (expenseCategories.OfficeSupplies || 0) + (expenseCategories.Utilities || 0) + (expenseCategories.Other || 0);
+    const totalCost = cogsTotal + opexTotal;
+    const grossProfit = revenue - cogsTotal;
+    const netIncomeBeforeTax = grossProfit - opexTotal;
+    const corporateTaxProvision = Math.max(0, netIncomeBeforeTax * 0.15);
+    const netProfit = netIncomeBeforeTax - corporateTaxProvision;
+
+    // Balance Sheet
+    const cashOnHand = Math.max(0, revenue - expensesCost - maintenanceCost - payrollCost);
+    const currentAssets = cashOnHand + receivables + inventoryValue;
+    const payables = pendingExpensesCost + pendingMaintenanceCost + pendingPayrollCost;
+    const totalLiabilities = payables + totalTaxWithheld;
+    const retainedEarnings = currentAssets - totalLiabilities;
+
+    // Tax summary calculations
+    const deductibleExpenses = expenses.filter(e => e.category !== 'Travel').reduce((s, e) => s + (e.amount || 0), 0) + payrollCost + maintenanceCost;
+    const nonDeductibleExpenses = expenses.filter(e => e.category === 'Travel').reduce((s, e) => s + (e.amount || 0), 0);
+
     return res.status(200).json({
       success: true,
       data: {
         revenue,
-        expensesCost,
-        payrollCost,
-        maintenanceCost,
-        totalCost,
+        totalInvoicedAmount,
+        cogsTotal,
+        grossProfit,
+        opexTotal,
+        netIncomeBeforeTax,
+        corporateTaxProvision,
         netProfit,
+        totalCost,
         receivables,
         payables,
         cashOnHand,
+        inventoryValue,
+        currentAssets,
+        totalLiabilities,
+        retainedEarnings,
+        deductibleExpenses,
+        nonDeductibleExpenses,
+        totalTaxWithheld,
+        totalBonus,
         expenseCategories,
         counts: {
           invoices: invoices.length,
+          paidInvoices: paidInvoices.length,
+          pendingInvoices: pendingInvoices.length,
           expenses: expenses.length,
           payrolls: payrolls.length,
-          maintenance: maintenance.length
+          maintenance: maintenance.length,
+          inventoryItems: inventoryItems.length
         }
       }
     });

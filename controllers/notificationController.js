@@ -23,37 +23,79 @@ const createNotificationHelper = async ({ recipient, sender, title, message, typ
 };
 
 /**
- * Helper to create notifications for all users matching a role
+ * Helper to create notifications for all users matching given roles or departments
  */
-const notifyRoleHelper = async ({ role, sender, title, message, type = 'system', link = '' }) => {
+const notifyRoleHelper = async (rolesOrOptions, optionsParam = {}) => {
   try {
+    let targetRoles = [];
+    let payload = {};
+
+    if (Array.isArray(rolesOrOptions)) {
+      targetRoles = rolesOrOptions;
+      payload = optionsParam || {};
+    } else if (typeof rolesOrOptions === 'string') {
+      targetRoles = [rolesOrOptions];
+      payload = optionsParam || {};
+    } else if (rolesOrOptions && typeof rolesOrOptions === 'object') {
+      if (rolesOrOptions.role) {
+        targetRoles = Array.isArray(rolesOrOptions.role) ? rolesOrOptions.role : [rolesOrOptions.role];
+      }
+      payload = rolesOrOptions;
+    }
+
     const roleMap = {
       hr_manager: ['hr_manager', 'hr', 'human_resources'],
-      accountant: ['accountant', 'finance', 'accounting'],
+      hr: ['hr_manager', 'hr', 'human_resources'],
+      accountant: ['accountant', 'accounts', 'accounting', 'finance'],
+      accounts: ['accountant', 'accounts', 'accounting'],
+      finance: ['finance', 'accountant', 'accounting'],
       sales_manager: ['sales_manager', 'sales'],
+      sales: ['sales_manager', 'sales_member', 'sales_rep', 'sales_person'],
+      sales_person: ['sales_person', 'sales_member', 'sales_rep'],
+      sales_rep: ['sales_rep', 'sales_person', 'sales_member'],
+      sales_member: ['sales_member', 'sales_rep', 'sales_person'],
+      support: ['support', 'operations'],
       project_manager: ['project_manager', 'project'],
       marketing: ['marketing'],
       administration: ['administration', 'admin'],
+      admin: ['admin', 'ceo'],
+      ceo: ['ceo', 'admin'],
       employee: ['employee']
     };
-    const targetRoles = roleMap[role] || [role];
-    const deptKeyword = role.replace('_manager', '').replace('_', ' ');
 
-    const users = await User.find({
+    const expandedRoles = new Set();
+    const deptKeywords = [];
+
+    targetRoles.forEach(r => {
+      const key = String(r).toLowerCase();
+      if (roleMap[key]) {
+        roleMap[key].forEach(mapped => expandedRoles.add(mapped));
+      } else {
+        expandedRoles.add(key);
+      }
+      const kw = key.replace('_manager', '').replace('_dept', '').replace('_', ' ');
+      if (kw) deptKeywords.push(kw);
+    });
+
+    const roleList = Array.from(expandedRoles);
+
+    const query = {
       $or: [
-        { role: { $in: targetRoles } },
-        { department: { $regex: new RegExp(deptKeyword, 'i') } }
+        { role: { $in: roleList } },
+        { department: { $in: roleList.map(r => new RegExp(r, 'i')) } }
       ],
       status: 'active'
-    }).select('_id');
+    };
+
+    const users = await User.find(query).select('_id fullName email role department');
 
     const notifications = users.map(u => ({
       recipient: u._id,
-      sender: sender || null,
-      title,
-      message,
-      type,
-      link,
+      sender: payload.sender || null,
+      title: payload.title || 'System Notification',
+      message: payload.message || '',
+      type: payload.type || 'system',
+      link: payload.link || '',
       isRead: false
     }));
 

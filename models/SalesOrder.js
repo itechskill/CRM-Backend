@@ -72,6 +72,58 @@ const SalesOrderSchema = new mongoose.Schema(
     financeApprovedByName: { type: String, default: '' },
     financeApprovedAt: { type: Date, default: null },
     financeRejectionReason: { type: String, default: '' },
+    isOverdueBlocked: { type: Boolean, default: false },
+    overdueBlockReason: { type: String, default: '' },
+    overdueBlockedAt: { type: Date, default: null },
+    overdueBlockedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    overdueBlockedByName: { type: String, default: '' },
+    supplierPO: {
+      poNumber: { type: String, default: '' },
+      poType: { type: String, enum: ['Local', 'International', ''], default: '' },
+      supplierName: { type: String, default: '' },
+      supplierCountry: { type: String, default: '' },
+      supplierEmail: { type: String, default: '' },
+      supplierPhone: { type: String, default: '' },
+      issueDate: { type: Date, default: null },
+      status: { type: String, default: 'Issued' },
+      items: [
+        {
+          description: { type: String, default: '' },
+          quantity: { type: Number, default: 1 },
+          unitPrice: { type: Number, default: 0 },
+          total: { type: Number, default: 0 }
+        }
+      ],
+      totalAmount: { type: Number, default: 0 },
+      currency: { type: String, default: 'PKR' },
+      notes: { type: String, default: '' },
+      issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      issuedByName: { type: String, default: '' },
+      issuedAt: { type: Date, default: null }
+    },
+    goodsReceivedInOffice: {
+      received: { type: Boolean, default: false },
+      receivedAt: { type: Date, default: null },
+      receivedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      receivedByName: { type: String, default: '' },
+      receivedQuantity: { type: Number, default: 0 },
+      orderedQuantity: { type: Number, default: 0 },
+      remarks: { type: String, default: '' }
+    },
+    blNumber: { type: String, default: '' },
+    blInput: {
+      blNumber: { type: String, default: '' },
+      blDate: { type: Date, default: null },
+      carrier: { type: String, default: '' },
+      containerNo: { type: String, default: '' },
+      portOfLoading: { type: String, default: '' },
+      portOfDischarge: { type: String, default: '' },
+      enteredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      enteredByName: { type: String, default: '' },
+      enteredAt: { type: Date, default: null }
+    },
+    shipmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shipment', default: null },
+    shipmentNumber: { type: String, default: '' },
     deliveryNoteId: { type: mongoose.Schema.Types.ObjectId, ref: 'DeliveryNote', default: null },
     deliveryNoteNumber: { type: String, default: '' },
     invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },

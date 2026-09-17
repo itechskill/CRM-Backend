@@ -19,6 +19,7 @@ const Payroll = require('../models/Payroll');
 const Attendance = require('../models/Attendance');
 const Leave = require('../models/Leave');
 const User = require('../models/User');
+const Shipment = require('../models/Shipment');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
 
 // ─────────────────────────────────────────────
@@ -122,7 +123,7 @@ const getMySalesStats = async (req, res) => {
 
     // ── TARGET QUOTA ──
     const activeTarget = targets.find(t => t.status === 'Active' || t.status === 'Ongoing') || targets[0];
-    const monthlyTarget = activeTarget?.targetAmount || (user?.salaryTarget ? user.salaryTarget * 5 : 50000);
+    const monthlyTarget = activeTarget?.targetAmount || (user?.salaryTarget ? user.salaryTarget * 5 : 0);
     const remainingTarget = Math.max(0, monthlyTarget - salesAchieved);
     const targetAchievementPct = monthlyTarget > 0 ? Math.round((salesAchieved / monthlyTarget) * 100) : (salesAchieved > 0 ? 100 : 0);
 
@@ -156,8 +157,8 @@ const getMySalesStats = async (req, res) => {
     const overdueInvoiceAmount = overdueAmount;
     const overdueOrderAmount = 0;
 
-    // 3. Salary Target: From employee user record, payroll base/net salary, or standard commission ratio
-    const salaryTarget = Number(user?.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(monthlyTarget * 0.1) || 5000;
+    // 3. Salary Target: From employee user record, payroll base/net salary
+    const salaryTarget = Number(user?.salaryTarget) || Number(user?.salary) || Number(payroll?.baseSalary) || Number(payroll?.netPay) || 0;
 
     // 4. Liability: Cancelled orders or liabilities
     const cancelledOrders = orders.filter(o => o.status === 'Cancelled');
@@ -759,14 +760,26 @@ const createMyInvoice = async (req, res) => {
     let resolvedDeliveryNoteNumber = deliveryNoteNumber || '';
 
     if (salesOrderId) {
-      const linkedSo = await SalesOrder.findById(salesOrderId);
+      const linkedSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
       if (linkedSo) {
-        resolvedSalePerson = resolvedSalePerson || linkedSo.salePerson || '';
-        resolvedSalesPersonId = linkedSo.salesPerson || linkedSo.createdBy || null;
+        resolvedSalePerson = resolvedSalePerson || linkedSo.salePerson || (linkedSo.salesPerson && linkedSo.salesPerson.fullName) || '';
+        resolvedSalesPersonId = linkedSo.salesPerson?._id || linkedSo.salesPerson || linkedSo.createdBy || null;
         if (!resolvedDeliveryNoteId && linkedSo.deliveryNoteId) {
           resolvedDeliveryNoteId = linkedSo.deliveryNoteId;
           resolvedDeliveryNoteNumber = linkedSo.deliveryNoteNumber || '';
         }
+      }
+    }
+
+    if (resolvedDeliveryNoteId && (!resolvedSalesPersonId || !resolvedSalePerson)) {
+      const linkedDn = await DeliveryNote.findById(resolvedDeliveryNoteId).populate('salesOrder');
+      if (linkedDn) {
+        if (!salesOrderId && linkedDn.salesOrder) {
+          salesOrderId = linkedDn.salesOrder._id || linkedDn.salesOrder;
+          salesOrderNumber = linkedDn.salesOrderNumber || linkedDn.salesOrder.orderNumber || linkedDn.salesOrder.orderReference || '';
+        }
+        resolvedSalePerson = resolvedSalePerson || linkedDn.salePerson || (linkedDn.salesOrder && (linkedDn.salesOrder.salePerson || (linkedDn.salesOrder.salesPerson && linkedDn.salesOrder.salesPerson.fullName))) || '';
+        resolvedSalesPersonId = resolvedSalesPersonId || linkedDn.salesPerson || (linkedDn.salesOrder && (linkedDn.salesOrder.salesPerson?._id || linkedDn.salesOrder.salesPerson)) || null;
       }
     }
 
@@ -1701,54 +1714,255 @@ const createMyOrder = async (req, res) => {
 };
 
 /**
- * @desc    Finance review (approve or reject) a sales order with overdue customer
+ * @desc    Finance review (approve / clear, block / hold, or reject) a sales order based on overdue verification
  * @route   POST /api/sales-employee/orders/:id/finance-review
  */
 const financeReviewSalesOrder = async (req, res) => {
   try {
-    const action = (req.body.action || req.body.decision || '').toLowerCase().trim(); // 'approve' or 'reject'
+    const action = (req.body.action || req.body.decision || '').toLowerCase().trim(); // 'approve', 'clear', 'block', 'hold', 'reject'
     const reason = req.body.reason || req.body.notes || '';
+    const fileTypeChoice = (req.body.fileType || '').trim(); // 'Green' or 'Blue'
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
 
-    if (action === 'approve') {
+    if (action === 'block' || action === 'hold') {
+      // Flowchart: Overdue? YES -> Order Blocked / Hold -> STOP
+      order.isOverdueBlocked = true;
+      order.overdueBlockReason = reason || 'Customer has outstanding overdue balance according to Financial Overdue Verification.';
+      order.overdueBlockedAt = new Date();
+      order.overdueBlockedBy = req.user._id;
+      order.overdueBlockedByName = req.user.fullName;
+      order.workflowStatus = 'Order Blocked / Hold';
+      order.status = 'Order Blocked / Hold';
+      order.departmentResponsible = 'Finance';
+
+      order.workflowHistory.push({
+        user: req.user._id,
+        userName: req.user.fullName,
+        department: 'Finance',
+        action: 'Order Blocked / Hold (Overdue = YES)',
+        previousStatus: order.workflowStatus,
+        newStatus: 'Order Blocked / Hold',
+        timestamp: new Date(),
+        notes: reason || `Order placed on HOLD by Finance due to customer overdue balance (PKR ${Number(order.customerOverdueAtCreation || 0).toLocaleString()}).`
+      });
+
+      await order.save();
+
+      await logSalesActivity({
+        type: 'Order Blocked by Finance',
+        description: `Sales Order ${order.orderNumber || order.orderReference} blocked/placed on hold by Finance (${req.user.fullName}) due to overdue balance`,
+        relatedModel: 'SalesOrder',
+        relatedId: order._id,
+        performedBy: req.user._id
+      });
+
+      if (order.salesPerson || order.createdBy) {
+        await createNotificationHelper({
+          recipient: order.salesPerson || order.createdBy,
+          sender: req.user._id,
+          title: 'Sales Order Blocked / On Hold',
+          message: `Finance has placed Sales Order ${order.orderNumber || order.orderReference} on HOLD due to customer overdue balance.${reason ? ` Reason: ${reason}` : ''}`,
+          type: 'finance',
+          link: '/employee/sales/orders'
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Sales Order ${order.orderNumber || order.orderReference} successfully placed on HOLD / BLOCKED. Downstream processing halted.`,
+        data: order
+      });
+    } else if (action === 'approve' || action === 'clear') {
+      // Flowchart: Overdue? NO / All Clear -> File Type? -> Green vs Blue
+      order.isOverdueBlocked = false;
+      order.overdueBlockReason = '';
       order.requiresFinanceApproval = false;
       order.financeApprovedBy = req.user._id;
       order.financeApprovedByName = req.user.fullName;
       order.financeApprovedAt = new Date();
-      order.workflowStatus = 'Finance Approved';
-      order.status = 'Finance Approved';
-      order.departmentResponsible = 'Support'; // Move to Support for Delivery Note creation
-      order.workflowHistory.push({
-        user: req.user._id,
-        userName: req.user.fullName,
-        department: 'Finance',
-        action: 'Finance Approved (Moved to Support for DN)',
-        previousStatus: 'Pending Finance Overdue Check',
-        newStatus: 'Finance Approved',
-        timestamp: new Date(),
-        notes: reason || 'Customer overdue check approved. Routed to Support Department for Delivery Note (DN).'
+
+      // Resolve file type: must be 'Green' or 'Blue'
+      const resolvedFileType = fileTypeChoice === 'Blue' || fileTypeChoice === 'Green'
+        ? fileTypeChoice
+        : (order.fileType === 'Blue' ? 'Blue' : 'Green');
+      order.fileType = resolvedFileType;
+
+      // Issue/prepare Supplier PO
+      const isBlue = resolvedFileType === 'Blue';
+      const supplierType = isBlue ? 'International' : 'Local';
+      const defaultSupplier = isBlue ? 'International Supplier' : 'Local Supplier';
+      const defaultCountry = isBlue ? (req.body.supplierCountry || 'China') : 'Pakistan';
+      const poNum = req.body.supplierPoNumber || `${isBlue ? 'IPO' : 'LPO'}-${Date.now().toString().slice(-6)}`;
+
+      order.supplierPO = {
+        poNumber: poNum,
+        poType: supplierType,
+        supplierName: req.body.supplierName || order.supplierPO?.supplierName || defaultSupplier,
+        supplierCountry: req.body.supplierCountry || order.supplierPO?.supplierCountry || defaultCountry,
+        supplierEmail: req.body.supplierEmail || order.supplierPO?.supplierEmail || '',
+        supplierPhone: req.body.supplierPhone || order.supplierPO?.supplierPhone || '',
+        issueDate: new Date(),
+        status: 'Issued',
+        items: order.items || [],
+        totalAmount: Number(req.body.supplierPoAmount) || order.netAmount || order.totalAmount || 0,
+        currency: 'PKR',
+        notes: req.body.supplierNotes || (isBlue ? 'Imported from outside Pakistan' : 'Local / Normal Order'),
+        issuedBy: req.user._id,
+        issuedByName: req.user.fullName,
+        issuedAt: new Date()
+      };
+
+      if (isBlue) {
+        // BLUE FILE FLOW: Routes to Logistics Department for Shipment Tracking!
+        order.workflowStatus = 'International Supplier PO Issued';
+        order.status = 'International Supplier PO Issued';
+        order.departmentResponsible = 'Logistics';
+
+        // Automatically initialize or link Shipment in Logistics
+        let shipment = await Shipment.findOne({ salesOrder: order._id });
+        if (!shipment) {
+          shipment = await Shipment.create({
+            salesOrder: order._id,
+            salesOrderNumber: order.orderNumber || order.orderReference,
+            salesPerson: order.salesPerson || req.user._id,
+            salePerson: order.salePerson || req.user.fullName,
+            clientName: order.clientName,
+            clientEmail: order.clientEmail || '',
+            clientPhone: order.clientPhone || '',
+            supplierName: order.supplierPO.supplierName,
+            supplierCountry: order.supplierPO.supplierCountry,
+            supplierPoNumber: order.supplierPO.poNumber,
+            supplierPoDate: new Date(),
+            fileType: 'Blue',
+            status: 'PO Issued',
+            description: order.productSummary || 'Imported Goods',
+            items: order.items || [],
+            createdBy: req.user._id,
+            trackingHistory: [
+              {
+                status: 'PO Issued',
+                location: 'International Origin',
+                notes: `PO #${poNum} issued to ${order.supplierPO.supplierName}. Ready for logistics dispatch tracking.`,
+                updatedBy: req.user._id,
+                updatedByName: req.user.fullName,
+                timestamp: new Date()
+              }
+            ]
+          });
+        }
+        order.shipmentId = shipment._id;
+        order.shipmentNumber = shipment.shipmentId;
+
+        order.workflowHistory.push({
+          user: req.user._id,
+          userName: req.user.fullName,
+          department: 'Finance',
+          action: 'Finance All Clear — Blue File (Routed to Logistics)',
+          previousStatus: 'Pending Finance Overdue Check',
+          newStatus: 'International Supplier PO Issued',
+          timestamp: new Date(),
+          notes: `Finance verified overdue clear. Blue File order with International PO #${poNum} routed to Logistics Department for Shipment Tracking.`
+        });
+
+        // Notify Logistics department
+        await notifyRoleHelper(['logistics', 'admin'], {
+          type: 'order',
+          title: 'New Blue File Shipment in Logistics',
+          message: `International Supplier PO #${poNum} for Sales Order ${order.orderNumber || order.orderReference} is ready for Logistics processing.`,
+          link: '/logistics/shipments',
+          sender: req.user._id
+        });
+      } else {
+        // GREEN FILE FLOW: Routes to Support Department for Goods Received in Office!
+        order.workflowStatus = 'Local Supplier PO Issued';
+        order.status = 'Local Supplier PO Issued';
+        order.departmentResponsible = 'Support';
+
+        order.workflowHistory.push({
+          user: req.user._id,
+          userName: req.user.fullName,
+          department: 'Finance',
+          action: 'Finance All Clear — Green File (Routed to Support)',
+          previousStatus: 'Pending Finance Overdue Check',
+          newStatus: 'Local Supplier PO Issued',
+          timestamp: new Date(),
+          notes: `Finance verified overdue clear. Green File order with Local PO #${poNum} routed to Support Department for Goods Received in Office.`
+        });
+
+        // Notify Support department
+        await notifyRoleHelper(['support', 'operations', 'admin'], {
+          type: 'order',
+          title: 'New Green File Order in Support',
+          message: `Local Supplier PO #${poNum} for Sales Order ${order.orderNumber || order.orderReference} is ready for Support goods receipt & DN creation.`,
+          link: '/support/orders',
+          sender: req.user._id
+        });
+      }
+
+      await order.save();
+
+      await logSalesActivity({
+        type: `Finance Approved (${resolvedFileType} File)`,
+        description: `Sales Order ${order.orderNumber || order.orderReference} verified All Clear by Finance (${req.user.fullName}) — ${resolvedFileType} File PO #${poNum}`,
+        relatedModel: 'SalesOrder',
+        relatedId: order._id,
+        performedBy: req.user._id
+      });
+
+      if (order.salesPerson || order.createdBy) {
+        await createNotificationHelper({
+          recipient: order.salesPerson || order.createdBy,
+          sender: req.user._id,
+          title: `Sales Order Approved: ${resolvedFileType} File`,
+          message: `Finance approved Sales Order ${order.orderNumber || order.orderReference} (${resolvedFileType} File). PO #${poNum} issued.`,
+          type: 'finance',
+          link: '/employee/sales/orders'
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Sales Order approved as ${resolvedFileType} File! Routed to ${isBlue ? 'Logistics Department' : 'Support Department'}.`,
+        data: order
       });
     } else if (action === 'reject') {
       order.workflowStatus = 'Finance Rejected';
       order.status = 'Rejected';
-      order.departmentResponsible = 'Sales'; // Return to Sales representative
-      order.financeRejectionReason = reason || 'Rejected by Finance due to customer overdue amount.';
+      order.departmentResponsible = 'Sales';
+      order.financeRejectionReason = reason || 'Rejected by Finance.';
       order.workflowHistory.push({
         user: req.user._id,
         userName: req.user.fullName,
         department: 'Finance',
-        action: 'Sales Order Rejected due to overdue amount',
-        previousStatus: 'Pending Finance Overdue Check',
+        action: 'Sales Order Rejected by Finance',
+        previousStatus: order.workflowStatus,
         newStatus: 'Rejected',
         timestamp: new Date(),
-        notes: reason || 'Rejected by Finance due to customer overdue amount. Returned to Sales.'
+        notes: reason || 'Rejected by Finance. Returned to Sales Person.'
+      });
+
+      await order.save();
+
+      if (order.salesPerson || order.createdBy) {
+        await createNotificationHelper({
+          recipient: order.salesPerson || order.createdBy,
+          sender: req.user._id,
+          title: 'Sales Order Rejected by Finance',
+          message: `Finance rejected Sales Order ${order.orderNumber || order.orderReference}.${reason ? ` Reason: ${reason}` : ''}`,
+          type: 'finance',
+          link: '/employee/sales/orders'
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Sales Order ${order.orderNumber || order.orderReference} rejected and returned to Sales Person.`,
+        data: order
       });
     } else {
-      return res.status(400).json({ success: false, message: 'Action/decision must be "approve" or "reject".' });
+      return res.status(400).json({ success: false, message: 'Action must be "approve", "clear", "block", "hold", or "reject".' });
     }
-
-    await order.save();
 
     await logSalesActivity({
       type: action === 'approve' ? 'Order Approved by Finance' : 'Order Rejected by Finance',
@@ -1758,16 +1972,16 @@ const financeReviewSalesOrder = async (req, res) => {
       performedBy: req.user._id
     });
 
-    // Notify the sales representative
+    // Notify the original sales representative
     if (order.salesPerson || order.createdBy) {
       const recipientId = order.salesPerson || order.createdBy;
       await createNotificationHelper({
         recipient: recipientId,
         sender: req.user._id,
-        title: action === 'approve' ? 'Sales Order Approved by Finance' : 'Sales Order Rejected due to overdue amount',
+        title: action === 'approve' ? 'Sales Order Approved by Finance' : 'Sales Order Rejected by Finance',
         message: action === 'approve'
-          ? `Finance (${req.user.fullName}) approved Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName}. It has been forwarded to Support for Delivery Note creation.`
-          : `Finance (${req.user.fullName}) rejected Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} due to customer overdue amount.${reason ? ` Reason: ${reason}` : ''}`,
+          ? `Finance approved Sales Order ${order.orderNumber || order.orderReference}.`
+          : `Finance rejected Sales Order ${order.orderNumber || order.orderReference}.${reason ? ` Reason: ${reason}` : ''}`,
         type: 'finance',
         link: '/employee/sales/orders'
       });
@@ -1775,11 +1989,12 @@ const financeReviewSalesOrder = async (req, res) => {
 
     // Notify Support Department on approval
     if (action === 'approve') {
-      await notifyRoleHelper(['support', 'operations', 'admin'], {
+      await notifyRoleHelper(['support', 'operations', 'admin', 'ceo'], {
         type: 'order',
-        title: 'New Sales Order for Delivery Note (DN)',
-        message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} approved by Finance and ready for Delivery Note (DN) creation.`,
-        link: '/employee/sales/delivery-notes'
+        title: 'Sales Order Ready for Delivery Processing',
+        message: `Sales Order ${order.orderNumber || order.orderReference} is ready for Delivery Note processing.`,
+        link: '/support/orders',
+        sender: req.user._id
       });
     }
 
@@ -1995,20 +2210,45 @@ const createMyDeliveryNote = async (req, res) => {
 
     const dnStatus = status || 'Done';
 
+    let resolvedSalesPersonId = null;
+    let resolvedSalePerson = req.body.salePerson || '';
+
     // Auto-populate items from Sales Order if not provided
     let dnItems = items || [];
-    if (dnItems.length === 0 && salesOrderId) {
-      const parentSo = await SalesOrder.findById(salesOrderId);
-      if (parentSo && parentSo.items && parentSo.items.length > 0) {
-        dnItems = parentSo.items.map(it => ({
-          product: it.description || 'Delivered Product',
-          description: it.description || '',
-          demand: Number(it.quantity) || 1,
-          quantity: Number(it.quantity) || 1,
-          unit: 'Units',
-          availability: 'Available',
-          totalOrderedQty: Number(it.quantity) || 1
-        }));
+    let resolvedFileType = req.body.fileType || '';
+    let resolvedSupplierPoNum = req.body.supplierPoNumber || '';
+    let resolvedBlNum = req.body.blNumber || '';
+    let resolvedShipmentId = null;
+    let resolvedShipmentNum = '';
+
+    if (salesOrderId) {
+      const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
+      if (parentSo) {
+        if (parentSo.isOverdueBlocked) {
+          return res.status(400).json({
+            success: false,
+            message: `Cannot create Delivery Note: Sales Order ${parentSo.orderNumber || parentSo.orderReference} is on Finance HOLD due to overdue customer balance.`
+          });
+        }
+        resolvedSalesPersonId = parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
+        resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || (parentSo.salesPerson && parentSo.salesPerson.fullName) || '';
+        resolvedFileType = parentSo.fileType || resolvedFileType;
+        resolvedSupplierPoNum = parentSo.supplierPO?.poNumber || resolvedSupplierPoNum;
+        resolvedBlNum = parentSo.blNumber || resolvedBlNum;
+        resolvedShipmentId = parentSo.shipmentId || null;
+        resolvedShipmentNum = parentSo.shipmentNumber || '';
+
+        if (dnItems.length === 0 && parentSo.items && parentSo.items.length > 0) {
+          dnItems = parentSo.items.map(it => ({
+            product: it.description || 'Delivered Product',
+            description: it.description || '',
+            demand: Number(it.quantity) || 1,
+            quantity: Number(it.quantity) || 1,
+            unit: 'Units',
+            availability: 'Available',
+            totalOrderedQty: Number(it.quantity) || 1
+          }));
+        }
       }
     }
 
@@ -2034,6 +2274,13 @@ const createMyDeliveryNote = async (req, res) => {
       status: dnStatus,
       isPartial: !!isPartial,
       invoiced: false,
+      fileType: resolvedFileType,
+      supplierPoNumber: resolvedSupplierPoNum,
+      blNumber: resolvedBlNum,
+      shipmentId: resolvedShipmentId,
+      shipmentNumber: resolvedShipmentNum,
+      salesPerson: resolvedSalesPersonId || (req.user.department === 'Sales' ? req.user._id : null),
+      salePerson: resolvedSalePerson || (req.user.department === 'Sales' ? req.user.fullName : ''),
       createdBy: req.user._id
     });
 
@@ -3016,9 +3263,20 @@ const getMyPayments = async (req, res) => {
     if (salesOrderId) query.salesOrderId = salesOrderId;
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ paymentRefNumber: regex }, { customerName: regex }, { salesOrderNumber: regex }];
+      query.$or = [
+        { paymentRefNumber: regex },
+        { customerName: regex },
+        { salesOrderNumber: regex },
+        { invoiceNumber: regex },
+        { salePerson: regex },
+        { paymentMethod: regex },
+        { paymentType: regex }
+      ];
     }
-    const payments = await Payment.find(query).populate('createdBy', 'fullName email position role department').sort({ createdAt: -1 });
+    const payments = await Payment.find(query)
+      .populate('createdBy', 'fullName email position role department')
+      .populate('salesPerson', 'fullName email')
+      .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: payments.length, data: payments });
   } catch (error) {
     console.error('[Get Payments Error]:', error);
@@ -3083,10 +3341,15 @@ const createMyPayment = async (req, res) => {
 
     const payAmount = Number(amount);
 
+    let resolvedSalesPersonId = null;
+    let resolvedSalePerson = '';
+
     // If invoice is linked, auto-resolve sales order and check against overpayment
     if (invoiceId) {
-      const invoice = await Invoice.findById(invoiceId);
+      const invoice = await Invoice.findById(invoiceId).populate('salesPerson');
       if (invoice) {
+        resolvedSalesPersonId = invoice.salesPerson?._id || invoice.salesPerson || null;
+        resolvedSalePerson = invoice.salePerson || (invoice.salesPerson && invoice.salesPerson.fullName) || '';
         if (!salesOrderId && invoice.salesOrderId) {
           salesOrderId = invoice.salesOrderId;
           salesOrderNumber = invoice.salesOrderNumber || invoice.saleReference || salesOrderNumber;
@@ -3107,6 +3370,14 @@ const createMyPayment = async (req, res) => {
       }
     }
 
+    if (salesOrderId && (!resolvedSalesPersonId || !resolvedSalePerson)) {
+      const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
+      if (parentSo) {
+        resolvedSalesPersonId = resolvedSalesPersonId || parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
+        resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || (parentSo.salesPerson && parentSo.salesPerson.fullName) || '';
+      }
+    }
+
     const payment = await Payment.create({
       customerName: customerName.trim(),
       salesOrderId: salesOrderId || null,
@@ -3118,6 +3389,8 @@ const createMyPayment = async (req, res) => {
       paymentType: paymentType || 'Partial',
       paymentMethod: paymentMethod || 'Bank Transfer',
       notes: notes || '',
+      salesPerson: resolvedSalesPersonId || (req.user.department === 'Sales' ? req.user._id : null),
+      salePerson: resolvedSalePerson || (req.user.department === 'Sales' ? req.user.fullName : ''),
       createdBy: req.user._id
     });
 
@@ -3134,12 +3407,13 @@ const createMyPayment = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifyRoleHelper(['finance', 'accountant', 'sales_manager', 'sales_member', 'sales_rep', 'sales_person', 'admin', 'ceo'], {
+      role: 'finance',
       sender: req.user._id,
       title: 'Payment Recorded',
-      message: `${req.user.fullName} recorded a payment of Rs. ${payAmount.toLocaleString()} from ${customerName} (${paymentType || 'Partial'}).`,
-      type: 'sales'
+      message: `Payment of PKR ${Number(payAmount).toLocaleString()} recorded for Invoice ${invoiceNumber || payment.invoiceNumber || 'Direct'}.`,
+      type: 'finance',
+      link: '/finance/payments'
     });
 
     return res.status(201).json({ success: true, message: 'Payment recorded successfully.', data: payment });
@@ -3568,11 +3842,12 @@ const sendOrderToSupport = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper(['support', 'admin', 'ceo'], {
+    await notifyRoleHelper(['support', 'operations', 'admin', 'ceo'], {
       type: 'order',
-      title: 'New Sales Order Sent to Support',
-      message: `Sales Order ${order.orderReference || order.orderNumber} is ready for delivery processing.`,
-      link: '/support/orders'
+      title: 'Sales Order Sent to Support',
+      message: `${req.user.fullName} sent Sales Order ${order.orderReference || order.orderNumber} to Support for delivery processing.`,
+      link: '/support/orders',
+      sender: req.user._id
     });
 
     return res.status(200).json({
@@ -3631,11 +3906,12 @@ const sendSalesOrderToFinance = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
+    await notifyRoleHelper(['finance', 'accountant', 'admin', 'ceo'], {
       type: 'finance',
-      title: 'Sales Order Awaiting Overdue Approval',
-      message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} sent by ${req.user.fullName} is awaiting Finance overdue verification (Overdue: PKR ${overdueInfo.overdueAmount.toLocaleString()}).`,
-      link: '/finance/invoices'
+      title: 'Sales Order Awaiting Overdue Check',
+      message: `Sales Person ${req.user.fullName} submitted Sales Order ${order.orderNumber || order.orderReference} for Finance approval/overdue check.`,
+      link: '/finance/invoices',
+      sender: req.user._id
     });
 
     return res.status(200).json({
@@ -3649,6 +3925,273 @@ const sendSalesOrderToFinance = async (req, res) => {
   }
 };
 
+/**
+ * @desc    Record Goods Received in Office (Support Department Action)
+ * @route   POST /api/sales-employee/orders/:id/goods-received
+ */
+const recordGoodsReceivedInOffice = async (req, res) => {
+  try {
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+    if (order.isOverdueBlocked) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot record goods received: Order is on Finance HOLD due to customer overdue balance.'
+      });
+    }
+
+    // For Blue File, must be confirmed received in office by Logistics first!
+    if (order.fileType === 'Blue') {
+      const shipment = await Shipment.findOne({ salesOrder: order._id });
+      if (!shipment || (!shipment.receivedInOffice && shipment.status !== 'Received in Office')) {
+        return res.status(400).json({
+          success: false,
+          message: 'Cannot record goods received for Blue File: International shipment has not yet been confirmed as "Received in Office" by the Logistics Department.'
+        });
+      }
+    }
+
+    const { receivedQuantity, orderedQuantity, remarks, receivedDate } = req.body;
+    const totalOrdered = (order.items && order.items.reduce((s, i) => s + (Number(i.quantity) || 1), 0)) || 1;
+    const rQty = Number(receivedQuantity) || totalOrdered;
+    const oQty = Number(orderedQuantity) || totalOrdered;
+
+    order.goodsReceivedInOffice = {
+      received: true,
+      receivedAt: receivedDate ? new Date(receivedDate) : new Date(),
+      receivedBy: req.user._id,
+      receivedByName: req.user.fullName,
+      receivedQuantity: rQty,
+      orderedQuantity: oQty,
+      remarks: remarks || 'Goods received in office and verified by Support Department.'
+    };
+
+    const prevStatus = order.workflowStatus;
+    order.workflowStatus = 'Goods Received in Office';
+    order.status = 'Goods Received in Office';
+    order.departmentResponsible = 'Support';
+
+    order.workflowHistory.push({
+      user: req.user._id,
+      userName: req.user.fullName,
+      department: 'Support',
+      action: 'Goods Received in Office',
+      previousStatus: prevStatus,
+      newStatus: 'Goods Received in Office',
+      timestamp: new Date(),
+      notes: remarks || `Goods received: ${rQty} of ${oQty} units verified in office.`
+    });
+
+    await order.save();
+
+    await logSalesActivity({
+      type: 'Goods Received in Office',
+      description: `Goods received in office for Sales Order ${order.orderNumber || order.orderReference} by Support (${req.user.fullName}). Verified: ${rQty} units.`,
+      relatedModel: 'SalesOrder',
+      relatedId: order._id,
+      performedBy: req.user._id
+    });
+
+    // Notify Sales Person
+    if (order.salesPerson) {
+      await createNotificationHelper({
+        recipient: order.salesPerson,
+        sender: req.user._id,
+        title: 'Goods Received in Office',
+        message: `Goods for your Sales Order ${order.orderNumber || order.orderReference} have been received in office by Support (${rQty} units).`,
+        type: 'order',
+        link: '/employee/sales/orders'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Goods receipt confirmed in office for Sales Order ${order.orderNumber || order.orderReference}!`,
+      data: order
+    });
+  } catch (err) {
+    console.error('[Record Goods Received Error]:', err);
+    return res.status(500).json({ success: false, message: 'Server error recording goods received.' });
+  }
+};
+
+/**
+ * @desc    Record Inventory Check and Bill of Lading (BL) input (Support Department Action)
+ * @route   POST /api/sales-employee/orders/:id/bl-input
+ */
+const recordBLInput = async (req, res) => {
+  try {
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+    if (order.isOverdueBlocked) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot record BL input: Order is on Finance HOLD.'
+      });
+    }
+
+    const { blNumber, blDate, carrier, containerNo, portOfLoading, portOfDischarge, stockVerified } = req.body;
+    if (!blNumber && !order.blNumber) {
+      return res.status(400).json({ success: false, message: 'BL Number is required.' });
+    }
+
+    const finalBlNumber = (blNumber || order.blNumber || '').trim();
+    order.blNumber = finalBlNumber;
+    order.blInput = {
+      blNumber: finalBlNumber,
+      blDate: blDate ? new Date(blDate) : new Date(),
+      carrier: carrier || '',
+      containerNo: containerNo || '',
+      portOfLoading: portOfLoading || '',
+      portOfDischarge: portOfDischarge || '',
+      enteredBy: req.user._id,
+      enteredByName: req.user.fullName,
+      enteredAt: new Date()
+    };
+
+    const prevStatus = order.workflowStatus;
+    order.workflowStatus = 'Inventory & BL Verified';
+    order.status = 'Inventory & BL Verified';
+    order.departmentResponsible = 'Support';
+
+    order.workflowHistory.push({
+      user: req.user._id,
+      userName: req.user.fullName,
+      department: 'Support',
+      action: 'Inventory Check and BL Input',
+      previousStatus: prevStatus,
+      newStatus: 'Inventory & BL Verified',
+      timestamp: new Date(),
+      notes: `BL #${finalBlNumber} recorded, warehouse inventory verified. Ready for Delivery Note creation.`
+    });
+
+    await order.save();
+
+    await logSalesActivity({
+      type: 'Inventory & BL Verified',
+      description: `Support (${req.user.fullName}) recorded BL #${finalBlNumber} and verified inventory for Sales Order ${order.orderNumber || order.orderReference}`,
+      relatedModel: 'SalesOrder',
+      relatedId: order._id,
+      performedBy: req.user._id
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `BL #${finalBlNumber} and inventory check verified! Ready for Delivery Note (DN).`,
+      data: order
+    });
+  } catch (err) {
+    console.error('[Record BL Input Error]:', err);
+    return res.status(500).json({ success: false, message: 'Server error saving BL details.' });
+  }
+};
+
+/**
+ * @desc    Issue Supplier PO (Local or International)
+ * @route   POST /api/sales-employee/orders/:id/issue-supplier-po
+ */
+const issueSupplierPO = async (req, res) => {
+  try {
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+    if (order.isOverdueBlocked) {
+      return res.status(400).json({ success: false, message: 'Cannot issue Supplier PO: Order is on Finance HOLD.' });
+    }
+
+    const {
+      poType,
+      supplierName,
+      supplierCountry,
+      supplierEmail,
+      supplierPhone,
+      notes,
+      items,
+      totalAmount
+    } = req.body;
+
+    const type = poType || (order.fileType === 'Blue' ? 'International' : 'Local');
+    const isBlue = type === 'International' || order.fileType === 'Blue';
+    const poNum = req.body.poNumber || `${isBlue ? 'IPO' : 'LPO'}-${Date.now().toString().slice(-6)}`;
+
+    order.fileType = isBlue ? 'Blue' : 'Green';
+    order.supplierPO = {
+      poNumber: poNum,
+      poType: type,
+      supplierName: supplierName || (isBlue ? 'International Supplier' : 'Local Supplier'),
+      supplierCountry: supplierCountry || (isBlue ? 'China' : 'Pakistan'),
+      supplierEmail: supplierEmail || '',
+      supplierPhone: supplierPhone || '',
+      issueDate: new Date(),
+      status: 'Issued',
+      items: items && items.length > 0 ? items : (order.items || []),
+      totalAmount: Number(totalAmount) || order.netAmount || order.totalAmount || 0,
+      currency: 'PKR',
+      notes: notes || '',
+      issuedBy: req.user._id,
+      issuedByName: req.user.fullName,
+      issuedAt: new Date()
+    };
+
+    if (isBlue) {
+      order.workflowStatus = 'International Supplier PO Issued';
+      order.departmentResponsible = 'Logistics';
+
+      // Ensure Shipment exists in Logistics
+      let shipment = await Shipment.findOne({ salesOrder: order._id });
+      if (!shipment) {
+        shipment = await Shipment.create({
+          salesOrder: order._id,
+          salesOrderNumber: order.orderNumber || order.orderReference,
+          salesPerson: order.salesPerson || req.user._id,
+          salePerson: order.salePerson || req.user.fullName,
+          clientName: order.clientName,
+          clientEmail: order.clientEmail || '',
+          clientPhone: order.clientPhone || '',
+          supplierName: order.supplierPO.supplierName,
+          supplierCountry: order.supplierPO.supplierCountry,
+          supplierPoNumber: order.supplierPO.poNumber,
+          supplierPoDate: new Date(),
+          fileType: 'Blue',
+          status: 'PO Issued',
+          description: order.productSummary || 'Imported Goods',
+          items: order.items || [],
+          createdBy: req.user._id
+        });
+      }
+      order.shipmentId = shipment._id;
+      order.shipmentNumber = shipment.shipmentId;
+    } else {
+      order.workflowStatus = 'Local Supplier PO Issued';
+      order.departmentResponsible = 'Support';
+    }
+
+    order.workflowHistory.push({
+      user: req.user._id,
+      userName: req.user.fullName,
+      department: req.user.department || 'Sales',
+      action: `Supplier PO Issued (${type})`,
+      previousStatus: order.workflowStatus,
+      newStatus: order.workflowStatus,
+      timestamp: new Date(),
+      notes: `PO #${poNum} issued to ${order.supplierPO.supplierName}.`
+    });
+
+    await order.save();
+
+    return res.status(200).json({
+      success: true,
+      message: `${type} Supplier PO ${poNum} successfully issued!`,
+      data: order
+    });
+  } catch (err) {
+    console.error('[Issue Supplier PO Error]:', err);
+    return res.status(500).json({ success: false, message: 'Server error issuing supplier PO.' });
+  }
+};
+
 const getSupportStats = async (req, res) => {
   try {
     const { filter, startDate, endDate } = req.query;
@@ -3656,12 +4199,17 @@ const getSupportStats = async (req, res) => {
 
     // Total orders sent to Support (in period if filtered)
     const orderQuery = {
+      isOverdueBlocked: { $ne: true },
       $or: [
         { departmentResponsible: 'Support' },
         {
           workflowStatus: {
             $in: [
               'Finance Approved',
+              'Local Supplier PO Issued',
+              'Shipment Received in Office',
+              'Goods Received in Office',
+              'Inventory & BL Verified',
               'Sent to Support',
               'Support Reviewing',
               'Delivery Note Created',
@@ -3689,9 +4237,22 @@ const getSupportStats = async (req, res) => {
 
     // Active pending queue: Sales Orders in Support that DO NOT have a Delivery Note yet
     const ordersPendingDelivery = await SalesOrder.countDocuments({
+      isOverdueBlocked: { $ne: true },
       $or: [
         { departmentResponsible: 'Support' },
-        { workflowStatus: { $in: ['Sent to Support', 'Support Reviewing', 'Finance Approved'] } }
+        {
+          workflowStatus: {
+            $in: [
+              'Finance Approved',
+              'Local Supplier PO Issued',
+              'Shipment Received in Office',
+              'Goods Received in Office',
+              'Inventory & BL Verified',
+              'Sent to Support',
+              'Support Reviewing'
+            ]
+          }
+        }
       ],
       deliveryNoteId: null
     });
@@ -3824,11 +4385,14 @@ const confirmDeliveryNoteWithInventory = async (req, res) => {
       }
     }
 
-    await notifyRoleHelper(['accountant', 'accounts', 'admin', 'ceo'], {
+    const soRef = (deliveryNote.salesOrderNumber || deliveryNote.salesOrder?.orderReference || deliveryNote.salesOrder?.orderNumber || 'SO-—');
+    const dnRef = (deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber || 'DN-—');
+    await notifyRoleHelper(['accountant', 'accounts', 'finance', 'admin', 'ceo'], {
       type: 'invoice',
-      title: 'Delivery Note Confirmed - Ready for Invoice',
-      message: `Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} confirmed. Order is ready for Draft Invoicing.`,
-      link: '/accounts/orders-ready'
+      title: 'Delivery Note Ready for Accounts',
+      message: `Delivery Note ${dnRef} for Sales Order ${soRef} is ready for Accounts.`,
+      link: '/accounts/orders-ready',
+      sender: req.user._id
     });
 
     return res.status(200).json({
@@ -3989,13 +4553,12 @@ const sendInvoiceToFinance = async (req, res) => {
       }
     }
 
-    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
+    await notifyRoleHelper(['finance', 'accountant', 'admin', 'ceo'], {
       type: 'finance',
-      title: wasReturned ? 'Revised Draft Invoice Resubmitted to Finance' : 'Draft Invoice Submitted to Finance',
-      message: wasReturned
-        ? `Draft Invoice ${invoice.invoiceNumber} for ${invoice.clientName} was revised by Accounts and resubmitted for finalization.`
-        : `Draft Invoice ${invoice.invoiceNumber} for ${invoice.clientName} submitted by Accounts for finalization.`,
-      link: '/finance/invoices'
+      title: wasReturned ? 'Revised Draft Invoice Resubmitted' : 'Draft Invoice Submitted to Finance',
+      message: `Accounts submitted Draft Invoice ${invoice.invoiceNumber} to Finance for finalization.`,
+      link: '/finance/invoices',
+      sender: req.user._id
     });
 
     return res.status(200).json({
@@ -4057,7 +4620,8 @@ const returnInvoiceToAccounts = async (req, res) => {
       type: 'invoice',
       title: `Draft Invoice ${invoice.invoiceNumber} Returned for Revision`,
       message: `Finance (${req.user.fullName}) returned Invoice ${invoice.invoiceNumber} for ${invoice.clientName} to Accounts. Comment: "${reason}". Please review, edit, and resubmit.`,
-      link: '/accounts/invoices'
+      link: '/accounts/invoices',
+      sender: req.user._id
     });
 
     return res.status(200).json({
@@ -4104,6 +4668,14 @@ const finalizeInvoice = async (req, res) => {
       relatedModel: 'Invoice',
       relatedId: invoice._id,
       performedBy: req.user._id
+    });
+
+    await notifyRoleHelper(['accountant', 'accounts', 'sales_manager', 'sales_member', 'sales_person', 'sales_rep', 'admin', 'ceo'], {
+      type: 'invoice',
+      title: 'Invoice Finalized',
+      message: `Finance finalized Invoice ${invoice.invoiceNumber}.`,
+      link: '/finance/invoices',
+      sender: req.user._id
     });
 
     return res.status(200).json({
@@ -4305,5 +4877,8 @@ module.exports = {
   returnInvoiceToAccounts,
   finalizeInvoice,
   getFinanceStats,
-  getFinanceReceivables
+  getFinanceReceivables,
+  recordGoodsReceivedInOffice,
+  recordBLInput,
+  issueSupplierPO
 };

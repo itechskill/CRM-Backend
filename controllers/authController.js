@@ -15,7 +15,8 @@ const PUBLIC_REGISTRATION_ROLES = [
   'accountant',
   'employee',
   'support',
-  'finance'
+  'finance',
+  'logistics'
 ];
 
 /**
@@ -159,6 +160,7 @@ const registerUser = async (req, res) => {
       'sales_person': 'Sales',
       'sales_member': 'Sales',
       'sales_manager': 'Sales',
+      'logistics': 'Logistics',
       'support': 'Customer Support',
       'accountant': 'Accounting',
       'finance': 'Finance',

@@ -15,7 +15,8 @@ const ALLOWED_ROLES = [
   'accountant',
   'employee',
   'support',
-  'finance'
+  'finance',
+  'logistics'
 ];
 
 const ACCOUNT_STATUSES = ['pending', 'active', 'inactive', 'deactivated', 'rejected', 'suspended'];
