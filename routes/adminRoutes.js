@@ -38,24 +38,22 @@ router.get('/org/users/:id/performance', authorize('admin', 'ceo'), getOrgUserPe
 router.get('/org/departments', authorize('admin', 'ceo'), getOrgDepartmentStats);
 router.get('/org/monthly', authorize('admin', 'ceo'), getOrgMonthlyPerformance);
 
-// Remaining routes require Admin role
-router.use(authorize('admin'));
-
+// Remaining routes require Admin or CEO for viewing
 // Registration requests
-router.get('/registration-requests', getRegistrationRequests);
-router.get('/registration-requests/:id', getRegistrationRequestById);
-router.patch('/registration-requests/:id/approve', approveRegistrationRequest);
-router.patch('/registration-requests/:id/reject', rejectRegistrationRequest);
-router.delete('/registration-requests/:id', deleteUser);
+router.get('/registration-requests', authorize('admin', 'ceo', 'administration'), getRegistrationRequests);
+router.get('/registration-requests/:id', authorize('admin', 'ceo', 'administration'), getRegistrationRequestById);
+router.patch('/registration-requests/:id/approve', authorize('admin', 'ceo', 'administration'), approveRegistrationRequest);
+router.patch('/registration-requests/:id/reject', authorize('admin', 'ceo', 'administration'), rejectRegistrationRequest);
+router.delete('/registration-requests/:id', authorize('admin', 'ceo', 'administration'), deleteUser);
 
 // User Management
-router.delete('/users/:id', deleteUser);
-router.patch('/users/:id/password', updateUserPassword);
-router.patch('/users/:id/reset-password', resetUserPassword);
-router.patch('/users/:id/email', updateUserEmail);
-router.patch('/users/:id/role', updateUserRole);
-router.patch('/users/:id/status', updateUserStatus);
-router.patch('/users/:id/department', updateUserDepartment);
+router.delete('/users/:id', authorize('admin', 'ceo', 'administration'), deleteUser);
+router.patch('/users/:id/password', authorize('admin'), updateUserPassword);
+router.patch('/users/:id/reset-password', authorize('admin'), resetUserPassword);
+router.patch('/users/:id/email', authorize('admin'), updateUserEmail);
+router.patch('/users/:id/role', authorize('admin', 'ceo'), updateUserRole);
+router.patch('/users/:id/status', authorize('admin', 'ceo', 'administration'), updateUserStatus);
+router.patch('/users/:id/department', authorize('admin', 'ceo', 'administration'), updateUserDepartment);
 
 // POST /api/admin/ceo — Admin creates CEO account
 router.post('/ceo', createCeoAccount);

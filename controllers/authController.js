@@ -11,12 +11,11 @@ const PUBLIC_REGISTRATION_ROLES = [
   'sales_member',
   'sales_person',
   'project_manager',
-  'marketing',
   'accountant',
-  'employee',
   'support',
   'finance',
-  'logistics'
+  'logistics',
+  'purchaser'
 ];
 
 /**
@@ -167,6 +166,7 @@ const registerUser = async (req, res) => {
       'project_manager': 'Development',
       'hr_manager': 'HR',
       'marketing': 'Marketing',
+      'purchaser': 'Procurement',
       'administration': 'Administration',
       'employee': 'General'
     };
@@ -179,6 +179,7 @@ const registerUser = async (req, res) => {
       phone: phone ? phone.trim() : '',
       password,
       role: normalizedRole,
+      purchaserSubDept: req.body.purchaserSubDept || req.body.subDepartment || (normalizedRole === 'purchaser' ? 'Local' : null),
       position: defaultPosition,
       department: resolvedDepartment,
       employeeId: employeeId && employeeId.trim() !== '' ? employeeId.trim() : undefined,

@@ -3,6 +3,7 @@ const Deal = require('../models/Deal');
 const Lead = require('../models/Lead');
 const SalesContact = require('../models/SalesContact');
 const { notifyRoleHelper } = require('./notificationController');
+const { getSalesManagerScope } = require('../utils/salesManagerScope');
 
 
 // CLIENTS API
@@ -50,7 +51,12 @@ const deleteClient = async (req, res) => {
 // DEALS API
 const getDeals = async (req, res) => {
   try {
-    const deals = await Deal.find().sort({ createdAt: -1 });
+    let query = {};
+    if (req.user && req.user.role === 'sales_manager') {
+      const scope = await getSalesManagerScope(req.user);
+      query = { $or: [{ assignedTo: { $in: scope.memberIds } }, { createdBy: { $in: scope.memberIds } }] };
+    }
+    const deals = await Deal.find(query).sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: deals.length, data: deals });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error retrieving deals.' });
@@ -170,7 +176,12 @@ const deleteDeal = async (req, res) => {
 // LEADS API
 const getLeads = async (req, res) => {
   try {
-    const leads = await Lead.find()
+    let query = {};
+    if (req.user && req.user.role === 'sales_manager') {
+      const scope = await getSalesManagerScope(req.user);
+      query = { $or: [{ assignedTo: { $in: scope.memberIds } }, { createdBy: { $in: scope.memberIds } }] };
+    }
+    const leads = await Lead.find(query)
       .populate('assignedTo', 'fullName email role')
       .populate('createdBy', 'fullName email')
       .sort({ createdAt: -1 });

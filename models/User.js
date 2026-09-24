@@ -16,7 +16,8 @@ const ALLOWED_ROLES = [
   'employee',
   'support',
   'finance',
-  'logistics'
+  'logistics',
+  'purchaser'
 ];
 
 const ACCOUNT_STATUSES = ['pending', 'active', 'inactive', 'deactivated', 'rejected', 'suspended'];
@@ -58,6 +59,11 @@ const userSchema = new mongoose.Schema(
       },
       default: 'employee'
     },
+    purchaserSubDept: {
+      type: String,
+      enum: ['Local', 'Global', null],
+      default: null
+    },
     department: {
       type: String,
       trim: true,
@@ -92,6 +98,26 @@ const userSchema = new mongoose.Schema(
     isApproved: {
       type: Boolean,
       default: false
+    },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    manager: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    branch: {
+      type: String,
+      trim: true,
+      default: ''
+    },
+    city: {
+      type: String,
+      trim: true,
+      default: ''
     },
     approvedBy: {
       type: mongoose.Schema.Types.ObjectId,

@@ -21,6 +21,8 @@ const Leave = require('../models/Leave');
 const User = require('../models/User');
 const Shipment = require('../models/Shipment');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
+const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
+const { getSalesManagerScope } = require('../utils/salesManagerScope');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -836,7 +838,16 @@ const createMyInvoice = async (req, res) => {
         invoiceId: invoice._id,
         invoiceNumber: invoiceNumber,
         invoiceStatus: 'To Invoice',
-        workflowStatus: 'Draft Invoice Created'
+        workflowStatus: 'Draft Invoice Created',
+        departmentResponsible: 'Accounts',
+        currentDepartment: 'Accounts',
+        currentStatus: 'DRAFT_INVOICE_CREATED',
+        previousDepartment: 'Support',
+        previousStatus: 'Delivery Note Created',
+        lastAction: `Draft Invoice ${invoiceNumber} Created`,
+        lastActionBy: req.user._id,
+        lastActionByName: req.user.fullName,
+        lastActionAt: new Date()
       });
     }
 
@@ -888,11 +899,10 @@ const calculateCustomerOverdue = async (clientName) => {
   const trimmed = clientName.trim();
   const now = new Date();
 
-  // Strictly check finalized, non-draft invoices that are past dueDate with an outstanding balance
+  // Check all non-cancelled, unpaid invoices (including draft invoices from Accounts/Finance) past dueDate
   const invoices = await Invoice.find({
     clientName: { $regex: new RegExp('^' + trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') },
-    isDraft: { $ne: true },
-    status: { $nin: ['Draft', 'Pending Finance Finalization', 'Cancelled'] },
+    status: { $nin: ['Cancelled', 'Paid'] },
     dueDate: { $lt: now }
   });
 
@@ -903,14 +913,18 @@ const calculateCustomerOverdue = async (clientName) => {
     const paid = Number(inv.paidAmount) || 0;
     const remaining = Math.max(0, amt - paid);
     if (remaining > 0) {
+      const daysOverdue = Math.max(0, Math.floor((now - new Date(inv.dueDate)) / (1000 * 60 * 60 * 24)));
       overdueAmount += remaining;
       overdueInvoices.push({
         _id: inv._id,
         invoiceNumber: inv.invoiceNumber,
+        salesOrderNumber: inv.salesOrderNumber || '',
         amount: amt,
         paidAmount: paid,
         remaining,
-        dueDate: inv.dueDate
+        dueDate: inv.dueDate,
+        daysOverdue,
+        status: inv.status
       });
     }
   });
@@ -1114,11 +1128,19 @@ const convertProductFileToSalesOrder = async (req, res) => {
       netAmount: netAmt,
       outstandingBalance: netAmt,
       totalPaid: 0,
-      status: 'Pending Finance Approval',
-      workflowStatus: 'Pending Finance Overdue Check',
-      departmentResponsible: 'Finance',
+      status: 'Sales Order',
+      workflowStatus: 'Draft',
+      departmentResponsible: 'Sales',
+      currentDepartment: 'Sales',
+      currentStatus: 'SALES_ORDER_CREATED',
+      previousDepartment: '',
+      previousStatus: '',
+      lastAction: 'Sales Order Created',
+      lastActionBy: req.user._id,
+      lastActionByName: req.user.fullName,
+      lastActionAt: new Date(),
       customerOverdueAtCreation: overdueInfo.overdueAmount,
-      requiresFinanceApproval: true,
+      requiresFinanceApproval: false,
       stockStatus: stockStatus || 'Available',
       deliveryStatus: 'Not Delivered',
       invoiceStatus: 'Not Invoiced',
@@ -1140,9 +1162,9 @@ const convertProductFileToSalesOrder = async (req, res) => {
           department: 'Sales',
           action: 'Sales Order Created',
           previousStatus: 'None',
-          newStatus: 'Pending Finance Overdue Check',
+          newStatus: 'Draft',
           timestamp: new Date(),
-          notes: `Created from Product File ${file.fileNumber || file._id}. Auto-routed to Finance for overdue check.`
+          notes: `Created from Product File ${file.fileNumber || file._id}. Ready in Sales portal for Move to Finance.`
         }
       ]
     });
@@ -1181,17 +1203,9 @@ const convertProductFileToSalesOrder = async (req, res) => {
       performedBy: req.user._id
     });
 
-    // Notify Finance Department
-    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
-      type: 'finance',
-      title: 'Sales Order Created — Pending Overdue Check',
-      message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} (Rs. ${netAmt.toLocaleString()}) created. Customer overdue balance: PKR ${overdueInfo.overdueAmount.toLocaleString()}.`,
-      link: '/finance/invoices'
-    });
-
     return res.status(201).json({
       success: true,
-      message: `Product File ${file.fileNumber || file._id} successfully converted to Sales Order ${order.orderNumber || order.orderReference} and moved to Finance for overdue check!`,
+      message: `Product File ${file.fileNumber || file._id} successfully converted to Sales Order ${order.orderNumber || order.orderReference}! Click 'Move to Finance' when ready for overdue approval.`,
       data: { order, file }
     });
   } catch (error) {
@@ -1249,11 +1263,19 @@ const convertQuotationToSalesOrder = async (req, res) => {
       netAmount: netAmt,
       outstandingBalance: netAmt,
       totalPaid: 0,
-      status: 'Pending Finance Approval',
-      workflowStatus: 'Pending Finance Overdue Check',
-      departmentResponsible: 'Finance',
+      status: 'Sales Order',
+      workflowStatus: 'Draft',
+      departmentResponsible: 'Sales',
+      currentDepartment: 'Sales',
+      currentStatus: 'SALES_ORDER_CREATED',
+      previousDepartment: '',
+      previousStatus: '',
+      lastAction: 'Sales Order Created',
+      lastActionBy: req.user._id,
+      lastActionByName: req.user.fullName,
+      lastActionAt: new Date(),
       customerOverdueAtCreation: overdueInfo.overdueAmount,
-      requiresFinanceApproval: true,
+      requiresFinanceApproval: false,
       stockStatus: stockStatus || 'Available',
       deliveryStatus: 'Not Delivered',
       invoiceStatus: 'Not Invoiced',
@@ -1274,9 +1296,9 @@ const convertQuotationToSalesOrder = async (req, res) => {
           department: 'Sales',
           action: 'Sales Order Created',
           previousStatus: 'None',
-          newStatus: 'Pending Finance Overdue Check',
+          newStatus: 'Draft',
           timestamp: new Date(),
-          notes: `Created from Quotation ${quotation.orderReference || quotation.quotationNumber}. Auto-routed to Finance for overdue verification.`
+          notes: `Created from Quotation ${quotation.orderReference || quotation.quotationNumber}. Ready in Sales portal for Move to Finance.`
         }
       ]
     });
@@ -1298,16 +1320,9 @@ const convertQuotationToSalesOrder = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper(['finance', 'admin', 'ceo'], {
-      type: 'finance',
-      title: 'Sales Order Requires Finance Approval',
-      message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} requires Finance approval due to customer overdue check (Overdue: PKR ${overdueInfo.overdueAmount.toLocaleString()}).`,
-      link: '/finance/invoices'
-    });
-
     return res.status(200).json({
       success: true,
-      message: `Quotation successfully converted to Sales Order ${order.orderNumber || order.orderReference}! Order moved to Finance for overdue check.`,
+      message: `Quotation successfully converted to Sales Order ${order.orderNumber || order.orderReference}! Click 'Move to Finance' when ready for overdue approval.`,
       data: {
         order,
         quotation
@@ -1329,11 +1344,31 @@ const convertQuotationToSalesOrder = async (req, res) => {
 const getMyQuotations = async (req, res) => {
   try {
     const { status, search, employeeId } = req.query;
-    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
+    const isGlobal = ['admin', 'ceo'].includes(req.user.role);
     const query = {};
 
-    if (isManagerOrAdmin) {
-      if (employeeId) query.createdBy = employeeId;
+    if (req.user.role === 'sales_manager') {
+      const scope = await getSalesManagerScope(req.user);
+      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
+      const managerConditions = [
+        { createdBy: { $in: scope.memberIds } },
+        { salesPerson: { $in: scope.memberIds } }
+      ];
+      if (nameRegexes.length > 0) {
+        managerConditions.push({ salePerson: { $in: nameRegexes } });
+      }
+
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) {
+          return res.status(200).json({ success: true, count: 0, data: [] });
+        }
+        query.$or = [{ createdBy: employeeId }, { salesPerson: employeeId }];
+      } else {
+        query.$or = managerConditions;
+      }
+    } else if (isGlobal) {
+      if (employeeId && employeeId !== 'all') query.createdBy = employeeId;
     } else {
       query.createdBy = req.user._id;
     }
@@ -1465,8 +1500,12 @@ const updateMyQuotation = async (req, res) => {
       'notes'
     ];
 
+    const changes = [];
     allowedFields.forEach(field => {
-      if (req.body[field] !== undefined) quotation[field] = req.body[field];
+      if (req.body[field] !== undefined && req.body[field] !== quotation[field]) {
+        changes.push({ field, oldValue: quotation[field], newValue: req.body[field] });
+        quotation[field] = req.body[field];
+      }
     });
 
     if (req.body.creationDate) {
@@ -1474,6 +1513,20 @@ const updateMyQuotation = async (req, res) => {
     }
 
     await quotation.save();
+
+    // Log to EditAuditLog
+    try {
+      await logCategoryAEdit({
+        documentType: 'Quotation',
+        documentId: quotation._id,
+        documentNumber: quotation.orderReference || quotation.quotationNumber || 'Quotation',
+        changedBy: req.user,
+        changes,
+        reason: req.body.remarks || 'Direct Quotation edit by Sales Person.'
+      });
+    } catch (auditErr) {
+      console.warn('EditAuditLog creation notice for Quotation:', auditErr.message);
+    }
 
     await logSalesActivity({
       type: 'Quotation Updated',
@@ -1500,12 +1553,32 @@ const updateMyQuotation = async (req, res) => {
 const getMyOrders = async (req, res) => {
   try {
     const { status, search, employeeId } = req.query;
-    const isGlobalAccess = ['sales_manager', 'admin', 'ceo', 'support', 'accountant', 'finance'].includes(req.user.role) ||
+    const isGlobalAccess = ['admin', 'ceo', 'support', 'accountant', 'finance'].includes(req.user.role) ||
       ['support', 'accounts', 'finance', 'administration'].includes((req.user.department || '').toLowerCase());
     
     const conditions = [];
 
-    if (isGlobalAccess) {
+    if (req.user.role === 'sales_manager') {
+      const scope = await getSalesManagerScope(req.user);
+      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
+      const managerConditions = [
+        { createdBy: { $in: scope.memberIds } },
+        { salesPerson: { $in: scope.memberIds } }
+      ];
+      if (nameRegexes.length > 0) {
+        managerConditions.push({ salePerson: { $in: nameRegexes } });
+      }
+
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) {
+          return res.status(200).json({ success: true, count: 0, data: [] });
+        }
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      } else {
+        conditions.push({ $or: managerConditions });
+      }
+    } else if (isGlobalAccess) {
       if (employeeId) conditions.push({ createdBy: employeeId });
     } else {
       conditions.push({
@@ -1638,10 +1711,19 @@ const createMyOrder = async (req, res) => {
       netAmount: netAmt,
       outstandingBalance: netAmt,
       totalPaid: 0,
-      status: requiresApproval ? 'Pending Finance Approval' : (status || 'Sales Order'),
-      workflowStatus: requiresApproval ? 'Pending Finance Approval' : 'Sales Order Created',
+      status: 'Sales Order',
+      workflowStatus: 'Draft',
+      departmentResponsible: 'Sales',
+      currentDepartment: 'Sales',
+      currentStatus: 'SALES_ORDER_CREATED',
+      previousDepartment: '',
+      previousStatus: '',
+      lastAction: 'Sales Order Created',
+      lastActionBy: req.user._id,
+      lastActionByName: req.user.fullName,
+      lastActionAt: new Date(),
       customerOverdueAtCreation: overdueInfo.overdueAmount,
-      requiresFinanceApproval: requiresApproval,
+      requiresFinanceApproval: false,
       stockStatus: stockStatus || 'Available',
       deliveryStatus: 'Not Delivered',
       invoiceStatus: 'Not Invoiced',
@@ -1688,15 +1770,6 @@ const createMyOrder = async (req, res) => {
       performedBy: req.user._id
     });
 
-    if (requiresApproval) {
-      await notifyRoleHelper(['finance', 'admin', 'ceo'], {
-        type: 'finance',
-        title: 'Sales Order Requires Finance Approval',
-        message: `Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} requires Finance approval due to overdue balance (PKR ${overdueInfo.overdueAmount.toLocaleString()}).`,
-        link: '/finance/invoices'
-      });
-    }
-
     // Notify Sales Manager
     await notifyRoleHelper({
       role: 'sales_manager',
@@ -1735,6 +1808,14 @@ const financeReviewSalesOrder = async (req, res) => {
       order.workflowStatus = 'Order Blocked / Hold';
       order.status = 'Order Blocked / Hold';
       order.departmentResponsible = 'Finance';
+      order.currentDepartment = 'Finance';
+      order.currentStatus = 'ORDER_BLOCKED_OVERDUE';
+      order.previousDepartment = 'Finance';
+      order.previousStatus = 'Pending Finance Overdue Check';
+      order.lastAction = 'Order Blocked / Hold (Overdue = YES)';
+      order.lastActionBy = req.user._id;
+      order.lastActionByName = req.user.fullName;
+      order.lastActionAt = new Date();
 
       order.workflowHistory.push({
         user: req.user._id,
@@ -1814,88 +1895,70 @@ const financeReviewSalesOrder = async (req, res) => {
       };
 
       if (isBlue) {
-        // BLUE FILE FLOW: Routes to Logistics Department for Shipment Tracking!
-        order.workflowStatus = 'International Supplier PO Issued';
-        order.status = 'International Supplier PO Issued';
-        order.departmentResponsible = 'Logistics';
-
-        // Automatically initialize or link Shipment in Logistics
-        let shipment = await Shipment.findOne({ salesOrder: order._id });
-        if (!shipment) {
-          shipment = await Shipment.create({
-            salesOrder: order._id,
-            salesOrderNumber: order.orderNumber || order.orderReference,
-            salesPerson: order.salesPerson || req.user._id,
-            salePerson: order.salePerson || req.user.fullName,
-            clientName: order.clientName,
-            clientEmail: order.clientEmail || '',
-            clientPhone: order.clientPhone || '',
-            supplierName: order.supplierPO.supplierName,
-            supplierCountry: order.supplierPO.supplierCountry,
-            supplierPoNumber: order.supplierPO.poNumber,
-            supplierPoDate: new Date(),
-            fileType: 'Blue',
-            status: 'PO Issued',
-            description: order.productSummary || 'Imported Goods',
-            items: order.items || [],
-            createdBy: req.user._id,
-            trackingHistory: [
-              {
-                status: 'PO Issued',
-                location: 'International Origin',
-                notes: `PO #${poNum} issued to ${order.supplierPO.supplierName}. Ready for logistics dispatch tracking.`,
-                updatedBy: req.user._id,
-                updatedByName: req.user.fullName,
-                timestamp: new Date()
-              }
-            ]
-          });
-        }
-        order.shipmentId = shipment._id;
-        order.shipmentNumber = shipment.shipmentId;
+        // BLUE FILE FLOW: Routes to Global Purchaser Portal!
+        order.workflowStatus = 'Pending Global Procurement';
+        order.status = 'Pending Global Procurement';
+        order.departmentResponsible = 'Global Purchaser';
+        order.currentDepartment = 'Global Purchaser';
+        order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
+        order.previousDepartment = 'Finance';
+        order.previousStatus = 'Pending Finance Overdue Check';
+        order.lastAction = 'Finance Approved — Blue File (Routed to Global Purchaser)';
+        order.lastActionBy = req.user._id;
+        order.lastActionByName = req.user.fullName;
+        order.lastActionAt = new Date();
 
         order.workflowHistory.push({
           user: req.user._id,
           userName: req.user.fullName,
           department: 'Finance',
-          action: 'Finance All Clear — Blue File (Routed to Logistics)',
+          action: 'Finance Approved — Blue File (Routed to Global Purchaser)',
           previousStatus: 'Pending Finance Overdue Check',
-          newStatus: 'International Supplier PO Issued',
+          newStatus: 'Pending Global Procurement',
           timestamp: new Date(),
-          notes: `Finance verified overdue clear. Blue File order with International PO #${poNum} routed to Logistics Department for Shipment Tracking.`
+          notes: `Finance verified overdue clear. Blue File order ${order.orderNumber || order.orderReference} routed to Global Purchaser for International PO creation.`
         });
 
-        // Notify Logistics department
-        await notifyRoleHelper(['logistics', 'admin'], {
+        // Notify Global Purchaser
+        await notifyRoleHelper(['purchaser', 'admin', 'ceo'], {
           type: 'order',
-          title: 'New Blue File Shipment in Logistics',
-          message: `International Supplier PO #${poNum} for Sales Order ${order.orderNumber || order.orderReference} is ready for Logistics processing.`,
-          link: '/logistics/shipments',
+          title: 'New Blue File Order for Global Purchaser',
+          message: `Blue File Sales Order ${order.orderNumber || order.orderReference} is ready for Global Procurement & Supplier PO creation.`,
+          link: '/purchaser/supplier_pos',
           sender: req.user._id
         });
       } else {
-        // GREEN FILE FLOW: Routes to Support Department for Goods Received in Office!
-        order.workflowStatus = 'Local Supplier PO Issued';
-        order.status = 'Local Supplier PO Issued';
-        order.departmentResponsible = 'Support';
+        // GREEN FILE FLOW: Routes to Local Purchaser Portal for Inventory Check!
+        order.workflowStatus = 'Pending Local Procurement';
+        order.status = 'Pending Local Procurement';
+        order.departmentResponsible = 'Local Purchaser';
+        order.currentDepartment = 'Local Purchaser';
+        order.currentStatus = 'GREEN_FILE_LOCAL_PURCHASER';
+        order.previousDepartment = 'Finance';
+        order.previousStatus = 'Pending Finance Overdue Check';
+        order.lastAction = 'Finance Approved — Green File (Routed to Local Purchaser)';
+        order.lastActionBy = req.user._id;
+        order.lastActionByName = req.user.fullName;
+        order.lastActionAt = new Date();
+        order.inventoryCheckStatus = 'Not Checked';
 
         order.workflowHistory.push({
           user: req.user._id,
           userName: req.user.fullName,
           department: 'Finance',
-          action: 'Finance All Clear — Green File (Routed to Support)',
+          action: 'Finance Approved — Green File (Routed to Local Purchaser)',
           previousStatus: 'Pending Finance Overdue Check',
-          newStatus: 'Local Supplier PO Issued',
+          newStatus: 'Pending Local Procurement',
           timestamp: new Date(),
-          notes: `Finance verified overdue clear. Green File order with Local PO #${poNum} routed to Support Department for Goods Received in Office.`
+          notes: `Finance verified overdue clear. Green File order ${order.orderNumber || order.orderReference} routed to Local Purchaser for Inventory Check.`
         });
 
-        // Notify Support department
-        await notifyRoleHelper(['support', 'operations', 'admin'], {
+        // Notify Local Purchaser
+        await notifyRoleHelper(['purchaser', 'admin', 'ceo'], {
           type: 'order',
-          title: 'New Green File Order in Support',
-          message: `Local Supplier PO #${poNum} for Sales Order ${order.orderNumber || order.orderReference} is ready for Support goods receipt & DN creation.`,
-          link: '/support/orders',
+          title: 'New Green File Order for Local Purchaser',
+          message: `Green File Sales Order ${order.orderNumber || order.orderReference} is ready for Local Procurement Inventory Check.`,
+          link: '/purchaser/dashboard',
           sender: req.user._id
         });
       }
@@ -1923,23 +1986,31 @@ const financeReviewSalesOrder = async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        message: `Sales Order approved as ${resolvedFileType} File! Routed to ${isBlue ? 'Logistics Department' : 'Support Department'}.`,
+        message: `Sales Order approved as ${resolvedFileType} File! Routed to ${isBlue ? 'Global Purchaser Portal' : 'Local Purchaser Portal'}.`,
         data: order
       });
     } else if (action === 'reject') {
       order.workflowStatus = 'Finance Rejected';
-      order.status = 'Rejected';
+      order.status = 'Sales Order Rejected due to overdue amount';
       order.departmentResponsible = 'Sales';
-      order.financeRejectionReason = reason || 'Rejected by Finance.';
+      order.currentDepartment = 'Sales';
+      order.currentStatus = 'FINANCE_REJECTED';
+      order.previousDepartment = 'Finance';
+      order.previousStatus = 'Pending Finance Overdue Check';
+      order.lastAction = 'Sales Order Rejected by Finance (Overdue)';
+      order.lastActionBy = req.user._id;
+      order.lastActionByName = req.user.fullName;
+      order.lastActionAt = new Date();
+      order.financeRejectionReason = reason || 'Rejected by Finance due to overdue amount.';
       order.workflowHistory.push({
         user: req.user._id,
         userName: req.user.fullName,
         department: 'Finance',
-        action: 'Sales Order Rejected by Finance',
+        action: 'Sales Order Rejected by Finance (Overdue)',
         previousStatus: order.workflowStatus,
-        newStatus: 'Rejected',
+        newStatus: 'Sales Order Rejected due to overdue amount',
         timestamp: new Date(),
-        notes: reason || 'Rejected by Finance. Returned to Sales Person.'
+        notes: reason || 'Rejected by Finance due to overdue amount. Returned to Sales Person.'
       });
 
       await order.save();
@@ -1949,7 +2020,7 @@ const financeReviewSalesOrder = async (req, res) => {
           recipient: order.salesPerson || order.createdBy,
           sender: req.user._id,
           title: 'Sales Order Rejected by Finance',
-          message: `Finance rejected Sales Order ${order.orderNumber || order.orderReference}.${reason ? ` Reason: ${reason}` : ''}`,
+          message: `Finance rejected Sales Order ${order.orderNumber || order.orderReference} due to overdue balance.${reason ? ` Reason: ${reason}` : ''}`,
           type: 'finance',
           link: '/employee/sales/orders'
         });
@@ -1957,7 +2028,7 @@ const financeReviewSalesOrder = async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        message: `Sales Order ${order.orderNumber || order.orderReference} rejected and returned to Sales Person.`,
+        message: `Sales Order ${order.orderNumber || order.orderReference} rejected due to overdue balance and returned to Sales Person.`,
         data: order
       });
     } else {
@@ -2010,7 +2081,7 @@ const financeReviewSalesOrder = async (req, res) => {
 };
 
 /**
- * @desc    Update sales order
+ * @desc    Update sales order (Category B - CEO Approval Required)
  * @route   PATCH /api/sales-employee/orders/:id
  */
 const updateMyOrder = async (req, res) => {
@@ -2018,8 +2089,12 @@ const updateMyOrder = async (req, res) => {
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
 
+    if (req.body.orderNumber && !req.body.orderReference) req.body.orderReference = req.body.orderNumber;
+    if (req.body.orderReference && !req.body.orderNumber) req.body.orderNumber = req.body.orderReference;
+
+    const changes = {};
     const allowedFields = [
-      'orderReference', 'clientName', 'clientAddress', 'salePerson', 'fileNo', 'fileType',
+      'orderReference', 'orderNumber', 'clientName', 'clientAddress', 'salePerson', 'fileNo', 'fileType',
       'productSummary', 'clientEmail', 'clientPhone', 'items', 'totalAmount', 'discount',
       'tax', 'netAmount', 'status', 'deliveryDate', 'creationDate', 'notes',
       'stockStatus', 'deliveryStatus', 'invoiceStatus', 'invoiceNumber',
@@ -2027,8 +2102,33 @@ const updateMyOrder = async (req, res) => {
     ];
 
     allowedFields.forEach(field => {
+      if (req.body[field] !== undefined && hasFieldValueChanged(order[field], req.body[field])) {
+        changes[field] = { old: order[field], new: req.body[field] };
+      }
+    });
+
+    // Enforce Category B CEO approval verification
+    const check = await verifyAndConsumeCEOPermission({
+      documentType: 'Sales Order',
+      documentId: order._id,
+      documentNumber: order.orderReference || order.orderNumber,
+      requestingUser: req.user,
+      changes
+    });
+
+    if (!check.authorized) {
+      return res.status(403).json({ success: false, message: check.message });
+    }
+
+    allowedFields.forEach(field => {
       if (req.body[field] !== undefined) order[field] = req.body[field];
     });
+
+    if (req.body.orderNumber || req.body.orderReference) {
+      const val = req.body.orderNumber || req.body.orderReference;
+      order.orderNumber = val;
+      order.orderReference = val;
+    }
 
     if (req.body.creationDate) {
       order.creationDate = new Date(req.body.creationDate);
@@ -2168,11 +2268,22 @@ const getAvailableOrdersForDelivery = async (req, res) => {
 // ══════════════════════════════════════════════
 const getMyDeliveryNotes = async (req, res) => {
   try {
-    const isPrivilegedOrDept = ['admin', 'ceo', 'support', 'accountant', 'finance', 'sales_manager'].includes(req.user.role) ||
-      ['support', 'accounts', 'finance', 'sales'].includes((req.user.department || '').toLowerCase());
-    const filter = isPrivilegedOrDept
-      ? {}
-      : { $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }] };
+    let filter = {};
+    if (req.user.role === 'sales_manager') {
+      const scope = await getSalesManagerScope(req.user);
+      filter = {
+        $or: [
+          { createdBy: { $in: scope.memberIds } },
+          { salesPerson: { $in: scope.memberIds } }
+        ]
+      };
+    } else {
+      const isPrivilegedOrDept = ['admin', 'ceo', 'support', 'accountant', 'finance'].includes(req.user.role) ||
+        ['support', 'accounts', 'finance'].includes((req.user.department || '').toLowerCase());
+      filter = isPrivilegedOrDept
+        ? {}
+        : { $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }] };
+    }
     const notes = await DeliveryNote.find(filter)
       .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount items clientEmail clientPhone clientAddress fileNo fileType salePerson')
       .sort({ createdAt: -1 });
@@ -2307,7 +2418,7 @@ const createMyDeliveryNote = async (req, res) => {
       await deliveryNote.save();
     }
 
-    // Auto-update Sales Order delivery status and link Delivery Note (removes SO from Support Pending Queue)
+    // Auto-update Sales Order delivery status and link Delivery Note (removes SO from Support Pending Queue, hands off to Accounts)
     if (salesOrderId) {
       const deliveryStatusUpdate = isPartial ? 'Partially Delivered' : 'Fully Delivered';
       const soStatusUpdate = isPartial ? 'Processing' : 'Delivered';
@@ -2316,7 +2427,16 @@ const createMyDeliveryNote = async (req, res) => {
         status: soStatusUpdate,
         deliveryNoteId: deliveryNote._id,
         deliveryNoteNumber: deliveryNote.deliveryNoteNumber || deliveryNote.deliveryNumber,
-        workflowStatus: 'Delivery Note Created'
+        workflowStatus: 'Delivery Note Created',
+        departmentResponsible: 'Accounts',
+        currentDepartment: 'Accounts',
+        currentStatus: 'DELIVERY_NOTE_CREATED_IN_ACCOUNTS',
+        previousDepartment: 'Support',
+        previousStatus: 'Pending Delivery Note',
+        lastAction: `Delivery Note ${deliveryNote.deliveryNoteNumber || deliveryNote.deliveryNumber} Created by Support`,
+        lastActionBy: req.user._id,
+        lastActionByName: req.user.fullName,
+        lastActionAt: new Date()
       });
     }
 
@@ -2521,28 +2641,38 @@ const getMyActivities = async (req, res) => {
 const getSalesTeamMembers = async (req, res) => {
   try {
     const now = new Date();
-    const salesEmployees = await User.find({
+    const scope = await getSalesManagerScope(req.user);
+
+    const baseQuery = {
       $or: [
-        { role: { $in: ['employee', 'sales_rep', 'sales_member'] }, department: { $regex: /^sales$/i } },
-        { role: { $in: ['sales_rep', 'sales_member'] } },
+        { role: { $in: ['employee', 'sales_rep', 'sales_member', 'sales_person'] }, department: { $regex: /^sales$/i } },
+        { role: { $in: ['sales_rep', 'sales_member', 'sales_person'] } },
         { department: { $regex: /^sales$/i } },
         { position: { $regex: /sales/i } }
       ],
       role: { $nin: ['admin', 'ceo', 'hr_manager', 'accountant', 'administration', 'project_manager', 'marketing', 'sales_manager'] }
-    }).select('-password').sort({ fullName: 1 });
+    };
+
+    if (!scope.isGlobal) {
+      const managedMemberObjectIds = scope.memberIds.filter(id => id.toString() !== req.user._id.toString());
+      baseQuery._id = { $in: managedMemberObjectIds };
+    }
+
+    const salesEmployees = await User.find(baseQuery).select('-password').sort({ fullName: 1 });
 
     // Attach full stats & financial calculations for each member
     const membersWithStats = await Promise.all(
       salesEmployees.map(async (emp) => {
         const empId = emp._id;
+        const empNameRegex = new RegExp(emp.fullName?.split(' ')[0] || '', 'i');
         const [leads, quotations, orders, deals, followUps, activeTarget, invoices, payroll] = await Promise.all([
           Lead.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }),
-          Quotation.find({ createdBy: empId }),
-          SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }] }),
+          Quotation.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }),
+          SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }, { salePerson: empNameRegex }] }),
           Deal.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }),
           FollowUp.find({ createdBy: empId }),
           SalesTarget.findOne({ employee: empId, status: { $in: ['Active', 'Ongoing'] } }).sort({ createdAt: -1 }),
-          Invoice.find({ createdBy: empId }),
+          Invoice.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }),
           Payroll.findOne({ user: empId, month: now.getMonth() + 1, year: now.getFullYear() })
         ]);
 
@@ -2557,7 +2687,7 @@ const getSalesTeamMembers = async (req, res) => {
         const paidInvoicesAmount = invoices.reduce((sum, i) => sum + (Number(i.paidAmount) || (i.status === 'Paid' ? Number(i.amount) : 0)), 0);
 
         const achievedAmount = Math.max(wonDealsValue, ordersAchieved, approvedInvoicesAmount);
-        const targetAmount = activeTarget?.targetAmount || (emp.salaryTarget ? emp.salaryTarget * 5 : 50000);
+        const targetAmount = activeTarget?.targetAmount || Number(emp.target) || Number(emp.salaryTarget) || 0;
         const remainingTarget = Math.max(0, targetAmount - achievedAmount);
         const targetPct = targetAmount > 0 ? Math.round((achievedAmount / targetAmount) * 100) : (achievedAmount > 0 ? 100 : 0);
 
@@ -2565,30 +2695,46 @@ const getSalesTeamMembers = async (req, res) => {
         const pendingLeads = leads.filter(l => ['New', 'Contacted', 'Qualified'].includes(l.status)).length;
         const completedFollowUps = followUps.filter(f => f.status === 'Completed').length;
 
-        // 1. Receivables: Strictly approved invoices with unpaid balance
+        // 1. Receivables: Approved unpaid invoices + uninvoiced orders
         const receivableInvoices = invoices.filter(i =>
           ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
           i.status !== 'Paid' &&
           i.status !== 'Cancelled'
         );
-        const receivables = receivableInvoices.reduce((sum, i) => {
+        const invoiceReceivables = receivableInvoices.reduce((sum, i) => {
           const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
           return sum + Math.max(0, outstanding);
         }, 0);
 
-        // 2. Overdue: Strictly approved invoices past due date or status Overdue with unpaid balance
+        const uninvoicedOrders = orders.filter(o => o.invoiceStatus !== 'Fully Invoiced' && o.status !== 'Cancelled');
+        const orderReceivables = uninvoicedOrders.reduce((sum, o) => {
+          return sum + Math.max(0, Number(o.outstandingBalance || o.netAmount || o.totalAmount || 0));
+        }, 0);
+
+        const receivables = invoiceReceivables + orderReceivables;
+
+        // 2. Overdue: Strictly approved invoices past due date or status Overdue with unpaid balance + orders past due
         const overdueInvoices = invoices.filter(i => {
           const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
           const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
           const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
           return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
         });
-        const overdueAmount = overdueInvoices.reduce((sum, i) => {
+        const overdueInvoiceAmountPart = overdueInvoices.reduce((sum, i) => {
           const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
           return sum + Math.max(0, outstanding);
         }, 0);
 
-        const salaryTarget = Number(emp.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(targetAmount * 0.1) || 5000;
+        const overdueOrders = uninvoicedOrders.filter(o => {
+          const orderBaseDate = o.orderDate || o.creationDate || o.createdAt;
+          const isPastDue = orderBaseDate && (new Date(orderBaseDate).getTime() + 30 * 24 * 60 * 60 * 1000) < now.getTime();
+          return isPastDue && (Number(o.outstandingBalance || o.netAmount || o.totalAmount || 0) > 0);
+        });
+        const overdueOrderAmount = overdueOrders.reduce((sum, o) => sum + Math.max(0, Number(o.outstandingBalance || o.netAmount || o.totalAmount || 0)), 0);
+
+        const overdueAmount = overdueInvoiceAmountPart + overdueOrderAmount;
+
+        const salaryTarget = Number(emp.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(targetAmount * 0.1) || 0;
         const cancelledOrders = orders.filter(o => o.status === 'Cancelled');
         const liability = cancelledOrders.reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
         const netRevenue = paidInvoicesAmount > 0 ? paidInvoicesAmount : achievedAmount;
@@ -2636,31 +2782,40 @@ const getSalesTeamMembers = async (req, res) => {
 const getSalesTeamMemberProfile = async (req, res) => {
   try {
     const now = new Date();
-    const emp = await User.findOne({
-      _id: req.params.id,
-      role: 'employee',
-      department: { $regex: /^sales$/i }
-    }).select('-password');
+    const scope = await getSalesManagerScope(req.user);
+
+    if (!scope.isGlobal) {
+      const isAllowed = scope.memberIds.some(id => id.toString() === req.params.id.toString());
+      if (!isAllowed) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. You can only view team members belonging to your regional branch.'
+        });
+      }
+    }
+
+    const emp = await User.findById(req.params.id).select('-password');
 
     if (!emp) {
-      return res.status(404).json({ success: false, message: 'Sales employee not found or not in Sales department.' });
+      return res.status(404).json({ success: false, message: 'Sales team member not found.' });
     }
 
     const empId = emp._id;
+    const empNameRegex = new RegExp(emp.fullName?.split(' ')[0] || '', 'i');
 
     const [leads, quotations, orders, deliveryNotes, followUps, targets, activities, invoices, deals, customerPOs, productFiles, payments, payroll] = await Promise.all([
       Lead.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }).sort({ createdAt: -1 }),
-      Quotation.find({ createdBy: empId }).sort({ creationDate: -1, createdAt: -1 }),
-      SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }] }).sort({ creationDate: -1, createdAt: -1 }),
-      DeliveryNote.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).populate('salesOrder', 'orderNumber orderReference').sort({ createdAt: -1 }),
+      Quotation.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }).sort({ creationDate: -1, createdAt: -1 }),
+      SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }, { salePerson: empNameRegex }] }).sort({ creationDate: -1, createdAt: -1 }),
+      DeliveryNote.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }).populate('salesOrder', 'orderNumber orderReference').sort({ createdAt: -1 }),
       FollowUp.find({ createdBy: empId }).populate('lead', 'name company').sort({ scheduledAt: 1 }),
       SalesTarget.find({ employee: empId }).populate('assignedBy', 'fullName').sort({ createdAt: -1 }),
       SalesActivity.find({ performedBy: empId }).sort({ createdAt: -1 }).limit(50),
-      Invoice.find({ createdBy: empId }).sort({ createdAt: -1 }),
+      Invoice.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }).sort({ createdAt: -1 }),
       Deal.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }).sort({ createdAt: -1 }),
-      CustomerPO.find({ createdBy: empId }).sort({ createdAt: -1 }),
+      CustomerPO.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).sort({ createdAt: -1 }),
       ProductFile.find({ createdBy: empId }).sort({ createdAt: -1 }),
-      Payment.find({ createdBy: empId }).sort({ createdAt: -1 }),
+      Payment.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).sort({ createdAt: -1 }),
       Payroll.findOne({ user: empId, month: now.getMonth() + 1, year: now.getFullYear() })
     ]);
 
@@ -2671,7 +2826,11 @@ const getSalesTeamMemberProfile = async (req, res) => {
     const totalQuotations = quotations.length;
     const acceptedQuotations = quotations.filter(q => q.status === 'Accepted').length;
     const totalOrders = orders.length;
-    const completedOrders = orders.filter(o => o.status === 'Delivered').length;
+    const completedOrders = orders.filter(o => ['Delivered', 'Done', 'Completed'].includes(o.status) || ['Delivered', 'Done', 'Fully Delivered'].includes(o.deliveryStatus)).length;
+    const pendingOrders = orders.filter(o => !['Delivered', 'Done', 'Completed', 'Cancelled', 'Rejected'].includes(o.status)).length;
+    const approvedOrders = orders.filter(o => Boolean(o.financeApprovedBy) || ['Local Supplier PO Issued', 'International Supplier PO Issued', 'Finance Approved', 'Delivered', 'Completed'].includes(o.workflowStatus) || ['Delivered', 'Completed'].includes(o.status)).length;
+    const heldOrders = orders.filter(o => o.isOverdueBlocked || o.workflowStatus === 'Order Blocked / Hold' || o.status === 'Order Blocked / Hold' || o.workflowStatus === 'Finance Rejected' || o.status === 'Rejected').length;
+    const totalOrderAmount = orders.reduce((sum, o) => sum + (Number(o.netAmount || o.totalAmount) || 0), 0);
     const totalDeliveryNotes = deliveryNotes.length;
     const completedFollowUps = followUps.filter(f => f.status === 'Completed').length;
     
@@ -2685,21 +2844,21 @@ const getSalesTeamMemberProfile = async (req, res) => {
       .filter(o => ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Sales Order'].includes(o.status))
       .reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
     const approvedInvoicesList = invoices
-      .filter(i => ['Approved', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status));
+      .filter(i => ['Approved', 'Finalized', 'Sent', 'Partially Paid', 'Overdue', 'Paid'].includes(i.status));
     const approvedInvoicesAmount = approvedInvoicesList.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
     const paidInvoicesAmount = invoices.reduce((sum, i) => sum + (Number(i.paidAmount) || (i.status === 'Paid' ? Number(i.amount) : 0)), 0);
 
     // Sales Achieved & Targets
     const salesAchieved = Math.max(wonDealsValue, ordersAchieved, approvedInvoicesAmount);
     const activeTarget = targets.find(t => t.status === 'Active' || t.status === 'Ongoing') || targets[0];
-    const monthlyTarget = activeTarget?.targetAmount || (emp.salaryTarget ? emp.salaryTarget * 5 : 50000);
+    const monthlyTarget = activeTarget?.targetAmount || Number(emp.target) || Number(emp.salaryTarget) || 0;
     const remainingTarget = Math.max(0, monthlyTarget - salesAchieved);
     const achievementPct = monthlyTarget > 0 ? Math.round((salesAchieved / monthlyTarget) * 100) : (salesAchieved > 0 ? 100 : 0);
 
     // Financial calculations (PKR / Rs.)
     // 1. Receivables: Strictly approved / active invoices with unpaid balance
     const receivableInvoices = invoices.filter(i =>
-      ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
+      ['Approved', 'Finalized', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
       i.status !== 'Paid' &&
       i.status !== 'Cancelled'
     );
@@ -2710,7 +2869,7 @@ const getSalesTeamMemberProfile = async (req, res) => {
 
     // 2. Overdue: Strictly approved invoices past due date or status Overdue with unpaid balance
     const overdueInvoices = invoices.filter(i => {
-      const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
+      const isApproved = ['Approved', 'Finalized', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
       const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
@@ -2720,7 +2879,7 @@ const getSalesTeamMemberProfile = async (req, res) => {
       return sum + Math.max(0, outstanding);
     }, 0);
 
-    const salaryTarget = Number(emp.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || Math.round(monthlyTarget * 0.1) || 5000;
+    const salaryTarget = Number(emp.salaryTarget) || Number(payroll?.baseSalary) || Number(payroll?.netSalary) || (monthlyTarget > 0 ? Math.round(monthlyTarget * 0.1) : 0);
     const cancelledOrders = orders.filter(o => o.status === 'Cancelled');
     const liability = cancelledOrders.reduce((sum, o) => sum + (Number(o.netAmount) || 0), 0);
     const netRevenue = paidInvoicesAmount > 0 ? paidInvoicesAmount : salesAchieved;
@@ -2736,7 +2895,11 @@ const getSalesTeamMemberProfile = async (req, res) => {
           totalQuotations,
           acceptedQuotations,
           totalOrders,
+          totalOrderAmount,
           completedOrders,
+          pendingOrders,
+          approvedOrders,
+          heldOrders,
           totalDeals,
           wonDealsCount,
           wonDealsValue,
@@ -2826,14 +2989,28 @@ const updateMyInvoice = async (req, res) => {
   try {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
-    if (!checkOwnership(invoice, 'createdBy', req.user._id, req.user)) {
-      return res.status(403).json({ success: false, message: 'Access denied. You can only edit your own invoices.' });
-    }
-    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
-    if (!isManagerOrAdmin && (invoice.status === 'Approved' || invoice.status === 'Paid')) {
-      return res.status(400).json({ success: false, message: 'Approved or paid invoices cannot be modified.' });
-    }
+
+    const changes = {};
     const allowedFields = ['clientName', 'customerEmail', 'customerPhone', 'customerAddress', 'items', 'subtotal', 'tax', 'taxRate', 'discount', 'amount', 'paymentTerms', 'issueDate', 'dueDate', 'description', 'notes', 'status', 'salesOrderId', 'deliveryNoteId', 'fileNumber', 'fileType', 'paidAmount', 'outstandingAmount'];
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined && hasFieldValueChanged(invoice[field], req.body[field])) {
+        changes[field] = { old: invoice[field], new: req.body[field] };
+      }
+    });
+
+    const docType = invoice.status === 'Draft' || invoice.type === 'Draft' ? 'Draft Invoice' : 'Final Invoice';
+    const check = await verifyAndConsumeCEOPermission({
+      documentType: docType,
+      documentId: invoice._id,
+      documentNumber: invoice.invoiceNumber,
+      requestingUser: req.user,
+      changes
+    });
+
+    if (!check.authorized) {
+      return res.status(403).json({ success: false, message: check.message });
+    }
+
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) invoice[field] = req.body[field];
     });
@@ -2913,9 +3090,8 @@ const updateMyDeliveryNote = async (req, res) => {
   try {
     const deliveryNote = await DeliveryNote.findById(req.params.id);
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
-    if (!checkOwnership(deliveryNote, 'createdBy', req.user._id, req.user)) {
-      return res.status(403).json({ success: false, message: 'Access denied. You can only edit your own delivery notes.' });
-    }
+
+    const changes = {};
     const allowedFields = [
       'clientName',
       'recipientName',
@@ -2939,6 +3115,24 @@ const updateMyDeliveryNote = async (req, res) => {
       'sourceDocument',
       'starred'
     ];
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined && hasFieldValueChanged(deliveryNote[field], req.body[field])) {
+        changes[field] = { old: deliveryNote[field], new: req.body[field] };
+      }
+    });
+
+    const check = await verifyAndConsumeCEOPermission({
+      documentType: 'Delivery Note',
+      documentId: deliveryNote._id,
+      documentNumber: deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber,
+      requestingUser: req.user,
+      changes
+    });
+
+    if (!check.authorized) {
+      return res.status(403).json({ success: false, message: check.message });
+    }
+
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) deliveryNote[field] = req.body[field];
     });
@@ -3487,8 +3681,15 @@ const deleteMyPayment = async (req, res) => {
 // ══════════════════════════════════════════════
 const getMyProformaInvoices = async (req, res) => {
   try {
-    const isManager = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
-    const query = isManager ? {} : { createdBy: req.user._id };
+    let query = {};
+    if (req.user.role === 'sales_manager') {
+      const scope = await getSalesManagerScope(req.user);
+      query = { createdBy: { $in: scope.memberIds } };
+    } else if (['admin', 'ceo'].includes(req.user.role)) {
+      query = {};
+    } else {
+      query = { createdBy: req.user._id };
+    }
 
     if (req.query.status && req.query.status !== 'all') {
       query.status = req.query.status;
@@ -3877,13 +4078,26 @@ const sendSalesOrderToFinance = async (req, res) => {
 
     const prevStatus = order.status || order.workflowStatus || 'Sales Order';
     order.departmentResponsible = 'Finance';
+    order.currentDepartment = 'Finance';
+    order.currentStatus = 'SENT_TO_FINANCE';
+    order.previousDepartment = 'Sales';
+    order.previousStatus = prevStatus;
+    order.lastAction = 'Sent to Finance for Overdue Verification';
+    order.lastActionBy = req.user._id;
+    order.lastActionByName = req.user.fullName;
+    order.lastActionAt = new Date();
     order.workflowStatus = 'Pending Finance Overdue Check';
-    order.status = 'Pending Finance Overdue Check';
+    order.status = 'Pending Finance Approval';
     order.requiresFinanceApproval = true;
+    order.isOverdueBlocked = false;
+    order.financeRejectionReason = '';
     order.customerOverdueAtCreation = overdueInfo.overdueAmount;
     order.financeApprovedBy = null;
     order.financeApprovedByName = '';
     order.financeApprovedAt = null;
+    if (order.supplierPO) {
+      order.supplierPO.status = '';
+    }
 
     order.workflowHistory.push({
       user: req.user._id,
@@ -3971,6 +4185,14 @@ const recordGoodsReceivedInOffice = async (req, res) => {
     order.workflowStatus = 'Goods Received in Office';
     order.status = 'Goods Received in Office';
     order.departmentResponsible = 'Support';
+    order.currentDepartment = 'Support';
+    order.currentStatus = 'GOODS_RECEIVED_IN_OFFICE';
+    order.previousDepartment = 'Logistics';
+    order.previousStatus = prevStatus;
+    order.lastAction = 'Goods Received in Office';
+    order.lastActionBy = req.user._id;
+    order.lastActionByName = req.user.fullName;
+    order.lastActionAt = new Date();
 
     order.workflowHistory.push({
       user: req.user._id,
@@ -4055,6 +4277,14 @@ const recordBLInput = async (req, res) => {
     order.workflowStatus = 'Inventory & BL Verified';
     order.status = 'Inventory & BL Verified';
     order.departmentResponsible = 'Support';
+    order.currentDepartment = 'Support';
+    order.currentStatus = 'BL_RECORDED';
+    order.previousDepartment = 'Logistics';
+    order.previousStatus = prevStatus;
+    order.lastAction = 'Inventory Check and BL Input';
+    order.lastActionBy = req.user._id;
+    order.lastActionByName = req.user.fullName;
+    order.lastActionAt = new Date();
 
     order.workflowHistory.push({
       user: req.user._id,
@@ -4539,6 +4769,14 @@ const sendInvoiceToFinance = async (req, res) => {
         order.invoiceStatus = 'Fully Invoiced';
         order.invoiceNumber = invoice.invoiceNumber;
         order.departmentResponsible = 'Finance';
+        order.currentDepartment = 'Finance';
+        order.currentStatus = 'PENDING_FINANCE_FINALIZATION';
+        order.previousDepartment = 'Accounts';
+        order.previousStatus = orderPrev;
+        order.lastAction = wasReturned ? 'Resubmitted to Finance after revision' : 'Sent to Finance for Finalization';
+        order.lastActionBy = req.user._id;
+        order.lastActionByName = req.user.fullName;
+        order.lastActionAt = new Date();
         order.workflowHistory.push({
           user: req.user._id,
           userName: req.user.fullName,
@@ -4594,6 +4832,14 @@ const returnInvoiceToAccounts = async (req, res) => {
         const orderPrev = order.workflowStatus || 'Pending Finance Finalization';
         order.workflowStatus = 'Draft Invoice Revision Required';
         order.departmentResponsible = 'Accounts';
+        order.currentDepartment = 'Accounts';
+        order.currentStatus = 'DRAFT_INVOICE_REVISION_REQUIRED';
+        order.previousDepartment = 'Finance';
+        order.previousStatus = orderPrev;
+        order.lastAction = 'Draft Invoice Returned to Accounts for Revision';
+        order.lastActionBy = req.user._id;
+        order.lastActionByName = req.user.fullName;
+        order.lastActionAt = new Date();
         order.workflowHistory.push({
           user: req.user._id,
           userName: req.user.fullName,
@@ -4658,7 +4904,16 @@ const finalizeInvoice = async (req, res) => {
       await SalesOrder.findByIdAndUpdate(invoice.salesOrderId, {
         workflowStatus: 'Completed',
         status: 'Completed',
-        invoiceStatus: 'Fully Invoiced'
+        invoiceStatus: 'Fully Invoiced',
+        departmentResponsible: 'Accounts',
+        currentDepartment: 'Accounts',
+        currentStatus: 'INVOICE_FINALIZED',
+        previousDepartment: 'Finance',
+        previousStatus: 'PENDING_FINANCE_FINALIZATION',
+        lastAction: `Invoice Finalized as ${invoice.invoiceType} by Finance`,
+        lastActionBy: req.user._id,
+        lastActionByName: req.user.fullName,
+        lastActionAt: new Date()
       });
     }
 
@@ -4692,71 +4947,52 @@ const finalizeInvoice = async (req, res) => {
 const getFinanceStats = async (req, res) => {
   try {
     const { filter, startDate, endDate } = req.query;
-    const dateFilter = getDateRangeFilter(filter, startDate, endDate, 'createdAt');
+    const [salesOrdersList, deliveryNotesCount, invoicesList, paymentsList] = await Promise.all([
+      SalesOrder.find({ status: { $ne: 'Cancelled' } }),
+      DeliveryNote.countDocuments({ status: { $ne: 'Cancelled' } }),
+      Invoice.find({ status: { $nin: ['Draft', 'Cancelled'] } }),
+      Payment.find({ status: { $ne: 'Cancelled' } })
+    ]);
 
-    // Received draft invoices from Accounts (in period)
-    const receivedQuery = {
-      status: { $in: ['Pending Finance Finalization', 'Submitted', 'Finalized', 'Approved', 'Paid', 'Partially Paid'] }
-    };
-    if (dateFilter) Object.assign(receivedQuery, dateFilter);
-    const draftInvoicesReceived = await Invoice.countDocuments(receivedQuery);
+    const salesOrdersCount = salesOrdersList.length;
+    const salesOrdersAmount = salesOrdersList.reduce((sum, o) => sum + (Number(o.netAmount || o.totalAmount) || 0), 0);
 
-    // Finalized invoices (in period)
-    const finalDateFilter = getDateRangeFilter(filter, startDate, endDate, 'finalizedAt');
-    const finalizedQuery = {
-      $or: [{ status: 'Finalized' }, { isDraft: false }]
-    };
-    if (finalDateFilter) Object.assign(finalizedQuery, finalDateFilter);
-    const invoicesFinalized = await Invoice.countDocuments(finalizedQuery);
+    const invoicesCount = invoicesList.length;
+    const invoicesAmount = invoicesList.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
 
-    // Current pending draft invoices in queue
-    const pendingDrafts = await Invoice.find({
-      status: { $in: ['Pending Finance Finalization', 'Submitted'] }
-    });
-    const pendingDraftsCount = pendingDrafts.length;
-    const pendingAmount = pendingDrafts.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
-
-    // Finalized invoices totals
-    const finalizedList = await Invoice.find({
-      status: { $nin: ['Draft', 'Pending Finance Finalization', 'Cancelled'] },
-      isDraft: { $ne: true }
-    });
-    const finalizedAmount = finalizedList.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
-    const totalPaid = finalizedList.reduce((sum, inv) => sum + (Number(inv.paidAmount) || 0), 0);
-    const outstandingReceivables = Math.max(0, finalizedAmount - totalPaid);
+    const totalPayments = paymentsList.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const receivablesAmount = Math.max(0, invoicesAmount - totalPayments);
 
     const now = new Date();
     let overdueAmount = 0;
-    finalizedList.forEach(inv => {
+    invoicesList.forEach(inv => {
       const rem = Math.max(0, (Number(inv.amount) || 0) - (Number(inv.paidAmount) || 0));
       if (rem > 0 && inv.dueDate && new Date(inv.dueDate) < now) {
         overdueAmount += rem;
       }
     });
 
-    const totalPaymentsCount = await Payment.countDocuments();
-    const advancePaymentsCount = await Payment.countDocuments({ paymentType: 'Advance' });
-    const partialPaymentsCount = await Payment.countDocuments({ paymentType: 'Partial' });
-    const fullPaymentsCount = await Payment.countDocuments({ paymentType: 'Full' });
+    const pendingDrafts = invoicesList.filter(i => ['Pending Finance Finalization', 'Submitted'].includes(i.status));
+    const pendingDraftsCount = pendingDrafts.length;
+    const pendingAmount = pendingDrafts.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
 
     return res.status(200).json({
       success: true,
       data: {
-        draftInvoicesReceived,
-        invoicesFinalized,
+        salesOrdersCount,
+        salesOrdersAmount,
+        deliveryNotesCount,
+        invoicesCount,
+        invoicesAmount,
+        receivablesAmount,
+        overdueAmount,
         pendingDrafts: pendingDraftsCount,
         pendingAmount,
-        finalizedAmount,
-        totalInvoices: await Invoice.countDocuments(),
-        approvedInvoices: invoicesFinalized,
-        totalInvoicedAmount: finalizedAmount,
-        totalPaid,
-        outstandingReceivables,
-        overdueAmount,
-        totalPaymentsCount,
-        advancePaymentsCount,
-        partialPaymentsCount,
-        fullPaymentsCount
+        totalPaid: totalPayments,
+        totalInvoices: invoicesCount,
+        approvedInvoices: invoicesCount,
+        totalInvoicedAmount: invoicesAmount,
+        outstandingReceivables: receivablesAmount
       }
     });
   } catch (error) {
@@ -4768,7 +5004,7 @@ const getFinanceStats = async (req, res) => {
 const getFinanceReceivables = async (req, res) => {
   try {
     const invoices = await Invoice.find({
-      status: { $nin: ['Draft', 'Cancelled'] }
+      status: { $nin: ['Cancelled'] }
     }).sort({ dueDate: 1 });
 
     const now = new Date();
@@ -4789,7 +5025,7 @@ const getFinanceReceivables = async (req, res) => {
         remainingReceivable: remaining,
         issueDate: inv.issueDate,
         dueDate: inv.dueDate,
-        status: remaining === 0 ? 'Paid' : (paid > 0 ? 'Partially Paid' : (isOverdue ? 'Overdue' : 'Pending')),
+        status: remaining === 0 ? 'Paid' : (paid > 0 ? 'Partially Paid' : (isOverdue ? 'Overdue' : (inv.status || 'Pending'))),
         isOverdue
       };
     });
@@ -4805,6 +5041,79 @@ const getFinanceReceivables = async (req, res) => {
   }
 };
 
+const getOrderDocumentPackage = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const order = await SalesOrder.findById(id).populate('salesPerson', 'fullName email phone');
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+
+    const [invoice, deliveryNote] = await Promise.all([
+      Invoice.findOne({ salesOrderId: order._id, status: { $ne: 'Cancelled' } }).sort({ createdAt: -1 }),
+      DeliveryNote.findOne({ salesOrder: order._id }).sort({ createdAt: -1 })
+    ]);
+
+    // Construct Undertaking if not set
+    const undertaking = {
+      undertakingNumber: order.undertakingDetails?.undertakingNumber || `UT-${(order.orderNumber || order.orderReference).replace(/[^0-9]/g, '') || Date.now().toString().slice(-5)}`,
+      issuedDate: order.undertakingDetails?.issuedDate || order.createdAt || new Date(),
+      companyName: 'Fortline CRM & Commercial Solutions',
+      clientName: order.clientName,
+      salesOrderNumber: order.orderNumber || order.orderReference,
+      termsAccepted: true,
+      declarationText: `We hereby undertake that the products supplied under Sales Order #${order.orderNumber || order.orderReference} conform to international quality standards, full technical specifications, and warranty compliance as agreed in contract.`
+    };
+
+    // Construct Goods Declaration Form if not set
+    const goodsDeclaration = {
+      gdNumber: order.goodsDeclarationDetails?.gdNumber || `GD-${(order.orderNumber || order.orderReference).replace(/[^0-9]/g, '') || Date.now().toString().slice(-5)}`,
+      gdDate: order.goodsDeclarationDetails?.gdDate || order.createdAt || new Date(),
+      portName: order.goodsDeclarationDetails?.portName || 'Karachi Customs Port',
+      declarationType: order.goodsDeclarationDetails?.declarationType || 'Commercial Import & Customs Clearance',
+      consignee: order.clientName,
+      consignor: order.supplierPO?.supplierName || 'Fortline Approved Global Vendor',
+      fileType: order.fileType || 'Green',
+      totalValuePKR: order.netAmount || order.totalAmount || 0
+    };
+
+    // Validation
+    const missingDocuments = [];
+    if (!invoice || (invoice.status !== 'Finalized' && !invoice.isFinalized && invoice.status !== 'Approved')) {
+      missingDocuments.push('Finalized Invoice');
+    }
+    if (!deliveryNote) {
+      missingDocuments.push('Delivery Note');
+    }
+    if (!undertaking.undertakingNumber) {
+      missingDocuments.push('Undertaking');
+    }
+    if (!goodsDeclaration.gdNumber) {
+      missingDocuments.push('Goods Declaration Form');
+    }
+
+    const isComplete = missingDocuments.length === 0;
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        order,
+        invoice,
+        deliveryNote,
+        undertaking,
+        goodsDeclaration,
+        validation: {
+          isComplete,
+          missingDocuments
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get Order Document Package Error:', error);
+    return res.status(500).json({ success: false, message: 'Server error retrieving document package.' });
+  }
+};
+
 module.exports = {
   getMySalesStats,
   getMyLeads,
@@ -4816,10 +5125,6 @@ module.exports = {
   createMyDeal,
   updateMyDeal,
   deleteMyDeal,
-  getMyInvoices,
-  createMyInvoice,
-  updateMyInvoice,
-  deleteMyInvoice,
   getMyQuotations,
   createMyQuotation,
   updateMyQuotation,
@@ -4845,6 +5150,10 @@ module.exports = {
   createMyDeliveryNote,
   updateMyDeliveryNote,
   deleteMyDeliveryNote,
+  getMyInvoices,
+  createMyInvoice,
+  updateMyInvoice,
+  deleteMyInvoice,
   getMyFollowUps,
   createMyFollowUp,
   updateMyFollowUp,
@@ -4880,5 +5189,6 @@ module.exports = {
   getFinanceReceivables,
   recordGoodsReceivedInOffice,
   recordBLInput,
-  issueSupplierPO
+  issueSupplierPO,
+  getOrderDocumentPackage
 };

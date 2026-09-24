@@ -51,7 +51,10 @@ const InvoiceSchema = new mongoose.Schema({
   finalizedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   finalizedByName: { type: String, default: '' },
   finalizedAt: { type: Date, default: null },
-  rejectionReason: { type: String, default: '' }
+  rejectionReason: { type: String, default: '' },
+  lateChargeAmount: { type: Number, default: 0, min: 0 },
+  lateChargePercentage: { type: Number, default: 3 },
+  lateChargeApplied: { type: Boolean, default: false }
 }, {
   timestamps: true
 });

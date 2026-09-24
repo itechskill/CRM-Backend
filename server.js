@@ -20,6 +20,8 @@ const publicRoutes = require('./routes/publicRoutes');
 const salesEmployeeRoutes = require('./routes/salesEmployeeRoutes');
 const salesManagerTeamRoutes = require('./routes/salesManagerTeamRoutes');
 const logisticsRoutes = require('./routes/logisticsRoutes');
+const purchaserRoutes = require('./routes/purchaserRoutes');
+const editPermissionRoutes = require('./routes/editPermissionRoutes');
 
 // Load environment variables
 dotenv.config();
@@ -102,6 +104,8 @@ app.use('/api/public', publicRoutes);
 app.use('/api/sales-employee', salesEmployeeRoutes);
 app.use('/api/sales-manager', salesManagerTeamRoutes);
 app.use('/api/logistics', logisticsRoutes);
+app.use('/api/purchaser', purchaserRoutes);
+app.use('/api/edit-permissions', editPermissionRoutes);
 
 // Root Fallback Route
 app.get('/', (req, res) => {
