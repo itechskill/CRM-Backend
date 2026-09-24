@@ -51,6 +51,21 @@ const InventoryItemSchema = new mongoose.Schema(
       type: String,
       default: ''
     },
+    supplierName: {
+      type: String,
+      trim: true,
+      default: ''
+    },
+    supplierPoNumber: {
+      type: String,
+      trim: true,
+      default: ''
+    },
+    orderReference: {
+      type: String,
+      trim: true,
+      default: ''
+    },
     status: {
       type: String,
       enum: ['In Stock', 'Low Stock', 'Out of Stock'],

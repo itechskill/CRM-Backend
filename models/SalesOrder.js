@@ -85,7 +85,7 @@ const SalesOrderSchema = new mongoose.Schema(
       supplierEmail: { type: String, default: '' },
       supplierPhone: { type: String, default: '' },
       issueDate: { type: Date, default: null },
-      status: { type: String, default: 'Issued' },
+      status: { type: String, default: '' },
       items: [
         {
           description: { type: String, default: '' },
@@ -128,6 +128,24 @@ const SalesOrderSchema = new mongoose.Schema(
     deliveryNoteNumber: { type: String, default: '' },
     invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
     // Department Handoff & Audit Trail
+    inventoryCheckStatus: {
+      type: String,
+      enum: ['Not Checked', 'In Stock', 'Shortage', 'Procurement Completed'],
+      default: 'Not Checked'
+    },
+    undertakingDetails: {
+      undertakingNumber: { type: String, default: '' },
+      issuedDate: { type: Date, default: null },
+      termsAccepted: { type: Boolean, default: true },
+      remarks: { type: String, default: 'Official Company Undertaking for Sales Order' }
+    },
+    goodsDeclarationDetails: {
+      gdNumber: { type: String, default: '' },
+      gdDate: { type: Date, default: null },
+      portName: { type: String, default: 'Karachi Customs Port' },
+      declarationType: { type: String, default: 'Commercial Import' },
+      remarks: { type: String, default: 'Verified Goods Declaration Form' }
+    },
     workflowStatus: {
       type: String,
       default: 'Sales Order Created'
@@ -136,6 +154,50 @@ const SalesOrderSchema = new mongoose.Schema(
       type: String,
       default: 'Sales'
     },
+    currentDepartment: {
+      type: String,
+      enum: ['Sales', 'Finance', 'Local Purchaser', 'Global Purchaser', 'Logistics', 'Support', 'Accounts', 'Completed'],
+      default: 'Sales'
+    },
+    currentStatus: {
+      type: String,
+      default: 'SALES_ORDER_CREATED'
+    },
+    previousDepartment: {
+      type: String,
+      default: ''
+    },
+    previousStatus: {
+      type: String,
+      default: ''
+    },
+    lastAction: {
+      type: String,
+      default: 'Sales Order Created'
+    },
+    lastActionBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    lastActionByName: {
+      type: String,
+      default: ''
+    },
+    lastActionAt: {
+      type: Date,
+      default: Date.now
+    },
+    inventoryAnalysis: [
+      {
+        productId: { type: String, default: '' },
+        productName: { type: String, default: '' },
+        orderedQty: { type: Number, default: 0 },
+        availableQty: { type: Number, default: 0 },
+        shortageQty: { type: Number, default: 0 },
+        status: { type: String, default: 'Pending' }
+      }
+    ],
     workflowHistory: [
       {
         user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
@@ -150,18 +212,27 @@ const SalesOrderSchema = new mongoose.Schema(
     ],
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', default: null },
     salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+
+    // Financial Control: Inventory Shortage & Customer Advance Tracking
+    shortageAmount: { type: Number, default: 0 },
+    advanceRequired: { type: Boolean, default: false },
+    advanceReceived: { type: Boolean, default: false },
+    advancePercentage: { type: Number, default: 0 },
+    advanceRequiredAmount: { type: Number, default: 0 },
+    advanceReceivedAmount: { type: Number, default: 0 },
+    isSupplierPaymentBlocked: { type: Boolean, default: false }
   },
   { timestamps: true }
 );
 
 SalesOrderSchema.pre('save', async function (next) {
   if (!this.orderNumber && !this.orderReference) {
+    let maxNum = 1724;
     const allOrders = await mongoose.model('SalesOrder').find({
       orderReference: { $regex: /^S\d+$/i }
     }).select('orderReference').lean();
     
-    let maxNum = 1724;
     allOrders.forEach(o => {
       const match = o.orderReference && o.orderReference.match(/\d+$/);
       if (match) {
@@ -170,9 +241,19 @@ SalesOrderSchema.pre('save', async function (next) {
       }
     });
     
-    const nextRef = 'S0' + String(maxNum + 1);
-    this.orderReference = nextRef;
-    this.orderNumber = nextRef;
+    let unique = false;
+    while (!unique) {
+      maxNum++;
+      const nextRef = 'S0' + String(maxNum);
+      const exists = await mongoose.model('SalesOrder').exists({ 
+        $or: [{ orderReference: nextRef }, { orderNumber: nextRef }] 
+      });
+      if (!exists) {
+        this.orderReference = nextRef;
+        this.orderNumber = nextRef;
+        unique = true;
+      }
+    }
   } else if (!this.orderNumber && this.orderReference) {
     this.orderNumber = this.orderReference;
   } else if (!this.orderReference && this.orderNumber) {

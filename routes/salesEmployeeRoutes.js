@@ -74,14 +74,18 @@ const {
   getFinanceReceivables,
   recordGoodsReceivedInOffice,
   recordBLInput,
-  issueSupplierPO
+  issueSupplierPO,
+  getOrderDocumentPackage
 } = require('../controllers/salesEmployeeController');
 
 // All Departmental Roles, Admin & CEO access departmental CRM endpoints
-const salesEmployeeGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'logistics', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
+const salesEmployeeGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'logistics', 'purchaser', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
 
 // Dashboard stats
 router.get('/stats', salesEmployeeGuard, getMySalesStats);
+
+// Master Document Package
+router.get('/orders/:id/document-package', salesEmployeeGuard, getOrderDocumentPackage);
 
 // Customer Overdue Check
 router.get('/check-overdue', salesEmployeeGuard, checkCustomerOverdueApi);

@@ -15,6 +15,10 @@ const CustomerPO = require('../models/CustomerPO');
 const DeliveryNote = require('../models/DeliveryNote');
 const Payment = require('../models/Payment');
 const Shipment = require('../models/Shipment');
+const SupplierPO = require('../models/SupplierPO');
+const PurchaserGRN = require('../models/PurchaserGRN');
+const LocalPayable = require('../models/LocalPayable');
+const InventoryItem = require('../models/InventoryItem');
 const JobPosting = require('../models/JobPosting');
 const JobApplication = require('../models/JobApplication');
 const AuditLog = require('../models/AuditLog');
@@ -471,7 +475,7 @@ const resetUserPassword = async (req, res) => {
  */
 const updateUserRole = async (req, res) => {
   try {
-    const { role } = req.body;
+    const { role, purchaserSubDept } = req.body;
     const targetUserId = req.params.id;
 
     if (!role) {
@@ -491,6 +495,9 @@ const updateUserRole = async (req, res) => {
 
     const oldRole = user.role;
     user.role = role.toLowerCase().trim();
+    if (purchaserSubDept) {
+      user.purchaserSubDept = purchaserSubDept;
+    }
     await user.save();
 
     await logAudit({
@@ -790,6 +797,25 @@ const getExecutiveSummary = async (req, res) => {
     const accountsTeamCount = allUsers.filter(u => u.role === 'accountant' && u.status === 'active').length;
     const financeTeamCount = allUsers.filter(u => u.role === 'finance' && u.status === 'active').length;
     const hrTeamCount = allUsers.filter(u => ['hr_manager', 'administration'].includes(u.role) && u.status === 'active').length;
+    const logisticsTeamCount = allUsers.filter(u => (u.role === 'logistics' || (u.department && u.department.toLowerCase().includes('logistic'))) && u.status === 'active').length;
+    const localPurchaserTeamCount = allUsers.filter(u => ((u.role === 'purchaser' && (u.purchaserSubDept === 'Local' || !u.purchaserSubDept)) || (u.department && u.department.toLowerCase().includes('local'))) && u.status === 'active').length;
+    const globalPurchaserTeamCount = allUsers.filter(u => ((u.role === 'purchaser' && u.purchaserSubDept === 'Global') || (u.department && u.department.toLowerCase().includes('global'))) && u.status === 'active').length;
+    const purchaserTeamCount = allUsers.filter(u => (u.role === 'purchaser' || (u.department && u.department.toLowerCase().includes('purchas'))) && u.status === 'active').length;
+
+    const registeredUsersList = allUsers.map(u => ({
+      _id: u._id,
+      fullName: u.fullName,
+      email: u.email,
+      phone: u.phone || '',
+      role: u.role || 'employee',
+      department: u.department || '',
+      purchaserSubDept: u.purchaserSubDept || null,
+      status: u.status || 'active',
+      isApproved: u.isApproved,
+      createdAt: u.createdAt,
+      lastLogin: u.lastLogin,
+      employeeId: u.employeeId || ''
+    }));
 
     // Sales metrics
     const totalLeads = leads.length;
@@ -924,6 +950,11 @@ const getExecutiveSummary = async (req, res) => {
         accountsTeamCount,
         financeTeamCount,
         hrTeamCount,
+        logisticsTeamCount,
+        purchaserTeamCount,
+        localPurchaserTeamCount,
+        globalPurchaserTeamCount,
+        registeredUsersList,
         
         // Sales Stage
         totalLeads,
@@ -1524,7 +1555,11 @@ const getOrgDepartmentStats = async (req, res) => {
       attendance,
       jobPostings,
       jobApplications,
-      shipments
+      shipments,
+      supplierPOs,
+      purchaserGRNs,
+      localPayables,
+      inventoryItems
     ] = await Promise.all([
       User.find().select('-password').lean(),
       SalesOrder.find().lean(),
@@ -1539,7 +1574,11 @@ const getOrgDepartmentStats = async (req, res) => {
       Attendance.find().sort({ date: -1 }).limit(500).lean(),
       JobPosting.find().lean(),
       JobApplication.find().lean(),
-      Shipment.find().lean()
+      Shipment.find().lean(),
+      SupplierPO.find().lean(),
+      PurchaserGRN.find().lean(),
+      LocalPayable.find().lean(),
+      InventoryItem.find().lean()
     ]);
 
     // Department Users
@@ -1549,6 +1588,20 @@ const getOrgDepartmentStats = async (req, res) => {
     const financeUsers = users.filter(u => u.role === 'finance' || (u.department && u.department.toLowerCase().includes('finance')));
     const hrUsers = users.filter(u => ['hr_manager', 'administration'].includes(u.role) || (u.department && u.department.toLowerCase().includes('hr')));
     const logisticsUsers = users.filter(u => u.role === 'logistics' || (u.department && u.department.toLowerCase().includes('logistic')));
+    const localPurchaserUsers = users.filter(u => ((u.role === 'purchaser' && (u.purchaserSubDept === 'Local' || !u.purchaserSubDept)) || (u.department && u.department.toLowerCase().includes('local'))));
+    const globalPurchaserUsers = users.filter(u => ((u.role === 'purchaser' && u.purchaserSubDept === 'Global') || (u.department && u.department.toLowerCase().includes('global'))));
+
+    // --- LOCAL PURCHASER STATS ---
+    const localSupplierPOs = (supplierPOs || []).filter(p => p.supplierType === 'Local' || p.poType === 'Local' || !p.fileType || p.fileType !== 'Blue');
+    const totalLocalSpend = (localPayables || []).reduce((sum, p) => sum + (p.totalAmount || p.amount || 0), 0);
+    const paidLocalPayables = (localPayables || []).filter(p => p.status === 'Paid').length;
+    const pendingLocalPayables = (localPayables || []).filter(p => p.status !== 'Paid').length;
+    const localPurchaserScore = (localPayables || []).length > 0 ? Math.min(100, Math.round((paidLocalPayables / (localPayables || []).length) * 100)) : 100;
+
+    // --- GLOBAL PURCHASER STATS ---
+    const globalSupplierPOs = (supplierPOs || []).filter(p => p.supplierType === 'Global' || p.poType === 'Global' || p.fileType === 'Blue');
+    const deliveredGlobalPOs = globalSupplierPOs.filter(p => ['Delivered', 'Received', 'Done'].includes(p.status)).length;
+    const globalPurchaserScore = globalSupplierPOs.length > 0 ? Math.min(100, Math.round((deliveredGlobalPOs / globalSupplierPOs.length) * 100)) : 100;
 
     // --- SALES STATS ---
     const wonDeals = deals.filter(d => ['Closed Won', 'Won'].includes(d.stage));
@@ -1705,6 +1758,43 @@ const getOrgDepartmentStats = async (req, res) => {
         records: {
           leaves: leaves.slice(0, 50),
           jobPostings: jobPostings.slice(0, 50)
+        }
+      },
+      local_purchaser: {
+        name: 'Local Purchaser Department',
+        userCount: localPurchaserUsers.length,
+        users: localPurchaserUsers,
+        score: localPurchaserScore,
+        kpis: {
+          totalSupplierPOs: (localSupplierPOs || []).length,
+          totalGRNs: (purchaserGRNs || []).length,
+          totalInventoryItems: (inventoryItems || []).length,
+          totalLocalSpend,
+          paidLocalPayables,
+          pendingLocalPayables
+        },
+        records: {
+          supplierPOs: (localSupplierPOs || []).slice(0, 50),
+          grns: (purchaserGRNs || []).slice(0, 50),
+          payables: (localPayables || []).slice(0, 50),
+          inventory: (inventoryItems || []).slice(0, 50)
+        }
+      },
+      global_purchaser: {
+        name: 'Global Purchaser Department',
+        userCount: globalPurchaserUsers.length,
+        users: globalPurchaserUsers,
+        score: globalPurchaserScore,
+        kpis: {
+          totalGlobalPOs: globalSupplierPOs.length,
+          deliveredGlobalPOs,
+          totalShipments: shipments.length,
+          inTransitShipments: shipments.filter(s => s.status === 'In Transit').length,
+          receivedInOffice: shipments.filter(s => s.receivedInOffice || s.status === 'Received in Office').length
+        },
+        records: {
+          supplierPOs: globalSupplierPOs.slice(0, 50),
+          shipments: shipments.slice(0, 50)
         }
       }
     };

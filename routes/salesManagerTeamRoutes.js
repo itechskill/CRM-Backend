@@ -12,6 +12,7 @@ const {
   deleteMyDeliveryNote
 } = require('../controllers/salesEmployeeController');
 const { createNotificationHelper, notifyRoleHelper } = require('../controllers/notificationController');
+const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 
 // Sales Manager, Admin, CEO can view and manage the Sales team
 const managerGuard = [protect, authorize('sales_manager', 'admin', 'ceo')];
@@ -37,11 +38,61 @@ const DeliveryNote = require('../models/DeliveryNote');
 const Task = require('../models/Task');
 const User = require('../models/User');
 const logAudit = require('../utils/auditLogger');
+const { getSalesManagerScope, inferBranchOrCity } = require('../utils/salesManagerScope');
 
 // ── GET SALES MANAGER DASHBOARD STATS (Aggregated Real MongoDB Data) ───────────
 router.get('/dashboard-stats', managerGuard, async (req, res) => {
   try {
     const now = new Date();
+    const scope = await getSalesManagerScope(req.user);
+
+    const userQuery = {
+      $or: [
+        { role: { $in: ['employee', 'sales_rep', 'sales_member', 'sales_person'] }, department: { $regex: /^sales$/i } },
+        { role: { $in: ['sales_rep', 'sales_member', 'sales_person'] } },
+        { department: { $regex: /^sales$/i } },
+        { position: { $regex: /sales/i } }
+      ],
+      role: { $nin: ['admin', 'ceo', 'hr_manager', 'accountant', 'sales_manager', 'administration', 'project_manager', 'marketing'] }
+    };
+
+    let leadQuery = {};
+    let dealQuery = {};
+    let quoQuery = {};
+    let orderQuery = {};
+    let invQuery = {};
+    let targetQuery = {};
+    let actQuery = {};
+    let taskQuery = { status: { $ne: 'Completed' } };
+
+    if (!scope.isGlobal) {
+      const managedMemberObjectIds = scope.memberIds.filter(id => id.toString() !== req.user._id.toString());
+      userQuery._id = { $in: managedMemberObjectIds };
+
+      const memberIds = scope.memberIds;
+      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
+
+      leadQuery = { $or: [{ assignedTo: { $in: memberIds } }, { createdBy: { $in: memberIds } }] };
+      dealQuery = { $or: [{ assignedTo: { $in: memberIds } }, { createdBy: { $in: memberIds } }] };
+
+      const salesDocOr = [
+        { createdBy: { $in: memberIds } },
+        { salesPerson: { $in: memberIds } }
+      ];
+      if (nameRegexes.length > 0) {
+        salesDocOr.push({ salePerson: { $in: nameRegexes } });
+      }
+
+      quoQuery = { $or: salesDocOr };
+      orderQuery = { $or: salesDocOr };
+      invQuery = { $or: salesDocOr };
+      targetQuery = { employee: { $in: memberIds } };
+      actQuery = { performedBy: { $in: memberIds } };
+      taskQuery = {
+        status: { $ne: 'Completed' },
+        $or: [{ assignedTo: { $in: memberIds } }, { createdBy: { $in: memberIds } }]
+      };
+    }
 
     const [
       teamMembers,
@@ -54,23 +105,15 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
       recentActivities,
       pendingTasks
     ] = await Promise.all([
-      User.find({
-        $or: [
-          { role: { $in: ['employee', 'sales_rep', 'sales_member'] }, department: { $regex: /^sales$/i } },
-          { role: { $in: ['sales_rep', 'sales_member'] } },
-          { department: { $regex: /^sales$/i } },
-          { position: { $regex: /sales/i } }
-        ],
-        role: { $nin: ['admin', 'ceo', 'hr_manager', 'accountant', 'sales_manager', 'administration', 'project_manager', 'marketing'] }
-      }).select('-password'),
-      Lead.find().populate('assignedTo', 'fullName email').sort({ createdAt: -1 }),
-      Deal.find().populate('assignedTo', 'fullName email').sort({ createdAt: -1 }),
-      Quotation.find().sort({ createdAt: -1 }),
-      SalesOrder.find().sort({ createdAt: -1 }),
-      Invoice.find().populate('createdBy', 'fullName email').sort({ createdAt: -1 }),
-      SalesTarget.find().populate('employee', 'fullName email').sort({ createdAt: -1 }),
-      SalesActivity.find().populate('performedBy', 'fullName profileImage email').sort({ createdAt: -1 }).limit(10),
-      Task.find({ status: { $ne: 'Completed' } }).sort({ createdAt: -1 }).limit(10)
+      User.find(userQuery).select('-password'),
+      Lead.find(leadQuery).populate('assignedTo', 'fullName email').sort({ createdAt: -1 }),
+      Deal.find(dealQuery).populate('assignedTo', 'fullName email').sort({ createdAt: -1 }),
+      Quotation.find(quoQuery).sort({ createdAt: -1 }),
+      SalesOrder.find(orderQuery).sort({ createdAt: -1 }),
+      Invoice.find(invQuery).populate('createdBy', 'fullName email').sort({ createdAt: -1 }),
+      SalesTarget.find(targetQuery).populate('employee', 'fullName email').sort({ createdAt: -1 }),
+      SalesActivity.find(actQuery).populate('performedBy', 'fullName profileImage email').sort({ createdAt: -1 }).limit(10),
+      Task.find(taskQuery).sort({ createdAt: -1 }).limit(10)
     ]);
 
     // 1. Team Members Count
@@ -149,7 +192,7 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
     const paidInvoices = invoices.filter(i => i.status === 'Paid');
     const paidInvoicesAmount = invoices.reduce((sum, i) => sum + (Number(i.paidAmount) || (i.status === 'Paid' ? Number(i.amount) : 0)), 0);
 
-    // Receivables: strictly approved / active invoices with remaining unpaid balance
+    // Receivables: strictly approved / active invoices with remaining unpaid balance + uninvoiced orders
     const approvedReceivableInvoices = invoices.filter(i =>
       ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status) &&
       i.status !== 'Paid' &&
@@ -159,51 +202,106 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
     }, 0);
-    const totalReceivables = invoiceReceivables;
 
-    // Overdue: strictly approved invoices past due date with remaining unpaid balance
+    const uninvoicedOrders = orders.filter(o => o.invoiceStatus !== 'Fully Invoiced' && o.status !== 'Cancelled');
+    const orderReceivables = uninvoicedOrders.reduce((sum, o) => {
+      return sum + Math.max(0, Number(o.outstandingBalance || o.netAmount || o.totalAmount || 0));
+    }, 0);
+
+    const totalReceivables = invoiceReceivables + orderReceivables;
+
+    // Overdue: strictly approved invoices past due date with remaining unpaid balance + uninvoiced orders past due
     const overdueInvoices = invoices.filter(i => {
       const isApproved = ['Approved', 'Sent', 'Partially Paid', 'Overdue'].includes(i.status);
       const isPastDue = i.status === 'Overdue' || (i.dueDate && new Date(i.dueDate) < now);
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return isApproved && isPastDue && outstanding > 0 && i.status !== 'Paid' && i.status !== 'Cancelled';
     });
-    const overdueInvoiceAmount = overdueInvoices.reduce((sum, i) => {
+    const overdueInvoiceAmountPart = overdueInvoices.reduce((sum, i) => {
       const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
       return sum + Math.max(0, outstanding);
     }, 0);
 
-    const overdueList = overdueInvoices.map(i => {
-      const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
-      return {
-        _id: i._id,
-        invoiceNumber: i.invoiceNumber,
-        clientName: i.clientName || 'Client',
-        salesRep: i.createdBy?.fullName || i.salePerson || 'Sales Team',
-        dueDate: i.dueDate,
-        issueDate: i.issueDate,
-        amount: Number(i.amount) || 0,
-        paidAmount: Number(i.paidAmount) || 0,
-        remainingBalance: Math.max(0, outstanding),
-        status: i.status || 'Overdue'
-      };
+    const overdueOrders = uninvoicedOrders.filter(o => {
+      const orderBaseDate = o.orderDate || o.creationDate || o.createdAt;
+      const isPastDue = orderBaseDate && (new Date(orderBaseDate).getTime() + 30 * 24 * 60 * 60 * 1000) < now.getTime();
+      return isPastDue && (Number(o.outstandingBalance || o.netAmount || o.totalAmount || 0) > 0);
     });
+    const overdueOrderAmount = overdueOrders.reduce((sum, o) => sum + Math.max(0, Number(o.outstandingBalance || o.netAmount || o.totalAmount || 0)), 0);
 
-    const receivablesList = approvedReceivableInvoices.map(i => {
-      const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
-      return {
-        _id: i._id,
-        invoiceNumber: i.invoiceNumber,
-        clientName: i.clientName || 'Client',
-        salesRep: i.createdBy?.fullName || i.salePerson || 'Sales Team',
-        dueDate: i.dueDate,
-        issueDate: i.issueDate,
-        amount: Number(i.amount) || 0,
-        paidAmount: Number(i.paidAmount) || 0,
-        remainingBalance: Math.max(0, outstanding),
-        status: i.status || 'Pending'
-      };
-    });
+    const overdueInvoiceAmount = overdueInvoiceAmountPart + overdueOrderAmount;
+
+    const overdueList = [
+      ...overdueInvoices.map(i => {
+        const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+        return {
+          _id: i._id,
+          invoiceNumber: i.invoiceNumber,
+          clientName: i.clientName || 'Client',
+          salesRep: i.salePerson || i.createdBy?.fullName || 'Sales Team',
+          dueDate: i.dueDate,
+          issueDate: i.issueDate,
+          amount: Number(i.amount) || 0,
+          paidAmount: Number(i.paidAmount) || 0,
+          remainingBalance: Math.max(0, outstanding),
+          status: i.status || 'Overdue',
+          type: 'Invoice'
+        };
+      }),
+      ...overdueOrders.map(o => {
+        const baseDate = o.orderDate || o.creationDate || o.createdAt;
+        const dueDate = new Date(new Date(baseDate).getTime() + 30 * 24 * 60 * 60 * 1000);
+        return {
+          _id: o._id,
+          invoiceNumber: o.orderNumber || o.orderReference,
+          clientName: o.clientName || 'Client',
+          salesRep: o.salePerson || 'Sales Team',
+          dueDate: dueDate,
+          issueDate: baseDate,
+          amount: Number(o.totalAmount || o.netAmount || 0),
+          paidAmount: Number(o.totalPaid || 0),
+          remainingBalance: Math.max(0, Number(o.outstandingBalance || o.totalAmount || 0)),
+          status: 'Overdue (Pending Invoice)',
+          type: 'Sales Order'
+        };
+      })
+    ];
+
+    const receivablesList = [
+      ...approvedReceivableInvoices.map(i => {
+        const outstanding = i.outstandingAmount != null ? Number(i.outstandingAmount) : (Number(i.amount) - (Number(i.paidAmount) || 0));
+        return {
+          _id: i._id,
+          invoiceNumber: i.invoiceNumber,
+          clientName: i.clientName || 'Client',
+          salesRep: i.salePerson || i.createdBy?.fullName || 'Sales Team',
+          dueDate: i.dueDate,
+          issueDate: i.issueDate,
+          amount: Number(i.amount) || 0,
+          paidAmount: Number(i.paidAmount) || 0,
+          remainingBalance: Math.max(0, outstanding),
+          status: i.status || 'Pending',
+          type: 'Invoice'
+        };
+      }),
+      ...uninvoicedOrders.map(o => {
+        const baseDate = o.orderDate || o.creationDate || o.createdAt;
+        const dueDate = new Date(new Date(baseDate).getTime() + 30 * 24 * 60 * 60 * 1000);
+        return {
+          _id: o._id,
+          invoiceNumber: o.orderNumber || o.orderReference,
+          clientName: o.clientName || 'Client',
+          salesRep: o.salePerson || 'Sales Team',
+          dueDate: dueDate,
+          issueDate: baseDate,
+          amount: Number(o.totalAmount || o.netAmount || 0),
+          paidAmount: Number(o.totalPaid || 0),
+          remainingBalance: Math.max(0, Number(o.outstandingBalance || o.totalAmount || 0)),
+          status: 'To Invoice',
+          type: 'Sales Order'
+        };
+      })
+    ];
 
     const ordersDelivered = orders.filter(o => o.status === 'Delivered');
     const deliveredOrdersValue = ordersDelivered.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
@@ -296,6 +394,11 @@ router.get('/team-members/:id/profile', managerGuard, getSalesTeamMemberProfile)
 // ── UPDATE SALES EMPLOYEE DETAILS (Name, Email, Phone, Position, Salary Target, Status) ──
 router.patch('/team-members/:id/details', managerGuard, async (req, res) => {
   try {
+    const scope = await getSalesManagerScope(req.user);
+    if (!scope.isGlobal && !scope.memberIds.some(id => id.toString() === req.params.id.toString())) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only update team members belonging to your branch.' });
+    }
+
     const { fullName, email, phone, position, salaryTarget, status } = req.body;
     const user = await User.findById(req.params.id);
 
@@ -371,6 +474,7 @@ router.post('/invite-member', managerGuard, async (req, res) => {
     const assignedRole = isSalesPerson ? 'sales_person' : 'sales_rep';
     const assignedPosition = isSalesPerson ? 'Sales Person' : 'Sales Representative';
     const targetVal = Number(salaryTarget || req.body.target) || 0;
+    const resolvedBranch = (req.body.branch || req.body.city || inferBranchOrCity(req.user) || '').trim();
 
     const newUser = new User({
       fullName: fullName.trim(),
@@ -382,7 +486,11 @@ router.post('/invite-member', managerGuard, async (req, res) => {
       role: assignedRole,
       department: 'Sales',
       status: 'pending',
-      isApproved: false
+      isApproved: false,
+      createdBy: req.user._id,
+      manager: req.user._id,
+      branch: resolvedBranch,
+      city: resolvedBranch
     });
 
     await newUser.save();
@@ -433,6 +541,11 @@ router.post('/invite-member', managerGuard, async (req, res) => {
 // ── DELETE / DEACTIVATE SALES TEAM MEMBER ─────────────────────────────────────
 router.delete('/team-members/:id', managerGuard, async (req, res) => {
   try {
+    const scope = await getSalesManagerScope(req.user);
+    if (!scope.isGlobal && !scope.memberIds.some(id => id.toString() === req.params.id.toString())) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only delete team members belonging to your branch.' });
+    }
+
     const member = await User.findById(req.params.id);
     if (!member) {
       return res.status(404).json({ success: false, message: 'Sales team member not found.' });
@@ -475,6 +588,11 @@ router.post('/assign-lead', managerGuard, async (req, res) => {
 
     if (!employeeId) {
       return res.status(400).json({ success: false, message: 'Employee ID is required.' });
+    }
+
+    const scope = await getSalesManagerScope(req.user);
+    if (!scope.isGlobal && !scope.memberIds.some(id => id.toString() === employeeId.toString())) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only assign leads to team members in your branch.' });
     }
 
     const employee = await User.findOne({
@@ -550,6 +668,11 @@ router.post('/assign-followup', managerGuard, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Employee ID and Title are required.' });
     }
 
+    const scope = await getSalesManagerScope(req.user);
+    if (!scope.isGlobal && !scope.memberIds.some(id => id.toString() === employeeId.toString())) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only assign follow-ups to team members in your branch.' });
+    }
+
     const employee = await User.findOne({
       _id: employeeId,
       $or: [
@@ -603,6 +726,11 @@ router.post('/targets', managerGuard, async (req, res) => {
 
     if (!employeeId || !targetAmount) {
       return res.status(400).json({ success: false, message: 'Employee ID and target amount are required.' });
+    }
+
+    const scope = await getSalesManagerScope(req.user);
+    if (!scope.isGlobal && !scope.memberIds.some(id => id.toString() === employeeId.toString())) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only assign targets to team members in your branch.' });
     }
 
     const employee = await User.findOne({
@@ -723,26 +851,52 @@ router.delete('/targets/:id', managerGuard, async (req, res) => {
 router.get('/invoices', managerGuard, async (req, res) => {
   try {
     const { status, search, employeeId } = req.query;
-    const query = {};
+    const scope = await getSalesManagerScope(req.user);
+    const conditions = [];
 
-    if (status && status !== 'all') {
-      query.status = status;
+    if (!scope.isGlobal) {
+      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
+      const teamScopeConditions = [
+        { createdBy: { $in: scope.memberIds } },
+        { salesPerson: { $in: scope.memberIds } }
+      ];
+      if (nameRegexes.length > 0) {
+        teamScopeConditions.push({ salePerson: { $in: nameRegexes } });
+      }
+
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) {
+          return res.status(200).json({ success: true, count: 0, data: [] });
+        }
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      } else {
+        conditions.push({ $or: teamScopeConditions });
+      }
+    } else {
+      if (employeeId && employeeId !== 'all') {
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      }
     }
 
-    if (employeeId && employeeId !== 'all') {
-      query.createdBy = employeeId;
+    if (status && status !== 'all') {
+      conditions.push({ status });
     }
 
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [
-        { invoiceNumber: regex },
-        { clientName: regex },
-        { dealTitle: regex },
-        { saleReference: regex },
-        { customerEmail: regex }
-      ];
+      conditions.push({
+        $or: [
+          { invoiceNumber: regex },
+          { clientName: regex },
+          { dealTitle: regex },
+          { saleReference: regex },
+          { customerEmail: regex }
+        ]
+      });
     }
+
+    const query = conditions.length > 0 ? { $and: conditions } : {};
 
     const invoices = await Invoice.find(query)
       .populate('createdBy', 'fullName email profileImage position department')
@@ -764,6 +918,7 @@ router.get('/invoices', managerGuard, async (req, res) => {
 // 2. GET SPECIFIC INVOICE
 router.get('/invoices/:id', managerGuard, async (req, res) => {
   try {
+    const scope = await getSalesManagerScope(req.user);
     const invoice = await Invoice.findById(req.params.id)
       .populate('createdBy', 'fullName email profileImage position department phone')
       .populate('reviewedBy', 'fullName email position')
@@ -771,6 +926,18 @@ router.get('/invoices/:id', managerGuard, async (req, res) => {
 
     if (!invoice) {
       return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    if (!scope.isGlobal) {
+      const creatorId = invoice.createdBy?._id || invoice.createdBy;
+      const salesPersonId = invoice.salesPerson?._id || invoice.salesPerson;
+      const isAllowed = scope.memberIds.some(id => 
+        (creatorId && id.toString() === creatorId.toString()) ||
+        (salesPersonId && id.toString() === salesPersonId.toString())
+      );
+      if (!isAllowed) {
+        return res.status(403).json({ success: false, message: 'Access denied. You can only view invoices belonging to your branch.' });
+      }
     }
 
     return res.status(200).json({
@@ -789,6 +956,26 @@ router.patch('/invoices/:id', managerGuard, async (req, res) => {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) {
       return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    const changes = {};
+    Object.keys(req.body).forEach(field => {
+      if (req.body[field] !== undefined && hasFieldValueChanged(invoice[field], req.body[field])) {
+        changes[field] = { old: invoice[field], new: req.body[field] };
+      }
+    });
+
+    const docType = invoice.status === 'Draft' || invoice.type === 'Draft' ? 'Draft Invoice' : 'Final Invoice';
+    const check = await verifyAndConsumeCEOPermission({
+      documentType: docType,
+      documentId: invoice._id,
+      documentNumber: invoice.invoiceNumber,
+      requestingUser: req.user,
+      changes
+    });
+
+    if (!check.authorized) {
+      return res.status(403).json({ success: false, message: check.message });
     }
 
     const {
@@ -967,34 +1154,58 @@ router.delete('/invoices/:id', managerGuard, async (req, res) => {
 router.get('/all-orders', managerGuard, async (req, res) => {
   try {
     const { employeeId, status, deliveryStatus, invoiceStatus, paymentStatus, search } = req.query;
-    const query = {};
-    if (employeeId && employeeId !== 'all') {
-      query.$or = [{ createdBy: employeeId }, { salesPerson: employeeId }];
-    }
-    if (status && status !== 'all') query.status = status;
-    if (deliveryStatus && deliveryStatus !== 'all') query.deliveryStatus = deliveryStatus;
-    if (invoiceStatus && invoiceStatus !== 'all') query.invoiceStatus = invoiceStatus;
-    if (paymentStatus && paymentStatus !== 'all') query.paymentStatus = paymentStatus;
-    if (search && search.trim()) {
-      const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      const searchConditions = [
-        { orderNumber: regex },
-        { orderReference: regex },
-        { customerName: regex },
-        { clientName: regex },
-        { customerPONumber: regex },
-        { invoiceNumber: regex },
-        { fileNo: regex },
-        { productSummary: regex },
-        { salePerson: regex }
+    const scope = await getSalesManagerScope(req.user);
+    const conditions = [];
+
+    if (!scope.isGlobal) {
+      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
+      const teamScopeConditions = [
+        { createdBy: { $in: scope.memberIds } },
+        { salesPerson: { $in: scope.memberIds } }
       ];
-      if (query.$or) {
-        query.$and = [{ $or: query.$or }, { $or: searchConditions }];
-        delete query.$or;
+      if (nameRegexes.length > 0) {
+        teamScopeConditions.push({ salePerson: { $in: nameRegexes } });
+      }
+
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) {
+          return res.status(200).json({ success: true, count: 0, data: [] });
+        }
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
       } else {
-        query.$or = searchConditions;
+        conditions.push({ $or: teamScopeConditions });
+      }
+    } else {
+      if (employeeId && employeeId !== 'all') {
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
       }
     }
+
+    if (status && status !== 'all') conditions.push({ status });
+    if (deliveryStatus && deliveryStatus !== 'all') conditions.push({ deliveryStatus });
+    if (invoiceStatus && invoiceStatus !== 'all') conditions.push({ invoiceStatus });
+    if (paymentStatus && paymentStatus !== 'all') conditions.push({ paymentStatus });
+
+    if (search && search.trim()) {
+      const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      conditions.push({
+        $or: [
+          { orderNumber: regex },
+          { orderReference: regex },
+          { customerName: regex },
+          { clientName: regex },
+          { customerPONumber: regex },
+          { invoiceNumber: regex },
+          { fileNo: regex },
+          { productSummary: regex },
+          { salePerson: regex }
+        ]
+      });
+    }
+
+    const query = conditions.length > 0 ? { $and: conditions } : {};
+
     const orders = await SalesOrder.find(query)
       .populate('createdBy', 'fullName email position department profileImage')
       .populate('salesPerson', 'fullName email position department profileImage')
@@ -1013,12 +1224,32 @@ router.get('/all-orders', managerGuard, async (req, res) => {
 router.get('/all-customer-pos', managerGuard, async (req, res) => {
   try {
     const { employeeId, search } = req.query;
-    const query = {};
-    if (employeeId && employeeId !== 'all') query.createdBy = employeeId;
+    const scope = await getSalesManagerScope(req.user);
+    const conditions = [];
+
+    if (!scope.isGlobal) {
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) return res.status(200).json({ success: true, count: 0, data: [] });
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      } else {
+        conditions.push({
+          $or: [{ createdBy: { $in: scope.memberIds } }, { salesPerson: { $in: scope.memberIds } }]
+        });
+      }
+    } else {
+      if (employeeId && employeeId !== 'all') {
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      }
+    }
+
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ poNumber: regex }, { customerName: regex }, { quotationNumber: regex }];
+      conditions.push({ $or: [{ poNumber: regex }, { customerName: regex }, { quotationNumber: regex }] });
     }
+
+    const query = conditions.length > 0 ? { $and: conditions } : {};
+
     const customerPOs = await CustomerPO.find(query)
       .populate('createdBy', 'fullName email position department profileImage')
       .populate('quotationId')
@@ -1034,13 +1265,31 @@ router.get('/all-customer-pos', managerGuard, async (req, res) => {
 router.get('/all-product-files', managerGuard, async (req, res) => {
   try {
     const { employeeId, fileType, search } = req.query;
-    const query = {};
-    if (employeeId && employeeId !== 'all') query.createdBy = employeeId;
-    if (fileType && fileType !== 'all') query.fileType = fileType;
+    const scope = await getSalesManagerScope(req.user);
+    const conditions = [];
+
+    if (!scope.isGlobal) {
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) return res.status(200).json({ success: true, count: 0, data: [] });
+        conditions.push({ createdBy: employeeId });
+      } else {
+        conditions.push({ createdBy: { $in: scope.memberIds } });
+      }
+    } else {
+      if (employeeId && employeeId !== 'all') conditions.push({ createdBy: employeeId });
+    }
+
+    if (fileType && fileType !== 'all') conditions.push({ fileType });
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ fileNumber: regex }, { customerName: regex }, { quotationNumber: regex }, { customerPONumber: regex }, { salesOrderNumber: regex }];
+      conditions.push({
+        $or: [{ fileNumber: regex }, { customerName: regex }, { quotationNumber: regex }, { customerPONumber: regex }, { salesOrderNumber: regex }]
+      });
     }
+
+    const query = conditions.length > 0 ? { $and: conditions } : {};
+
     const productFiles = await ProductFile.find(query)
       .populate('createdBy', 'fullName email position department profileImage')
       .populate('quotationId')
@@ -1058,13 +1307,35 @@ router.get('/all-product-files', managerGuard, async (req, res) => {
 router.get('/all-payments', managerGuard, async (req, res) => {
   try {
     const { employeeId, paymentType, search } = req.query;
-    const query = {};
-    if (employeeId && employeeId !== 'all') query.createdBy = employeeId;
-    if (paymentType && paymentType !== 'all') query.paymentType = paymentType;
+    const scope = await getSalesManagerScope(req.user);
+    const conditions = [];
+
+    if (!scope.isGlobal) {
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) return res.status(200).json({ success: true, count: 0, data: [] });
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      } else {
+        conditions.push({
+          $or: [{ createdBy: { $in: scope.memberIds } }, { salesPerson: { $in: scope.memberIds } }]
+        });
+      }
+    } else {
+      if (employeeId && employeeId !== 'all') {
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      }
+    }
+
+    if (paymentType && paymentType !== 'all') conditions.push({ paymentType });
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ paymentRefNumber: regex }, { customerName: regex }, { invoiceNumber: regex }, { salesOrderNumber: regex }];
+      conditions.push({
+        $or: [{ paymentRefNumber: regex }, { customerName: regex }, { invoiceNumber: regex }, { salesOrderNumber: regex }]
+      });
     }
+
+    const query = conditions.length > 0 ? { $and: conditions } : {};
+
     const payments = await Payment.find(query)
       .populate('createdBy', 'fullName email position department profileImage')
       .populate('salesOrderId')
@@ -1081,13 +1352,31 @@ router.get('/all-payments', managerGuard, async (req, res) => {
 router.get('/all-activities', managerGuard, async (req, res) => {
   try {
     const { employeeId, type, search } = req.query;
-    const query = {};
-    if (employeeId && employeeId !== 'all') query.performedBy = employeeId;
-    if (type && type !== 'all') query.type = type;
+    const scope = await getSalesManagerScope(req.user);
+    const conditions = [];
+
+    if (!scope.isGlobal) {
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) return res.status(200).json({ success: true, count: 0, data: [] });
+        conditions.push({ performedBy: employeeId });
+      } else {
+        conditions.push({ performedBy: { $in: scope.memberIds } });
+      }
+    } else {
+      if (employeeId && employeeId !== 'all') conditions.push({ performedBy: employeeId });
+    }
+
+    if (type && type !== 'all') conditions.push({ type });
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ description: regex }, { type: regex }, { relatedCustomer: regex }, { salesMemberName: regex }];
+      conditions.push({
+        $or: [{ description: regex }, { type: regex }, { relatedCustomer: regex }, { salesMemberName: regex }]
+      });
     }
+
+    const query = conditions.length > 0 ? { $and: conditions } : {};
+
     const activities = await SalesActivity.find(query)
       .populate('performedBy', 'fullName email position department profileImage')
       .sort({ createdAt: -1 })
@@ -1103,13 +1392,35 @@ router.get('/all-activities', managerGuard, async (req, res) => {
 router.get('/all-delivery-notes', managerGuard, async (req, res) => {
   try {
     const { employeeId, status, search } = req.query;
-    const query = {};
-    if (employeeId && employeeId !== 'all') query.createdBy = employeeId;
-    if (status && status !== 'all') query.status = status;
+    const scope = await getSalesManagerScope(req.user);
+    const conditions = [];
+
+    if (!scope.isGlobal) {
+      if (employeeId && employeeId !== 'all') {
+        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
+        if (!isMember) return res.status(200).json({ success: true, count: 0, data: [] });
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      } else {
+        conditions.push({
+          $or: [{ createdBy: { $in: scope.memberIds } }, { salesPerson: { $in: scope.memberIds } }]
+        });
+      }
+    } else {
+      if (employeeId && employeeId !== 'all') {
+        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+      }
+    }
+
+    if (status && status !== 'all') conditions.push({ status });
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ deliveryNoteNumber: regex }, { customerName: regex }, { salesOrderRef: regex }];
+      conditions.push({
+        $or: [{ deliveryNoteNumber: regex }, { customerName: regex }, { salesOrderRef: regex }]
+      });
     }
+
+    const query = conditions.length > 0 ? { $and: conditions } : {};
+
     const deliveryNotes = await DeliveryNote.find(query)
       .populate('createdBy', 'fullName email position department profileImage')
       .populate('salesOrderId')
@@ -1126,6 +1437,25 @@ router.patch('/delivery-notes/:id', managerGuard, async (req, res) => {
   try {
     const deliveryNote = await DeliveryNote.findById(req.params.id);
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
+
+    const changes = {};
+    Object.keys(req.body).forEach(field => {
+      if (req.body[field] !== undefined && hasFieldValueChanged(deliveryNote[field], req.body[field])) {
+        changes[field] = { old: deliveryNote[field], new: req.body[field] };
+      }
+    });
+
+    const check = await verifyAndConsumeCEOPermission({
+      documentType: 'Delivery Note',
+      documentId: deliveryNote._id,
+      documentNumber: deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber,
+      requestingUser: req.user,
+      changes
+    });
+
+    if (!check.authorized) {
+      return res.status(403).json({ success: false, message: check.message });
+    }
 
     const allowedFields = [
       'clientName',

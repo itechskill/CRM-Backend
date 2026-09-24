@@ -3,6 +3,7 @@ const Shipment = require('../models/Shipment');
 const SalesOrder = require('../models/SalesOrder');
 const DeliveryNote = require('../models/DeliveryNote');
 const User = require('../models/User');
+const InventoryItem = require('../models/InventoryItem');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
 
 /**
@@ -13,9 +14,12 @@ const getLogisticsDashboardStats = async (req, res) => {
   try {
     const now = new Date();
 
+    // Get all Sales Order IDs that ALREADY have an initialized shipment
+    const initializedOrderIds = await Shipment.distinct('salesOrder');
+
     const [
+      incomingOrdersCount,
       pendingShipmentsCount,
-      intPoCount,
       inTransitCount,
       expectedArrivalsCount,
       receivedCount,
@@ -23,15 +27,20 @@ const getLogisticsDashboardStats = async (req, res) => {
       totalActiveCount,
       recentShipments
     ] = await Promise.all([
+      // Incoming Blue File Orders awaiting Shipment Initialization (NOT YET INITIALIZED)
+      SalesOrder.countDocuments({
+        _id: { $nin: initializedOrderIds },
+        shipmentId: null,
+        fileType: 'Blue',
+        $or: [
+          { 'supplierPO.poType': 'International' },
+          { workflowStatus: { $in: ['International Supplier PO Issued', 'Finance Approved', 'Routed to Logistics', 'In Logistics', 'Pending Logistics Handover'] } }
+        ]
+      }),
       // Pending Shipments (PO Issued, Shipment Pending, Booked)
       Shipment.countDocuments({
         status: { $in: ['PO Issued', 'Shipment Pending', 'Booked'] },
         receivedInOffice: false
-      }),
-      // International Supplier POs (Sales orders with Blue file and International PO, or Shipments with PO Issued)
-      SalesOrder.countDocuments({
-        fileType: 'Blue',
-        'supplierPO.poType': 'International'
       }),
       // In Transit
       Shipment.countDocuments({
@@ -75,8 +84,9 @@ const getLogisticsDashboardStats = async (req, res) => {
     return res.status(200).json({
       success: true,
       data: {
+        incomingOrders: incomingOrdersCount,
+        internationalSupplierPOs: incomingOrdersCount,
         pendingShipments: pendingShipmentsCount,
-        internationalSupplierPOs: intPoCount,
         inTransit: inTransitCount,
         expectedArrivals: expectedArrivalsCount,
         shipmentsReceived: receivedCount,
@@ -511,27 +521,45 @@ const receiveShipmentInOffice = async (req, res) => {
     const order = await SalesOrder.findById(shipment.salesOrder);
     if (order) {
       const prevStatus = order.workflowStatus;
-      order.workflowStatus = 'Shipment Received in Office';
-      order.status = 'Shipment Received in Office';
-      order.departmentResponsible = 'Support'; // Automatically ready for Support processing!
+      order.workflowStatus = 'Pending Logistics GRN';
+      order.status = 'Pending Logistics GRN';
+      order.departmentResponsible = 'Logistics'; // Keep in logistics for GRN
+      order.currentDepartment = 'Logistics';
+      order.currentStatus = 'PENDING_LOGISTICS_GRN';
+      order.previousDepartment = 'Logistics';
+      order.previousStatus = prevStatus;
+      order.lastAction = `Shipment ${shipment.shipmentId} confirmed received in office by Logistics`;
+      order.lastActionBy = req.user._id;
+      order.lastActionByName = req.user.fullName;
+      order.lastActionAt = new Date();
+      order.goodsReceivedInOffice = {
+        received: true,
+        receivedAt: new Date(),
+        receivedBy: req.user._id,
+        receivedByName: req.user.fullName,
+        receivedQuantity: order.items?.reduce((acc, it) => acc + (it.quantity || 0), 0) || 0,
+        orderedQuantity: order.items?.reduce((acc, it) => acc + (it.quantity || 0), 0) || 0,
+        remarks: 'Received by Logistics'
+      };
+      
       order.workflowHistory.push({
         user: req.user._id,
         userName: req.user.fullName,
         department: 'Logistics',
         action: 'Shipment Received in Office',
         previousStatus: prevStatus,
-        newStatus: 'Shipment Received in Office',
+        newStatus: 'Pending Logistics GRN',
         timestamp: new Date(),
-        notes: `Shipment ${shipment.shipmentId} confirmed received in office by ${req.user.fullName}. Handed over to Support for Goods Received & Delivery Note.`
+        notes: `Shipment ${shipment.shipmentId} confirmed received in office by ${req.user.fullName}. Awaiting GRN creation.`
       });
       await order.save();
 
-      // Notify Support team that goods arrived and are ready for receipt / BL input
-      await notifyRoleHelper(['support', 'operations', 'admin'], {
+      // Notify Logistics team that goods arrived and are ready for GRN
+      await notifyRoleHelper(['logistics'], {
         type: 'order',
-        title: 'Shipment Received in Office — Ready for Support',
-        message: `Shipment ${shipment.shipmentId} for Sales Order ${order.orderNumber || order.orderReference} has been received in office and is ready for Support processing.`,
-        link: '/support/orders',
+        title: 'Shipment Received — Awaiting GRN',
+        message: `Shipment ${shipment.shipmentId} for Sales Order ${order.orderNumber || order.orderReference} is received. Please create GRN.`,
+        link: '/logistics/grn',
         sender: req.user._id
       });
 
@@ -550,7 +578,7 @@ const receiveShipmentInOffice = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: `Shipment ${shipment.shipmentId} confirmed as received in office and transitioned to Support!`,
+      message: `Shipment ${shipment.shipmentId} confirmed as received in office. Please create GRN.`,
       data: shipment
     });
   } catch (error) {
@@ -565,16 +593,20 @@ const receiveShipmentInOffice = async (req, res) => {
  */
 const getIncomingOrders = async (req, res) => {
   try {
-    // Sales Orders with Blue file and International PO
+    // Find all Sales Order IDs that ALREADY have an initialized shipment
+    const initializedOrderIds = await Shipment.distinct('salesOrder');
+
+    // Sales Orders with Blue file and International PO awaiting shipment initialization (not yet initialized)
     const orders = await SalesOrder.find({
+      _id: { $nin: initializedOrderIds },
+      shipmentId: null,
       fileType: 'Blue',
       $or: [
         { 'supplierPO.poType': 'International' },
-        { workflowStatus: { $in: ['International Supplier PO Issued', 'Finance Approved', 'Routed to Logistics'] } }
+        { workflowStatus: { $in: ['International Supplier PO Issued', 'Finance Approved', 'Routed to Logistics', 'In Logistics', 'Pending Logistics Handover'] } }
       ]
     })
       .populate('salesPerson', 'fullName email')
-      .populate('shipmentId')
       .sort({ createdAt: -1 })
       .lean();
 
@@ -620,3 +652,346 @@ module.exports = {
   getIncomingOrders,
   getLogisticsDeliveryNotes
 };
+
+/**
+ * @desc    Get all Logistics GRNs
+ * @route   GET /api/logistics/grns
+ */
+const getLogisticsGRNs = async (req, res) => {
+  try {
+    const PurchaserGRN = require('../models/PurchaserGRN');
+    const grns = await PurchaserGRN.find({
+      $or: [
+        { grnType: 'Logistics' },
+        { grnType: 'Supplier' },
+        { grnType: { $exists: false } }
+      ]
+    }).sort({ createdAt: -1 }).lean();
+    return res.status(200).json({ success: true, count: grns.length, grns, data: grns });
+  } catch (error) {
+    console.error('[Get Logistics GRNs Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error loading GRNs.' });
+  }
+};
+
+module.exports.getLogisticsGRNs = getLogisticsGRNs;
+
+/**
+ * @desc    Get orders / shipments pending Logistics GRN
+ * @route   GET /api/logistics/pending-grns
+ */
+const getPendingGRNs = async (req, res) => {
+  try {
+    const orders = await SalesOrder.find({
+      fileType: 'Blue',
+      status: { $nin: ['Delivered', 'Cancelled', 'Closed'] },
+      $or: [
+        { departmentResponsible: 'Logistics' },
+        { currentDepartment: 'Logistics' },
+        { workflowStatus: { $in: ['Shipment In Transit', 'Customs Clearance', 'Pending Logistics GRN', 'Shipment Received in Office', 'Order Placed with Supplier'] } }
+      ]
+    }).populate('salesPerson', 'fullName email').sort({ createdAt: -1 }).lean();
+
+    return res.status(200).json({ success: true, count: orders.length, data: orders, orders });
+  } catch (error) {
+    console.error('[Get Pending GRNs Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error loading pending GRNs.' });
+  }
+};
+
+module.exports.getPendingGRNs = getPendingGRNs;
+
+const PurchaserGRN = require('../models/PurchaserGRN');
+
+/**
+ * @desc    Create GRN in Logistics and hand over to Support (if linked to Sales Order)
+ * @route   POST /api/logistics/grn
+ */
+const createLogisticsGRN = async (req, res) => {
+  try {
+    const {
+      salesOrderId,
+      salesOrderNumber,
+      supplierName,
+      supplierPONumber,
+      deliveryNoteNumber,
+      inspectionStatus,
+      remarks,
+      items,
+      grnNumber: customGrnNumber
+    } = req.body;
+
+    let order = null;
+    if (salesOrderId) {
+      order = await SalesOrder.findById(salesOrderId);
+    }
+
+    const grnCount = await PurchaserGRN.countDocuments();
+    const grnNumber = customGrnNumber || `GRN-LOG-${new Date().getFullYear()}-${String(grnCount + 1).padStart(4, '0')}`;
+
+    const formattedItems = (Array.isArray(items) ? items : []).map(it => ({
+      productName: it.productName || it.description || 'General Item',
+      orderedQty: Number(it.orderedQty) || Number(it.quantity) || 1,
+      receivedQty: Number(it.receivedQty || it.quantityReceived || it.quantity) || 1,
+      quantity: Number(it.quantity || it.quantityReceived || it.receivedQty) || 1,
+      quantityReceived: Number(it.quantityReceived || it.receivedQty || it.quantity) || 1,
+      condition: it.condition || 'Good'
+    }));
+
+    const grn = await PurchaserGRN.create({
+      grnNumber,
+      grnType: 'Logistics',
+      supplierName: supplierName || (order ? order.supplierName : '') || 'Logistics Inward',
+      poNumber: supplierPONumber || '',
+      salesOrder: order ? order._id : null,
+      salesOrderId: order ? order._id : null,
+      salesOrderNumber: salesOrderNumber || (order ? (order.orderNumber || order.orderReference) : ''),
+      items: formattedItems.length > 0 ? formattedItems : [{ productName: 'General Goods', orderedQty: 1, receivedQty: 1, quantityReceived: 1, condition: 'Good' }],
+      remarks: remarks || 'Logistics Goods Receipt Note',
+      status: inspectionStatus || 'Completed',
+      createdBy: req.user?._id,
+      createdByName: req.user?.fullName || 'Logistics User'
+    });
+
+    // Auto add received items into Import Inventory
+    try {
+      for (const it of formattedItems) {
+        const qty = Number(it.quantityReceived || it.receivedQty || it.orderedQty) || 1;
+        const itemName = (it.productName || 'Imported Product').trim();
+
+        let itemDoc = await InventoryItem.findOne({
+          name: { $regex: new RegExp(`^${itemName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') },
+          $or: [{ category: 'Imported Goods' }, { location: { $regex: 'Logistics|Import', $options: 'i' } }]
+        });
+
+        if (itemDoc) {
+          itemDoc.quantityOnHand = (itemDoc.quantityOnHand || 0) + qty;
+          if (order) itemDoc.orderReference = order.orderNumber || order.orderReference;
+          if (supplierName) itemDoc.supplierName = supplierName;
+          if (supplierPONumber) itemDoc.supplierPoNumber = supplierPONumber;
+          await itemDoc.save();
+        } else {
+          await InventoryItem.create({
+            name: itemName,
+            sku: supplierPONumber ? `IMP-${supplierPONumber}` : `IMP-${Date.now().toString().slice(-6)}`,
+            category: 'Imported Goods',
+            unit: 'pcs',
+            quantityOnHand: qty,
+            reservedQuantity: 0,
+            unitPrice: 0,
+            location: 'Logistics / Import WH',
+            description: remarks || `Imported via GRN ${grnNumber}`,
+            supplierName: supplierName || (order ? order.supplierName : ''),
+            supplierPoNumber: supplierPONumber || '',
+            orderReference: order ? (order.orderNumber || order.orderReference) : ''
+          });
+        }
+      }
+    } catch (invErr) {
+      console.warn('[GRN Auto Import Inventory Sync Error]:', invErr.message);
+    }
+
+    // Advance Sales Order to Support if order exists
+    if (order) {
+      const prevStatus = order.workflowStatus;
+      order.workflowStatus = 'Shipment Received in Office';
+      order.status = 'Shipment Received in Office';
+      order.departmentResponsible = 'Support';
+      order.currentDepartment = 'Support';
+      order.currentStatus = 'SHIPMENT_RECEIVED_IN_OFFICE';
+      order.previousDepartment = 'Logistics';
+      order.previousStatus = prevStatus;
+      order.lastAction = `Logistics GRN ${grnNumber} Created`;
+      order.lastActionBy = req.user?._id;
+      order.lastActionByName = req.user?.fullName || 'Logistics User';
+      order.lastActionAt = new Date();
+      
+      order.workflowHistory.push({
+        user: req.user?._id,
+        userName: req.user?.fullName || 'Logistics User',
+        department: 'Logistics',
+        action: 'Logistics GRN Created',
+        previousStatus: prevStatus,
+        newStatus: 'Shipment Received in Office',
+        timestamp: new Date(),
+        notes: `Logistics GRN ${grnNumber} created. Order handed over to Support.`
+      });
+      
+      await order.save();
+
+      try {
+        await notifyRoleHelper(['support', 'operations', 'admin'], {
+          type: 'order',
+          title: 'Logistics GRN Created — Ready for Support',
+          message: `Logistics created GRN ${grnNumber} for Sales Order ${order.orderNumber || order.orderReference}. Ready for Support processing.`,
+          link: '/support/orders',
+          sender: req.user?._id
+        });
+      } catch (notifyErr) {
+        console.warn('Logistics notify error:', notifyErr.message);
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: `GRN ${grnNumber} created successfully.${order ? ' Order moved to Support.' : ''}`,
+      data: grn
+    });
+  } catch (error) {
+    console.error('[Create Logistics GRN Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error creating Logistics GRN: ' + error.message });
+  }
+};
+
+module.exports.createLogisticsGRN = createLogisticsGRN;
+
+/**
+ * @desc    Get Logistics Import Inventory items
+ * @route   GET /api/logistics/import-inventory
+ */
+const getImportInventory = async (req, res) => {
+  try {
+    const { search, status } = req.query;
+    const query = {
+      $or: [
+        { category: 'Imported Goods' },
+        { location: { $regex: 'Logistics|Import', $options: 'i' } }
+      ]
+    };
+
+    if (status && status !== 'All') {
+      query.status = status;
+    }
+
+    if (search && search.trim()) {
+      const term = search.trim();
+      const regex = { $regex: term, $options: 'i' };
+      query.$and = [
+        { $or: query.$or },
+        {
+          $or: [
+            { name: regex },
+            { sku: regex },
+            { supplierName: regex },
+            { supplierPoNumber: regex },
+            { orderReference: regex },
+            { description: regex },
+            { location: regex }
+          ]
+        }
+      ];
+      delete query.$or;
+    }
+
+    const items = await InventoryItem.find(query).sort({ updatedAt: -1 }).lean();
+
+    const totalQty = items.reduce((sum, i) => sum + (i.quantityOnHand || 0), 0);
+    const totalValue = items.reduce((sum, i) => sum + ((i.quantityOnHand || 0) * (i.unitPrice || 0)), 0);
+    const lowStockCount = items.filter(i => i.status === 'Low Stock' || i.status === 'Out of Stock').length;
+
+    return res.status(200).json({
+      success: true,
+      count: items.length,
+      stats: {
+        totalItems: items.length,
+        totalQuantityOnHand: totalQty,
+        totalInventoryValue: totalValue,
+        lowStockItems: lowStockCount
+      },
+      data: items
+    });
+  } catch (error) {
+    console.error('[Get Import Inventory Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error loading import inventory.' });
+  }
+};
+
+/**
+ * @desc    Create a new Import Inventory item in Logistics
+ * @route   POST /api/logistics/import-inventory
+ */
+const createImportInventoryItem = async (req, res) => {
+  try {
+    const {
+      name,
+      sku,
+      unit,
+      quantityOnHand,
+      minStockLevel,
+      unitPrice,
+      location,
+      description,
+      supplierName,
+      supplierPoNumber,
+      orderReference
+    } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Item name is required.' });
+    }
+
+    const item = await InventoryItem.create({
+      name: name.trim(),
+      sku: sku ? sku.trim() : `IMP-${Date.now().toString().slice(-6)}`,
+      category: 'Imported Goods',
+      unit: unit || 'pcs',
+      quantityOnHand: Number(quantityOnHand) || 0,
+      reservedQuantity: 0,
+      minStockLevel: Number(minStockLevel) || 5,
+      unitPrice: Number(unitPrice) || 0,
+      location: location || 'Logistics / Import WH',
+      description: description || '',
+      supplierName: supplierName || '',
+      supplierPoNumber: supplierPoNumber || '',
+      orderReference: orderReference || ''
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Import inventory item "${item.name}" created successfully.`,
+      data: item
+    });
+  } catch (error) {
+    console.error('[Create Import Inventory Item Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error creating import inventory item.' });
+  }
+};
+
+/**
+ * @desc    Update an Import Inventory item in Logistics
+ * @route   PATCH /api/logistics/import-inventory/:id
+ */
+const updateImportInventoryItem = async (req, res) => {
+  try {
+    const item = await InventoryItem.findById(req.params.id);
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+    }
+
+    const allowed = ['name', 'sku', 'unit', 'quantityOnHand', 'reservedQuantity', 'minStockLevel', 'unitPrice', 'location', 'description', 'supplierName', 'supplierPoNumber', 'orderReference'];
+    allowed.forEach(field => {
+      if (req.body[field] !== undefined) {
+        if (field === 'quantityOnHand' || field === 'reservedQuantity' || field === 'minStockLevel' || field === 'unitPrice') {
+          item[field] = Number(req.body[field]);
+        } else {
+          item[field] = req.body[field];
+        }
+      }
+    });
+
+    await item.save();
+
+    return res.status(200).json({
+      success: true,
+      message: `Import inventory item "${item.name}" updated successfully.`,
+      data: item
+    });
+  } catch (error) {
+    console.error('[Update Import Inventory Item Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating import inventory item.' });
+  }
+};
+
+module.exports.getImportInventory = getImportInventory;
+module.exports.createImportInventoryItem = createImportInventoryItem;
+module.exports.updateImportInventoryItem = updateImportInventoryItem;

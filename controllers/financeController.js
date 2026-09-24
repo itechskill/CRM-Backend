@@ -4,6 +4,7 @@ const Payroll = require('../models/Payroll');
 const User = require('../models/User');
 const MaintenanceCharge = require('../models/MaintenanceCharge');
 const InventoryItem = require('../models/InventoryItem');
+const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 
 // INVOICES API
 const getInvoices = async (req, res) => {
@@ -63,12 +64,37 @@ const createInvoice = async (req, res) => {
 
 const updateInvoice = async (req, res) => {
   try {
-    const invoice = await Invoice.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    const invoice = await Invoice.findById(req.params.id);
     if (!invoice) {
       return res.status(404).json({ success: false, message: 'Invoice not found.' });
     }
+
+    const changes = {};
+    Object.keys(req.body).forEach(field => {
+      if (req.body[field] !== undefined && hasFieldValueChanged(invoice[field], req.body[field])) {
+        changes[field] = { old: invoice[field], new: req.body[field] };
+      }
+    });
+
+    const docType = invoice.status === 'Draft' || invoice.type === 'Draft' ? 'Draft Invoice' : 'Final Invoice';
+    const check = await verifyAndConsumeCEOPermission({
+      documentType: docType,
+      documentId: invoice._id,
+      documentNumber: invoice.invoiceNumber,
+      requestingUser: req.user,
+      changes
+    });
+
+    if (!check.authorized) {
+      return res.status(403).json({ success: false, message: check.message });
+    }
+
+    Object.assign(invoice, req.body);
+    await invoice.save();
+
     return res.status(200).json({ success: true, message: 'Invoice updated successfully.', data: invoice });
   } catch (error) {
+    console.error('[Finance Update Invoice Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error updating invoice.' });
   }
 };
