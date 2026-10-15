@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 require('dotenv').config();
 const User = require('./models/User');
 
-mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://fortlinecrm:R8K5rGqH6vN2yP9b@cluster0.sxeideq.mongodb.net/fortlinecrm?retryWrites=true&w=majority', {
+mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true
 }).then(async () => {

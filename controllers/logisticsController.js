@@ -169,6 +169,7 @@ const getShipments = async (req, res) => {
       const searchOr = [
         { shipmentId: regex },
         { trackingNumber: regex },
+        { awbNumber: regex },
         { salesOrderNumber: regex },
         { deliveryNoteNumber: regex },
         { clientName: regex },
@@ -177,6 +178,7 @@ const getShipments = async (req, res) => {
         { supplierPoNumber: regex },
         { flightNumber: regex },
         { carrier: regex },
+        { transitLocation: regex },
         { status: regex },
         { description: regex }
       ];
@@ -194,7 +196,7 @@ const getShipments = async (req, res) => {
 
     const shipments = await Shipment.find(query)
       .sort(sortOption)
-      .populate('salesOrder', 'orderReference orderNumber clientName netAmount totalAmount fileType')
+      .populate('salesOrder', 'orderReference orderNumber clientName netAmount totalAmount fileType workflowStatus currentDepartment departmentResponsible')
       .populate('salesPerson', 'fullName email phone')
       .populate('receivedInOfficeBy', 'fullName email')
       .lean();
@@ -257,9 +259,11 @@ const createShipment = async (req, res) => {
       carrier,
       flightNumber,
       trackingNumber,
+      awbNumber,
       shippingMethod,
       departureLocation,
       arrivalLocation,
+      transitLocation,
       etd,
       eta,
       description,
@@ -304,9 +308,11 @@ const createShipment = async (req, res) => {
       carrier: carrier || '',
       flightNumber: flightNumber || '',
       trackingNumber: trackingNumber || '',
+      awbNumber: awbNumber || '',
       shippingMethod: shippingMethod || 'Air Freight',
       departureLocation: departureLocation || '',
       arrivalLocation: arrivalLocation || 'Karachi, Pakistan',
+      transitLocation: transitLocation || '',
       etd: etd ? new Date(etd) : null,
       eta: eta ? new Date(eta) : null,
       description: description || order.productSummary || '',
@@ -386,8 +392,10 @@ const updateShipmentTracking = async (req, res) => {
       carrier,
       shippingMethod,
       trackingNumber,
+      awbNumber,
       departureLocation,
       arrivalLocation,
+      transitLocation,
       description,
       referenceDocs,
       remarks,
@@ -405,8 +413,10 @@ const updateShipmentTracking = async (req, res) => {
     if (carrier !== undefined) shipment.carrier = carrier.trim();
     if (shippingMethod !== undefined) shipment.shippingMethod = shippingMethod;
     if (trackingNumber !== undefined) shipment.trackingNumber = trackingNumber.trim();
+    if (awbNumber !== undefined) shipment.awbNumber = awbNumber.trim();
     if (departureLocation !== undefined) shipment.departureLocation = departureLocation.trim();
     if (arrivalLocation !== undefined) shipment.arrivalLocation = arrivalLocation.trim();
+    if (transitLocation !== undefined) shipment.transitLocation = transitLocation.trim();
     if (description !== undefined) shipment.description = description.trim();
     if (referenceDocs !== undefined) shipment.referenceDocs = referenceDocs.trim();
     if (remarks !== undefined) shipment.remarks = remarks.trim();
@@ -479,6 +489,73 @@ const updateShipmentTracking = async (req, res) => {
 };
 
 /**
+ * @desc    Record the next ordered customs-clearance state for a Blue shipment
+ * @route   POST /api/logistics/shipments/:id/customs-clearance
+ */
+const updateCustomsClearance = async (req, res) => {
+  try {
+    const shipment = await Shipment.findById(req.params.id);
+    if (!shipment) {
+      return res.status(404).json({ success: false, message: 'Shipment not found.' });
+    }
+    if (shipment.fileType !== 'Blue') {
+      return res.status(400).json({ success: false, message: 'Customs clearance states apply only to Blue file shipments.' });
+    }
+    if (shipment.receivedInOffice || shipment.customsClearanceStatus === 'Received in Office') {
+      return res.status(400).json({ success: false, message: 'This shipment has already been received in office.' });
+    }
+
+    const state = req.body.state;
+    const orderedStates = ['GD Filed', 'Assessment in Process', 'Duty in Process', 'Duty Paid'];
+    const allowedStates = ['GD Not Filed', ...orderedStates];
+    if (!allowedStates.includes(state)) {
+      return res.status(400).json({ success: false, message: 'A valid customs-clearance state is required.' });
+    }
+
+    const currentState = shipment.customsClearanceStatus || '';
+    if (state === 'GD Not Filed') {
+      if (orderedStates.includes(currentState)) {
+        return res.status(400).json({ success: false, message: 'GD filing has already been completed for this shipment.' });
+      }
+      if (currentState === 'GD Not Filed') {
+        return res.status(200).json({ success: true, message: 'GD Not Filed is already recorded.', data: shipment });
+      }
+    } else {
+      const currentIndex = orderedStates.indexOf(currentState);
+      const requestedIndex = orderedStates.indexOf(state);
+      if (requestedIndex <= currentIndex) {
+        return res.status(200).json({ success: true, message: `${state} is already complete.`, data: shipment });
+      }
+      if (requestedIndex !== currentIndex + 1) {
+        return res.status(400).json({ success: false, message: `Complete ${orderedStates[currentIndex + 1]} before ${state}.` });
+      }
+    }
+
+    shipment.customsClearanceStatus = state;
+    shipment.trackingHistory.push({
+      status: state,
+      location: shipment.transitLocation || shipment.arrivalLocation || '',
+      notes: req.body.notes || `Customs clearance updated to ${state}.`,
+      updatedBy: req.user._id,
+      updatedByName: req.user.fullName,
+      timestamp: new Date()
+    });
+    await shipment.save();
+
+    return res.status(200).json({
+      success: true,
+      message: state === 'GD Not Filed'
+        ? 'GD Not Filed recorded. Assessment remains locked until GD is filed.'
+        : `${state} recorded successfully.`,
+      data: shipment
+    });
+  } catch (error) {
+    console.error('[Update Customs Clearance Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating customs clearance.' });
+  }
+};
+
+/**
  * @desc    Confirm Shipment Received in Office (Logistics Department action)
  * @route   POST /api/logistics/shipments/:id/receive-in-office
  */
@@ -489,46 +566,58 @@ const receiveShipmentInOffice = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Shipment not found.' });
     }
 
-    if (shipment.receivedInOffice) {
+    const order = await SalesOrder.findById(shipment.salesOrder);
+    const alreadyReceived = shipment.receivedInOffice || shipment.status === 'Received in Office';
+    const isLegacyPendingGRN = alreadyReceived && order?.workflowStatus === 'Pending Logistics GRN';
+
+    if (alreadyReceived && !isLegacyPendingGRN) {
       return res.status(400).json({
         success: false,
         message: `Shipment ${shipment.shipmentId} is already marked as received in office.`
       });
     }
+    if (!alreadyReceived && shipment.customsClearanceStatus !== 'Duty Paid') {
+      return res.status(400).json({
+        success: false,
+        message: 'Complete Duty Paid before confirming Received in Office.'
+      });
+    }
 
     const { receivedDate, remarks } = req.body;
-    const rDate = receivedDate ? new Date(receivedDate) : new Date();
+    if (!alreadyReceived) {
+      const rDate = receivedDate ? new Date(receivedDate) : new Date();
 
-    shipment.receivedInOffice = true;
-    shipment.receivedInOfficeDate = rDate;
-    shipment.receivedInOfficeBy = req.user._id;
-    shipment.receivedInOfficeByName = req.user.fullName;
-    shipment.status = 'Received in Office';
-    if (remarks) shipment.remarks = (shipment.remarks ? shipment.remarks + ' | ' : '') + remarks;
+      shipment.receivedInOffice = true;
+      shipment.receivedInOfficeDate = rDate;
+      shipment.receivedInOfficeBy = req.user._id;
+      shipment.receivedInOfficeByName = req.user.fullName;
+      shipment.status = 'Received in Office';
+      shipment.customsClearanceStatus = 'Received in Office';
+      if (remarks) shipment.remarks = (shipment.remarks ? shipment.remarks + ' | ' : '') + remarks;
 
-    shipment.trackingHistory.push({
-      status: 'Received in Office',
-      location: 'Fortline Office',
-      notes: remarks || `Confirmed received in office by ${req.user.fullName}.`,
-      updatedBy: req.user._id,
-      updatedByName: req.user.fullName,
-      timestamp: new Date()
-    });
+      shipment.trackingHistory.push({
+        status: 'Received in Office',
+        location: 'Fortline Office',
+        notes: remarks || `Confirmed received in office by ${req.user.fullName}.`,
+        updatedBy: req.user._id,
+        updatedByName: req.user.fullName,
+        timestamp: new Date()
+      });
 
-    await shipment.save();
+      await shipment.save();
+    }
 
-    // Update linked Sales Order: advance workflow to Support!
-    const order = await SalesOrder.findById(shipment.salesOrder);
+    // Update linked Sales Order: hand the received shipment directly to Support.
     if (order) {
       const prevStatus = order.workflowStatus;
-      order.workflowStatus = 'Pending Logistics GRN';
-      order.status = 'Pending Logistics GRN';
-      order.departmentResponsible = 'Logistics'; // Keep in logistics for GRN
-      order.currentDepartment = 'Logistics';
-      order.currentStatus = 'PENDING_LOGISTICS_GRN';
+      order.workflowStatus = 'Goods Received in Office';
+      order.status = 'Goods Received in Office';
+      order.departmentResponsible = 'Support';
+      order.currentDepartment = 'Support';
+      order.currentStatus = 'GOODS_RECEIVED_IN_OFFICE';
       order.previousDepartment = 'Logistics';
       order.previousStatus = prevStatus;
-      order.lastAction = `Shipment ${shipment.shipmentId} confirmed received in office by Logistics`;
+      order.lastAction = `Shipment ${shipment.shipmentId} received in office and handed to Support`;
       order.lastActionBy = req.user._id;
       order.lastActionByName = req.user.fullName;
       order.lastActionAt = new Date();
@@ -546,20 +635,19 @@ const receiveShipmentInOffice = async (req, res) => {
         user: req.user._id,
         userName: req.user.fullName,
         department: 'Logistics',
-        action: 'Shipment Received in Office',
+        action: 'Shipment Received in Office and Sent to Support',
         previousStatus: prevStatus,
-        newStatus: 'Pending Logistics GRN',
+        newStatus: 'Goods Received in Office',
         timestamp: new Date(),
-        notes: `Shipment ${shipment.shipmentId} confirmed received in office by ${req.user.fullName}. Awaiting GRN creation.`
+        notes: `Shipment ${shipment.shipmentId} confirmed received in office by ${req.user.fullName} and handed directly to Support for Inventory IN and Delivery Note creation.`
       });
       await order.save();
 
-      // Notify Logistics team that goods arrived and are ready for GRN
-      await notifyRoleHelper(['logistics'], {
+      await notifyRoleHelper(['support', 'operations', 'admin', 'ceo'], {
         type: 'order',
-        title: 'Shipment Received — Awaiting GRN',
-        message: `Shipment ${shipment.shipmentId} for Sales Order ${order.orderNumber || order.orderReference} is received. Please create GRN.`,
-        link: '/logistics/grn',
+        title: 'Blue File Received - Ready for Support',
+        message: `Shipment ${shipment.shipmentId} for Sales Order ${order.orderNumber || order.orderReference} is received and ready for Support Inventory IN and Delivery Note creation.`,
+        link: '/support/orders',
         sender: req.user._id
       });
 
@@ -578,7 +666,7 @@ const receiveShipmentInOffice = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: `Shipment ${shipment.shipmentId} confirmed as received in office. Please create GRN.`,
+      message: `Shipment ${shipment.shipmentId} confirmed as received in office and moved to Support.`,
       data: shipment
     });
   } catch (error) {
@@ -648,6 +736,7 @@ module.exports = {
   getShipmentById,
   createShipment,
   updateShipmentTracking,
+  updateCustomsClearance,
   receiveShipmentInOffice,
   getIncomingOrders,
   getLogisticsDeliveryNotes
@@ -685,11 +774,7 @@ const getPendingGRNs = async (req, res) => {
     const orders = await SalesOrder.find({
       fileType: 'Blue',
       status: { $nin: ['Delivered', 'Cancelled', 'Closed'] },
-      $or: [
-        { departmentResponsible: 'Logistics' },
-        { currentDepartment: 'Logistics' },
-        { workflowStatus: { $in: ['Shipment In Transit', 'Customs Clearance', 'Pending Logistics GRN', 'Shipment Received in Office', 'Order Placed with Supplier'] } }
-      ]
+      workflowStatus: 'Pending Logistics GRN'
     }).populate('salesPerson', 'fullName email').sort({ createdAt: -1 }).lean();
 
     return res.status(200).json({ success: true, count: orders.length, data: orders, orders });
@@ -753,52 +838,14 @@ const createLogisticsGRN = async (req, res) => {
       createdByName: req.user?.fullName || 'Logistics User'
     });
 
-    // Auto add received items into Import Inventory
-    try {
-      for (const it of formattedItems) {
-        const qty = Number(it.quantityReceived || it.receivedQty || it.orderedQty) || 1;
-        const itemName = (it.productName || 'Imported Product').trim();
-
-        let itemDoc = await InventoryItem.findOne({
-          name: { $regex: new RegExp(`^${itemName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') },
-          $or: [{ category: 'Imported Goods' }, { location: { $regex: 'Logistics|Import', $options: 'i' } }]
-        });
-
-        if (itemDoc) {
-          itemDoc.quantityOnHand = (itemDoc.quantityOnHand || 0) + qty;
-          if (order) itemDoc.orderReference = order.orderNumber || order.orderReference;
-          if (supplierName) itemDoc.supplierName = supplierName;
-          if (supplierPONumber) itemDoc.supplierPoNumber = supplierPONumber;
-          await itemDoc.save();
-        } else {
-          await InventoryItem.create({
-            name: itemName,
-            sku: supplierPONumber ? `IMP-${supplierPONumber}` : `IMP-${Date.now().toString().slice(-6)}`,
-            category: 'Imported Goods',
-            unit: 'pcs',
-            quantityOnHand: qty,
-            reservedQuantity: 0,
-            unitPrice: 0,
-            location: 'Logistics / Import WH',
-            description: remarks || `Imported via GRN ${grnNumber}`,
-            supplierName: supplierName || (order ? order.supplierName : ''),
-            supplierPoNumber: supplierPONumber || '',
-            orderReference: order ? (order.orderNumber || order.orderReference) : ''
-          });
-        }
-      }
-    } catch (invErr) {
-      console.warn('[GRN Auto Import Inventory Sync Error]:', invErr.message);
-    }
-
-    // Advance Sales Order to Support if order exists
+    // Legacy compatibility: a GRN may still be recorded, but Logistics never updates inventory.
     if (order) {
       const prevStatus = order.workflowStatus;
-      order.workflowStatus = 'Shipment Received in Office';
-      order.status = 'Shipment Received in Office';
+      order.workflowStatus = 'Goods Received in Office';
+      order.status = 'Goods Received in Office';
       order.departmentResponsible = 'Support';
       order.currentDepartment = 'Support';
-      order.currentStatus = 'SHIPMENT_RECEIVED_IN_OFFICE';
+      order.currentStatus = 'GOODS_RECEIVED_IN_OFFICE';
       order.previousDepartment = 'Logistics';
       order.previousStatus = prevStatus;
       order.lastAction = `Logistics GRN ${grnNumber} Created`;
@@ -812,7 +859,7 @@ const createLogisticsGRN = async (req, res) => {
         department: 'Logistics',
         action: 'Logistics GRN Created',
         previousStatus: prevStatus,
-        newStatus: 'Shipment Received in Office',
+        newStatus: 'Goods Received in Office',
         timestamp: new Date(),
         notes: `Logistics GRN ${grnNumber} created. Order handed over to Support.`
       });
@@ -912,6 +959,15 @@ const getImportInventory = async (req, res) => {
  */
 const createImportInventoryItem = async (req, res) => {
   try {
+    const role = (req.user?.role || '').toLowerCase();
+    const department = (req.user?.department || '').toLowerCase();
+    if (role === 'logistics' || department.includes('logistics')) {
+      return res.status(403).json({
+        success: false,
+        message: 'Inventory updates are handled by the Support team.'
+      });
+    }
+
     const {
       name,
       sku,
@@ -963,6 +1019,15 @@ const createImportInventoryItem = async (req, res) => {
  */
 const updateImportInventoryItem = async (req, res) => {
   try {
+    const role = (req.user?.role || '').toLowerCase();
+    const department = (req.user?.department || '').toLowerCase();
+    if (role === 'logistics' || department.includes('logistics')) {
+      return res.status(403).json({
+        success: false,
+        message: 'Inventory updates are handled by the Support team.'
+      });
+    }
+
     const item = await InventoryItem.findById(req.params.id);
     if (!item) {
       return res.status(404).json({ success: false, message: 'Inventory item not found.' });

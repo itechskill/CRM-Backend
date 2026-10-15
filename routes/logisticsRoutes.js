@@ -6,6 +6,7 @@ const {
   getShipmentById,
   createShipment,
   updateShipmentTracking,
+  updateCustomsClearance,
   receiveShipmentInOffice,
   getIncomingOrders,
   getLogisticsDeliveryNotes,
@@ -39,6 +40,7 @@ router.route('/shipments/:id')
   .get(getShipmentById);
 
 router.patch('/shipments/:id/tracking', updateShipmentTracking);
+router.post('/shipments/:id/customs-clearance', updateCustomsClearance);
 router.post('/shipments/:id/receive-in-office', receiveShipmentInOffice);
 
 module.exports = router;

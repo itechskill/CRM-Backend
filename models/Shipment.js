@@ -116,6 +116,11 @@ const ShipmentSchema = new mongoose.Schema(
       trim: true,
       default: ''
     },
+    awbNumber: {
+      type: String,
+      trim: true,
+      default: ''
+    },
     departureLocation: {
       type: String,
       trim: true,
@@ -124,6 +129,16 @@ const ShipmentSchema = new mongoose.Schema(
     arrivalLocation: {
       type: String,
       trim: true,
+      default: ''
+    },
+    transitLocation: {
+      type: String,
+      trim: true,
+      default: ''
+    },
+    customsClearanceStatus: {
+      type: String,
+      enum: ['', 'GD Not Filed', 'GD Filed', 'Assessment in Process', 'Duty in Process', 'Duty Paid', 'Received in Office'],
       default: ''
     },
     description: {
