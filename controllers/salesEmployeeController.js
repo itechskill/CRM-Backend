@@ -48,6 +48,29 @@ const checkOwnership = (record, fields, userId, reqUser) => {
   });
 };
 
+const CUSTOMER_PO_ATTACHMENT_EXTENSION = /\.(pdf|xls|xlsx|png|jpe?g|webp|gif|bmp)$/i;
+const CUSTOMER_PO_ATTACHMENT_DATA_URL = /^data:(application\/pdf|application\/vnd\.ms-excel|application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet|image\/(png|jpeg|webp|gif|bmp));base64,/i;
+const CUSTOMER_PO_ATTACHMENT_MAX_SIZE = 3 * 1024 * 1024;
+const CUSTOMER_PO_ATTACHMENT_MESSAGE = 'Attach the Customer PO as a PDF, Excel file, or screenshot (maximum 3 MB) before continuing.';
+
+const getBase64DataSize = (dataUrl) => {
+  const base64 = String(dataUrl || '').split(',')[1] || '';
+  const padding = base64.endsWith('==') ? 2 : (base64.endsWith('=') ? 1 : 0);
+  return Math.floor((base64.length * 3) / 4) - padding;
+};
+
+const hasValidCustomerPOAttachment = (po) => {
+  const uploadedDocument = String(po?.uploadedDocument || '').trim();
+  const documentName = String(po?.documentName || '').trim();
+  return Boolean(
+    uploadedDocument &&
+    documentName &&
+    CUSTOMER_PO_ATTACHMENT_EXTENSION.test(documentName) &&
+    CUSTOMER_PO_ATTACHMENT_DATA_URL.test(uploadedDocument) &&
+    getBase64DataSize(uploadedDocument) <= CUSTOMER_PO_ATTACHMENT_MAX_SIZE
+  );
+};
+
 // ══════════════════════════════════════════════
 // ══════════════════════════════════════════════
 // DASHBOARD STATS & FINANCIALS FOR SALES TEAM MEMBER
@@ -959,6 +982,9 @@ const convertQuotationToCustomerPO = async (req, res) => {
     }
 
     const { poNumber, poDate, notes, uploadedDocument, documentName } = req.body;
+    if (!hasValidCustomerPOAttachment({ uploadedDocument, documentName })) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
     const netAmt = Number(quotation.netAmount) || Number(quotation.totalAmount) || 0;
 
     const po = await CustomerPO.create({
@@ -1011,6 +1037,9 @@ const convertCustomerPOToProductFile = async (req, res) => {
     const po = await CustomerPO.findById(req.params.id);
     if (!po) {
       return res.status(404).json({ success: false, message: 'Customer PO not found.' });
+    }
+    if (!hasValidCustomerPOAttachment(po)) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
 
     const { fileNumber, fileType, products, notes } = req.body;
@@ -1082,6 +1111,14 @@ const convertProductFileToSalesOrder = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Product file not found.' });
     }
 
+    if (!file.customerPOId) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
+    const customerPO = await CustomerPO.findById(file.customerPOId);
+    if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
+
     const { orderReference, clientAddress, clientEmail, clientPhone, items, totalAmount, discount, tax, netAmount, deliveryDate, notes, stockStatus } = req.body;
 
     // Check overdue balance of customer
@@ -1150,8 +1187,8 @@ const convertProductFileToSalesOrder = async (req, res) => {
       orderDate: new Date(),
       notes: notes || file.notes || '',
       quotationId: file.quotationId || (quoteRef ? quoteRef._id : null),
-      customerPOId: file.customerPOId || null,
-      customerPONumber: file.customerPONumber || '',
+      customerPOId: customerPO._id,
+      customerPONumber: customerPO.poNumber || file.customerPONumber || '',
       productFileId: file._id,
       salesPerson: req.user._id,
       createdBy: req.user._id,
@@ -1234,6 +1271,14 @@ const convertQuotationToSalesOrder = async (req, res) => {
       });
     }
 
+    if (!quotation.customerPOId) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
+    const customerPO = await CustomerPO.findById(quotation.customerPOId);
+    if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
+
     const { deliveryDate, notes, stockStatus } = req.body;
 
     // Check overdue balance of customer using finalized invoices only
@@ -1286,7 +1331,8 @@ const convertQuotationToSalesOrder = async (req, res) => {
       notes: notes || quotation.notes || '',
       quotationId: quotation._id,
       leadId: quotation.leadId || null,
-      customerPOId: quotation.customerPOId || null,
+      customerPOId: customerPO._id,
+      customerPONumber: customerPO.poNumber || '',
       salesPerson: req.user._id,
       createdBy: req.user._id,
       workflowHistory: [
@@ -1647,7 +1693,21 @@ const getMyOrders = async (req, res) => {
       .populate('deliveryNoteId', 'deliveryNumber deliveryNoteNumber status invoiced')
       .populate('invoiceId', 'invoiceNumber amount status isDraft')
       .sort({ creationDate: -1, createdAt: -1 });
-    return res.status(200).json({ success: true, count: orders.length, data: orders });
+
+    let responseOrders = orders;
+    const isSupportUser = req.user.role === 'support' || (req.user.department || '').toLowerCase().includes('support');
+    if (isSupportUser) {
+      const shipments = await Shipment.find({
+        salesOrder: { $in: orders.filter(order => order.fileType === 'Blue').map(order => order._id) }
+      }).select('salesOrder shipmentId awbNumber trackingNumber carrier flightNumber shippingMethod departureLocation transitLocation arrivalLocation etd eta actualDepartureDate actualArrivalDate status customsClearanceStatus receivedInOffice receivedInOfficeDate').lean();
+      const shipmentsByOrder = new Map(shipments.map(shipment => [shipment.salesOrder.toString(), shipment]));
+      responseOrders = orders.map(order => ({
+        ...order.toObject(),
+        shipmentDetails: shipmentsByOrder.get(order._id.toString()) || null
+      }));
+    }
+
+    return res.status(200).json({ success: true, count: orders.length, data: responseOrders });
   } catch (error) {
     console.error('[Get Orders Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching orders.' });
@@ -1688,6 +1748,14 @@ const createMyOrder = async (req, res) => {
     } = req.body;
 
     if (!clientName) return res.status(400).json({ success: false, message: 'Customer/Client name is required.' });
+
+    if (!customerPOId || !mongoose.Types.ObjectId.isValid(customerPOId)) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
+    const customerPO = await CustomerPO.findById(customerPOId);
+    if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
 
     // Check customer overdue balance
     const overdueInfo = await calculateCustomerOverdue(clientName);
@@ -1733,8 +1801,8 @@ const createMyOrder = async (req, res) => {
       orderDate: creationDate ? new Date(creationDate) : new Date(),
       notes: notes || '',
       quotationId: quotationId && mongoose.Types.ObjectId.isValid(quotationId) ? quotationId : null,
-      customerPOId: customerPOId && mongoose.Types.ObjectId.isValid(customerPOId) ? customerPOId : null,
-      customerPONumber: customerPONumber || '',
+      customerPOId: customerPO._id,
+      customerPONumber: customerPO.poNumber || customerPONumber || '',
       productFileId: productFileId && mongoose.Types.ObjectId.isValid(productFileId) ? productFileId : null,
       leadId: leadId && mongoose.Types.ObjectId.isValid(leadId) ? leadId : null,
       salesPerson: req.user._id,
@@ -1869,30 +1937,7 @@ const financeReviewSalesOrder = async (req, res) => {
         : (order.fileType === 'Blue' ? 'Blue' : 'Green');
       order.fileType = resolvedFileType;
 
-      // Issue/prepare Supplier PO
       const isBlue = resolvedFileType === 'Blue';
-      const supplierType = isBlue ? 'International' : 'Local';
-      const defaultSupplier = isBlue ? 'International Supplier' : 'Local Supplier';
-      const defaultCountry = isBlue ? (req.body.supplierCountry || 'China') : 'Pakistan';
-      const poNum = req.body.supplierPoNumber || `${isBlue ? 'IPO' : 'LPO'}-${Date.now().toString().slice(-6)}`;
-
-      order.supplierPO = {
-        poNumber: poNum,
-        poType: supplierType,
-        supplierName: req.body.supplierName || order.supplierPO?.supplierName || defaultSupplier,
-        supplierCountry: req.body.supplierCountry || order.supplierPO?.supplierCountry || defaultCountry,
-        supplierEmail: req.body.supplierEmail || order.supplierPO?.supplierEmail || '',
-        supplierPhone: req.body.supplierPhone || order.supplierPO?.supplierPhone || '',
-        issueDate: new Date(),
-        status: 'Issued',
-        items: order.items || [],
-        totalAmount: Number(req.body.supplierPoAmount) || order.netAmount || order.totalAmount || 0,
-        currency: 'PKR',
-        notes: req.body.supplierNotes || (isBlue ? 'Imported from outside Pakistan' : 'Local / Normal Order'),
-        issuedBy: req.user._id,
-        issuedByName: req.user.fullName,
-        issuedAt: new Date()
-      };
 
       if (isBlue) {
         // BLUE FILE FLOW: Routes to Global Purchaser Portal!
@@ -1967,7 +2012,7 @@ const financeReviewSalesOrder = async (req, res) => {
 
       await logSalesActivity({
         type: `Finance Approved (${resolvedFileType} File)`,
-        description: `Sales Order ${order.orderNumber || order.orderReference} verified All Clear by Finance (${req.user.fullName}) — ${resolvedFileType} File PO #${poNum}`,
+        description: `Sales Order ${order.orderNumber || order.orderReference} verified All Clear by Finance (${req.user.fullName}) - ${resolvedFileType} File routed to ${isBlue ? 'Global Purchaser' : 'Local Purchaser'}`,
         relatedModel: 'SalesOrder',
         relatedId: order._id,
         performedBy: req.user._id
@@ -1978,7 +2023,7 @@ const financeReviewSalesOrder = async (req, res) => {
           recipient: order.salesPerson || order.createdBy,
           sender: req.user._id,
           title: `Sales Order Approved: ${resolvedFileType} File`,
-          message: `Finance approved Sales Order ${order.orderNumber || order.orderReference} (${resolvedFileType} File). PO #${poNum} issued.`,
+          message: `Finance approved Sales Order ${order.orderNumber || order.orderReference} (${resolvedFileType} File). Routed to ${isBlue ? 'Global Purchaser' : 'Local Purchaser'} for Supplier PO creation.`,
           type: 'finance',
           link: '/employee/sales/orders'
         });
@@ -2186,18 +2231,6 @@ const checkOrderStock = async (req, res) => {
         }
       }
 
-      // If not in inventory yet, auto-register item with positive baseline warehouse stock
-      if (!inv && desc) {
-        inv = await InventoryItem.create({
-          name: desc,
-          sku: 'SKU-' + Math.floor(1000 + Math.random() * 9000),
-          category: 'Sales Inventory',
-          quantityOnHand: Math.max(requiredQty * 2, 25),
-          reservedQuantity: 0,
-          unitPrice: Number(item.unitPrice) || 0
-        });
-      }
-
       const onHand = inv ? (inv.quantityOnHand || 0) : 0;
       const reserved = inv ? (inv.reservedQuantity || 0) : 0;
       const available = Math.max(0, onHand - reserved);
@@ -2214,7 +2247,7 @@ const checkOrderStock = async (req, res) => {
         reservedQuantity: reserved,
         availableQty: available,
         unit: inv?.unit || 'pcs',
-        status: isItemInStock ? 'In Stock' : 'Insufficient Stock',
+        status: !inv ? 'Missing from Inventory' : (isItemInStock ? 'In Stock' : 'Insufficient Stock'),
         shortageQty: Math.max(0, requiredQty - available),
         inventoryItemId: inv?._id || null
       });
@@ -2250,10 +2283,12 @@ const checkOrderStock = async (req, res) => {
  */
 const getAvailableOrdersForDelivery = async (req, res) => {
   try {
-    // Support Pending Queue: Sales Orders sent to support without Delivery Notes
+    // Support queue: goods must be physically received in office before Delivery Note creation.
     const orders = await SalesOrder.find({
-      workflowStatus: { $in: ['Sent to Support', 'Support Reviewing'] },
-      $or: [{ deliveryNoteId: { $exists: false } }, { deliveryNoteId: null }]
+      goodsReceivedInOffice: { $ne: null },
+      'goodsReceivedInOffice.received': true,
+      $or: [{ currentDepartment: 'Support' }, { departmentResponsible: 'Support' }],
+      deliveryNoteId: null
     }).sort({ createdAt: -1 });
 
     return res.status(200).json({ success: true, count: orders.length, data: orders });
@@ -2285,7 +2320,7 @@ const getMyDeliveryNotes = async (req, res) => {
         : { $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }] };
     }
     const notes = await DeliveryNote.find(filter)
-      .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount items clientEmail clientPhone clientAddress fileNo fileType salePerson')
+      .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount discount tax items clientEmail clientPhone clientAddress fileNo fileType salePerson')
       .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: notes.length, data: notes });
   } catch (error) {
@@ -2332,42 +2367,63 @@ const createMyDeliveryNote = async (req, res) => {
     let resolvedShipmentId = null;
     let resolvedShipmentNum = '';
 
-    if (salesOrderId) {
-      const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
-      if (parentSo) {
-        if (parentSo.isOverdueBlocked) {
-          return res.status(400).json({
-            success: false,
-            message: `Cannot create Delivery Note: Sales Order ${parentSo.orderNumber || parentSo.orderReference} is on Finance HOLD due to overdue customer balance.`
-          });
-        }
-        resolvedSalesPersonId = parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
-        resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || (parentSo.salesPerson && parentSo.salesPerson.fullName) || '';
-        resolvedFileType = parentSo.fileType || resolvedFileType;
-        resolvedSupplierPoNum = parentSo.supplierPO?.poNumber || resolvedSupplierPoNum;
-        resolvedBlNum = parentSo.blNumber || resolvedBlNum;
-        resolvedShipmentId = parentSo.shipmentId || null;
-        resolvedShipmentNum = parentSo.shipmentNumber || '';
+    if (!salesOrderId || !mongoose.Types.ObjectId.isValid(salesOrderId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid Sales Order in the Support stage is required to create a Delivery Note.'
+      });
+    }
 
-        if (dnItems.length === 0 && parentSo.items && parentSo.items.length > 0) {
-          dnItems = parentSo.items.map(it => ({
-            product: it.description || 'Delivered Product',
-            description: it.description || '',
-            demand: Number(it.quantity) || 1,
-            quantity: Number(it.quantity) || 1,
-            unit: 'Units',
-            availability: 'Available',
-            totalOrderedQty: Number(it.quantity) || 1
-          }));
-        }
-      }
+    const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
+    if (!parentSo) {
+      return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+    if (parentSo.isOverdueBlocked) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot create Delivery Note: Sales Order ${parentSo.orderNumber || parentSo.orderReference} is on Finance HOLD due to overdue customer balance.`
+      });
+    }
+
+    const isInSupport = parentSo.currentDepartment === 'Support' || parentSo.departmentResponsible === 'Support';
+    if (!isInSupport || parentSo.goodsReceivedInOffice?.received !== true) {
+      return res.status(400).json({
+        success: false,
+        message: 'Delivery Notes can only be created after the Sales Order reaches Support and goods are received in office.'
+      });
+    }
+    if (parentSo.deliveryNoteId) {
+      return res.status(400).json({
+        success: false,
+        message: `A Delivery Note already exists for Sales Order ${parentSo.orderNumber || parentSo.orderReference}.`
+      });
+    }
+
+    resolvedSalesPersonId = parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
+    resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || (parentSo.salesPerson && parentSo.salesPerson.fullName) || '';
+    resolvedFileType = parentSo.fileType || resolvedFileType;
+    resolvedSupplierPoNum = parentSo.supplierPO?.poNumber || resolvedSupplierPoNum;
+    resolvedBlNum = parentSo.blNumber || resolvedBlNum;
+    resolvedShipmentId = parentSo.shipmentId || null;
+    resolvedShipmentNum = parentSo.shipmentNumber || '';
+
+    if (dnItems.length === 0 && parentSo.items && parentSo.items.length > 0) {
+      dnItems = parentSo.items.map(it => ({
+        product: it.description || 'Delivered Product',
+        description: it.description || '',
+        demand: Number(it.quantity) || 1,
+        quantity: Number(it.quantity) || 1,
+        unit: 'Units',
+        availability: 'Available',
+        totalOrderedQty: Number(it.quantity) || 1
+      }));
     }
 
     const deliveryNote = await DeliveryNote.create({
-      salesOrder: salesOrderId || null,
-      salesOrderNumber: salesOrderNumber || '',
-      sourceDocument: sourceDocument || salesOrderNumber || '',
-      clientName: clientName || recipientName || '',
+      salesOrder: parentSo._id,
+      salesOrderNumber: parentSo.orderReference || parentSo.orderNumber || salesOrderNumber || '',
+      sourceDocument: sourceDocument || parentSo.orderReference || parentSo.orderNumber || salesOrderNumber || '',
+      clientName: parentSo.clientName || clientName || recipientName || '',
       recipientName: recipientName || clientName || '',
       recipientPhone: recipientPhone || '',
       deliveryAddress: deliveryAddress || '',
@@ -3213,6 +3269,9 @@ const createMyCustomerPO = async (req, res) => {
   try {
     const { customerName, quotationId, quotationNumber, poDate, amount, notes, uploadedDocument, documentName } = req.body;
     if (!customerName) return res.status(400).json({ success: false, message: 'Customer name is required.' });
+    if (!hasValidCustomerPOAttachment({ uploadedDocument, documentName })) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
 
     const po = await CustomerPO.create({
       customerName: customerName.trim(),
@@ -3267,6 +3326,9 @@ const updateMyCustomerPO = async (req, res) => {
 
     const allowedFields = ['customerName', 'quotationNumber', 'poDate', 'amount', 'notes', 'uploadedDocument', 'documentName', 'status'];
     allowedFields.forEach(field => { if (req.body[field] !== undefined) po[field] = req.body[field]; });
+    if ((req.body.uploadedDocument !== undefined || req.body.documentName !== undefined) && !hasValidCustomerPOAttachment(po)) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
     await po.save();
     return res.status(200).json({ success: true, message: 'Customer PO updated.', data: po });
   } catch (error) {
@@ -3335,14 +3397,19 @@ const createMyProductFile = async (req, res) => {
     const safeCustomerPOId = customerPOId && mongoose.Types.ObjectId.isValid(customerPOId) ? customerPOId : null;
     const safeSalesOrderId = salesOrderId && mongoose.Types.ObjectId.isValid(salesOrderId) ? salesOrderId : null;
 
+    const customerPO = safeCustomerPOId ? await CustomerPO.findById(safeCustomerPOId) : null;
+    if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
+      return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
+    }
+
     const pf = await ProductFile.create({
       fileNumber: fileNumber || '',
       fileType: fileType || 'Blue',
       customerName: customerName.trim(),
       quotationId: safeQuotationId,
       quotationNumber: quotationNumber || '',
-      customerPOId: safeCustomerPOId,
-      customerPONumber: customerPONumber || '',
+      customerPOId: customerPO._id,
+      customerPONumber: customerPO.poNumber || customerPONumber || '',
       salesOrderId: safeSalesOrderId,
       salesOrderNumber: salesOrderNumber || '',
       products: Array.isArray(products) ? products : [],

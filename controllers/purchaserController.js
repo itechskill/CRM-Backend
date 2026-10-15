@@ -809,8 +809,20 @@ exports.getPendingPurchaserOrders = async (req, res) => {
     const subDept = req.query.subDept || req.query.type || req.user.purchaserSubDept || 'Local';
     const deptRole = subDept === 'Global' ? 'Global Purchaser' : 'Local Purchaser';
     const statusQuery = subDept === 'Global'
-      ? ['Pending Global Procurement', 'In Logistics']
+      ? ['Pending Global Procurement']
       : ['Pending Local Procurement', 'Local Supplier PO Issued'];
+    const approvedFileFallback = subDept === 'Global'
+      ? {
+          fileType: 'Blue',
+          financeApprovedBy: { $ne: null },
+          currentDepartment: { $nin: ['Logistics', 'Support', 'Accounts', 'Completed'] },
+          workflowStatus: { $nin: ['In Logistics', 'Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'] }
+        }
+      : {
+          fileType: 'Green',
+          financeApprovedBy: { $ne: null },
+          workflowStatus: { $nin: ['Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'] }
+        };
 
     const orders = await SalesOrder.find({
       $or: [
@@ -818,7 +830,7 @@ exports.getPendingPurchaserOrders = async (req, res) => {
         { currentDepartment: deptRole },
         { workflowStatus: { $in: statusQuery } },
         { status: { $in: statusQuery } },
-        { fileType: subDept === 'Global' ? 'Blue' : 'Green', financeApprovedBy: { $ne: null }, workflowStatus: { $nin: ['Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'] } }
+        approvedFileFallback
       ]
     }).populate('salesPerson', 'fullName email').sort({ updatedAt: -1 });
 
@@ -937,27 +949,79 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
 
-    const InventoryItem = require('../models/InventoryItem');
-
-    // Deduct ordered quantity from inventory stock
-    for (const item of (order.items || [])) {
-      const targetName = (item.description || item.productName || '').trim().toLowerCase();
-      const targetCode = (item.productCode || item.sku || '').trim().toLowerCase();
-      const reqQty = Number(item.quantity) || 1;
-
-      if (targetName || targetCode) {
-        const inv = await InventoryItem.findOne({
-          $or: [
-            ...(targetName ? [{ name: new RegExp('^' + targetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') }] : []),
-            ...(targetCode ? [{ sku: new RegExp('^' + targetCode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') }] : [])
-          ]
-        });
-        if (inv) {
-          inv.quantityOnHand = Math.max(0, (inv.quantityOnHand || 0) - reqQty);
-          await inv.save();
-        }
-      }
+    const { supplierName, poNumber, paymentTerms, remarks, items, totalAmountPKR } = req.body;
+    const finalSupplierName = (supplierName || '').trim();
+    const finalPoNumber = (poNumber || '').trim();
+    if (!finalSupplierName || !finalPoNumber) {
+      return res.status(400).json({
+        success: false,
+        message: 'Supplier name and Local PO number are required before completing procurement.'
+      });
     }
+
+    const existingPO = await SupplierPO.findOne({ poNumber: finalPoNumber });
+    if (existingPO) {
+      return res.status(400).json({
+        success: false,
+        message: `Supplier PO #${finalPoNumber} already exists.`
+      });
+    }
+
+    let calculatedTotal = 0;
+    const poItems = ((Array.isArray(items) && items.length > 0) ? items : (order.items || [])).map(item => {
+      const quantity = Number(item.quantity) || 1;
+      const unitPrice = Number(item.unitPricePKR ?? item.unitPrice) || 0;
+      const totalAmount = Number(item.totalPricePKR ?? item.total) || (quantity * unitPrice);
+      calculatedTotal += totalAmount;
+      return {
+        productName: item.productName || item.description || 'Product Item',
+        description: item.description || '',
+        quantity,
+        unitPrice,
+        totalAmount
+      };
+    });
+    const poTotal = Number(totalAmountPKR ?? req.body.totalAmount) || calculatedTotal || Number(order.netAmount || order.totalAmount) || 0;
+    const issuedAt = new Date();
+
+    await SupplierPO.create({
+      poNumber: finalPoNumber,
+      supplierName: finalSupplierName,
+      supplierCountry: 'Pakistan',
+      poType: 'Local',
+      poDate: issuedAt,
+      paymentTerms: paymentTerms || '',
+      items: poItems,
+      totalAmount: poTotal,
+      salesOrderId: order._id,
+      salesOrderNumber: order.orderNumber || order.orderReference || '',
+      currency: 'PKR',
+      status: 'Issued',
+      notes: remarks || '',
+      createdBy: req.user._id,
+      createdByName: req.user.fullName
+    });
+
+    order.supplierPO = {
+      poNumber: finalPoNumber,
+      poType: 'Local',
+      supplierName: finalSupplierName,
+      supplierCountry: 'Pakistan',
+      issueDate: issuedAt,
+      status: 'Issued',
+      items: poItems.map(item => ({
+        description: item.description || item.productName,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        total: item.totalAmount
+      })),
+      totalAmount: poTotal,
+      currency: 'PKR',
+      notes: remarks || '',
+      issuedBy: req.user._id,
+      issuedByName: req.user.fullName,
+      issuedAt
+    };
 
     const totalQty = (order.items || []).reduce((s, i) => s + (Number(i.quantity) || 1), 0);
 
@@ -974,9 +1038,9 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       receivedQuantity: totalQty,
       orderedQuantity: totalQty,
       receivingDate: new Date(),
-      remarks: 'Goods present in warehouse inventory and released to Support Department for Delivery Note.'
+      remarks: 'Goods brought to the office and handed to Support for Inventory IN and Delivery Note.'
     };
-    order.lastAction = 'Goods Released from Inventory — Moved to Support for Delivery Note';
+    order.lastAction = `Local Supplier PO ${finalPoNumber} Issued - Moved to Support for Inventory IN and Delivery Note`;
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
     order.lastActionAt = new Date();
@@ -986,11 +1050,11 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       user: req.user._id,
       userName: req.user.fullName,
       department: 'Local Purchaser',
-      action: 'Moved to Support Department for DN Creation',
+      action: 'Local Supplier PO Issued and Moved to Support',
       previousStatus: 'Pending Local Procurement',
       newStatus: 'Goods Received in Office',
       timestamp: new Date(),
-      notes: `Inventory goods verified in stock and released for Sales Order ${order.orderNumber || order.orderReference}. Order moved to Support Department for Delivery Note (DN) creation.`
+      notes: `Local Supplier PO ${finalPoNumber} was issued to ${finalSupplierName}. Goods for Sales Order ${order.orderNumber || order.orderReference} were brought to the office and moved to Support for Inventory IN and Delivery Note (DN) creation.`
     });
 
     await order.save();
@@ -998,14 +1062,14 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
     await notifyRoleHelper(['support', 'operations', 'admin', 'ceo'], {
       type: 'order',
       title: 'New Order Ready for Delivery Note in Support',
-      message: `Green File Order ${order.orderNumber || order.orderReference} passed inventory check and is ready for Delivery Note creation in Support.`,
+      message: `Green File Order ${order.orderNumber || order.orderReference} with Local Supplier PO ${finalPoNumber} arrived at the office and is ready for Support Inventory IN and Delivery Note creation.`,
       link: '/support/orders',
       sender: req.user._id
     });
 
     return res.status(200).json({
       success: true,
-      message: `Sales Order ${order.orderNumber || order.orderReference} inventory stock verified and order successfully moved to Support Department for Delivery Note creation!`,
+      message: `Local Supplier PO ${finalPoNumber} saved and Sales Order ${order.orderNumber || order.orderReference} successfully moved to Support for Inventory IN and Delivery Note creation!`,
       data: order
     });
   } catch (error) {
@@ -1041,15 +1105,13 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       issuedAt: new Date()
     };
 
-    // Route to Logistics
-    order.workflowStatus = 'In Logistics';
-    order.status = 'In Logistics';
-    order.departmentResponsible = 'Logistics';
-    order.currentDepartment = 'Logistics';
-    order.currentStatus = 'GLOBAL_PO_ISSUED_IN_LOGISTICS';
-    order.previousDepartment = 'Global Purchaser';
-    order.previousStatus = 'Pending Global Procurement';
-    order.lastAction = 'Global Supplier PO Created (Routed to Logistics)';
+    // Keep the Blue file with Global Purchasing until all procurement checkpoints are complete.
+    order.workflowStatus = 'Pending Global Procurement';
+    order.status = 'Pending Global Procurement';
+    order.departmentResponsible = 'Global Purchaser';
+    order.currentDepartment = 'Global Purchaser';
+    order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
+    order.lastAction = 'Global Supplier PO Created';
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
     order.lastActionAt = new Date();
@@ -1065,7 +1127,7 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
         items: items && items.length > 0 ? items : (order.items || []),
         totalAmount: order.totalAmount || order.netAmount || 0,
         currency: 'PKR',
-        status: 'In Logistics',
+        status: 'Issued',
         salesOrderId: order._id,
         salesOrderNumber: order.orderNumber || order.orderReference,
         notes: remarks || '',
@@ -1079,60 +1141,100 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
     order.supplierPoId = poDoc._id;
     order.supplierPoNumber = poNum;
 
-    // Link or create shipment
-    let shipment = await Shipment.findOne({ salesOrder: order._id });
-    if (!shipment) {
-      shipment = await Shipment.create({
-        salesOrder: order._id,
-        salesOrderNumber: order.orderNumber || order.orderReference,
-        salesPerson: order.salesPerson || req.user._id,
-        salePerson: order.salePerson || req.user.fullName,
-        clientName: order.clientName,
-        clientEmail: order.clientEmail || '',
-        clientPhone: order.clientPhone || '',
-        supplierName: order.supplierPO.supplierName,
-        supplierCountry: order.supplierPO.supplierCountry,
-        supplierPoNumber: poNum,
-        supplierPoDate: new Date(),
-        fileType: 'Blue',
-        status: 'PO Issued',
-        description: order.productSummary || 'Imported Goods',
-        items: order.items || [],
-        createdBy: req.user._id
-      });
-    }
-    order.shipmentId = shipment._id;
-    order.shipmentNumber = shipment.shipmentId;
-
     order.workflowHistory.push({
       user: req.user._id,
       userName: req.user.fullName,
       department: 'Global Purchaser',
-      action: 'Global Supplier PO Created (Routed to Logistics)',
+      action: 'Global Supplier PO Created',
       previousStatus: 'Pending Global Procurement',
-      newStatus: 'In Logistics',
+      newStatus: 'Pending Global Procurement',
       timestamp: new Date(),
-      notes: `Global Supplier PO #${poNum} created by ${req.user.fullName}. Routed to Logistics Department for Shipment Tracking.`
+      notes: `Global Supplier PO #${poNum} created by ${req.user.fullName}. Awaiting manufacturing and pick-up checkpoints.`
     });
 
     await order.save();
 
-    await notifyRoleHelper(['logistics', 'admin', 'ceo'], {
-      type: 'order',
-      title: 'New Blue File Shipment in Logistics',
-      message: `Global Supplier PO #${poNum} for Sales Order ${order.orderNumber || order.orderReference} is ready for Logistics shipment tracking.`,
-      link: '/logistics/shipments',
-      sender: req.user._id
-    });
-
     return res.status(200).json({
       success: true,
-      message: `Global Supplier PO ${poNum} created. Order ${order.orderNumber || order.orderReference} routed to Logistics Department.`,
+      message: `Global Supplier PO ${poNum} created. Order ${order.orderNumber || order.orderReference} remains with Global Purchasing for checkpoint updates.`,
       data: order
     });
   } catch (error) {
     console.error('Global Procurement Send To Logistics Error:', error);
     return res.status(500).json({ success: false, message: 'Server error creating global PO.' });
+  }
+};
+
+/**
+ * @desc Record the next ordered Global Purchasing checkpoint for a Blue file
+ * @route POST /api/purchaser/orders/:id/global-checkpoint
+ */
+exports.updateGlobalProcurementCheckpoint = async (req, res) => {
+  try {
+    const checkpoints = ['In Manufacturing', 'Ready to Pick Up', 'Picked Up'];
+    const checkpoint = req.body.checkpoint;
+    if (!checkpoints.includes(checkpoint)) {
+      return res.status(400).json({ success: false, message: 'A valid Global Purchasing checkpoint is required.' });
+    }
+
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+    if (order.fileType !== 'Blue') {
+      return res.status(400).json({ success: false, message: 'Global Purchasing checkpoints apply only to Blue file orders.' });
+    }
+    if (order.currentDepartment !== 'Global Purchaser' || order.workflowStatus === 'In Logistics') {
+      return res.status(400).json({ success: false, message: 'This order is no longer in the Global Purchasing stage.' });
+    }
+    if (!order.supplierPO || !order.supplierPO.poNumber) {
+      return res.status(400).json({ success: false, message: 'Create the Global Supplier PO before updating procurement checkpoints.' });
+    }
+
+    const currentStatus = order.supplierPO.status || 'Issued';
+    const currentIndex = checkpoints.indexOf(currentStatus);
+    const requestedIndex = checkpoints.indexOf(checkpoint);
+
+    if (requestedIndex <= currentIndex) {
+      return res.status(200).json({ success: true, message: `${checkpoint} is already complete.`, data: order });
+    }
+    if (requestedIndex !== currentIndex + 1) {
+      return res.status(400).json({ success: false, message: `Complete ${checkpoints[currentIndex + 1]} before ${checkpoint}.` });
+    }
+
+    order.supplierPO.status = checkpoint;
+    order.workflowStatus = 'Pending Global Procurement';
+    order.status = 'Pending Global Procurement';
+    order.departmentResponsible = 'Global Purchaser';
+    order.currentDepartment = 'Global Purchaser';
+    order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
+    order.lastAction = `Global procurement checkpoint completed: ${checkpoint}`;
+    order.lastActionBy = req.user._id;
+    order.lastActionByName = req.user.fullName;
+    order.lastActionAt = new Date();
+    order.workflowHistory.push({
+      user: req.user._id,
+      userName: req.user.fullName,
+      department: 'Global Purchaser',
+      action: `Global procurement checkpoint completed: ${checkpoint}`,
+      previousStatus: currentStatus,
+      newStatus: checkpoint,
+      timestamp: new Date(),
+      notes: `Global Supplier PO #${order.supplierPO.poNumber}: ${checkpoint}.`
+    });
+
+    await order.save();
+
+    return res.status(200).json({
+      success: true,
+      message: checkpoint === 'Picked Up'
+        ? 'Picked Up recorded. The order is ready for Logistics handoff.'
+        : `${checkpoint} recorded. The order remains with Global Purchasing.`,
+      data: order
+    });
+  } catch (error) {
+    console.error('Update Global Procurement Checkpoint Error:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating Global Purchasing checkpoint.' });
   }
 };
 
@@ -1180,6 +1282,19 @@ exports.sendGlobalOrderToLogistics = async (req, res) => {
     }
     if (!order) {
       return res.status(404).json({ success: false, message: 'Associated Sales Order not found for moving to Logistics.' });
+    }
+    const alreadySentToLogistics =
+      ['Logistics', 'Support', 'Accounts', 'Completed'].includes(order.currentDepartment) ||
+      ['In Logistics', 'Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'].includes(order.workflowStatus) ||
+      ['In Transit', 'In Logistics', 'Shipped', 'Partially Received', 'Fully Received', 'Completed'].includes(order.supplierPO?.status);
+    if (alreadySentToLogistics) {
+      return res.status(409).json({
+        success: false,
+        message: 'This order has already been sent to Logistics.'
+      });
+    }
+    if (order.supplierPO?.status !== 'Picked Up') {
+      return res.status(400).json({ success: false, message: 'Complete the Picked Up checkpoint before moving this order to Logistics.' });
     }
 
     const effectivePoNumber = supplierPoNumber || order.supplierPO?.poNumber || order.supplierPoNumber || `GPO-${Date.now().toString().slice(-6)}`;
@@ -1323,6 +1438,13 @@ exports.getPurchaserInventory = async (req, res) => {
 
 exports.createOrUpdatePurchaserInventory = async (req, res) => {
   try {
+    if (req.user?.role === 'purchaser' && req.user.purchaserSubDept !== 'Global') {
+      return res.status(403).json({
+        success: false,
+        message: 'Inventory updates are handled by the Support team.'
+      });
+    }
+
     const InventoryItem = require('../models/InventoryItem');
     const targetId = req.params.id || req.body.id || req.body._id;
     const { name, productName, sku, productCode, category, unit, quantityOnHand, quantity, minStockLevel, unitPrice, location, description } = req.body;
@@ -1400,6 +1522,13 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
 
 exports.deletePurchaserInventoryItem = async (req, res) => {
   try {
+    if (req.user?.role === 'purchaser' && req.user.purchaserSubDept !== 'Global') {
+      return res.status(403).json({
+        success: false,
+        message: 'Inventory updates are handled by the Support team.'
+      });
+    }
+
     const InventoryItem = require('../models/InventoryItem');
     const { id } = req.params;
     const mongoose = require('mongoose');
