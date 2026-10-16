@@ -3529,6 +3529,8 @@ const getMyPayments = async (req, res) => {
         { customerName: regex },
         { salesOrderNumber: regex },
         { invoiceNumber: regex },
+        { 'allocations.salesOrderNumber': regex },
+        { 'allocations.invoiceNumber': regex },
         { salePerson: regex },
         { paymentMethod: regex },
         { paymentType: regex }
@@ -3545,18 +3547,44 @@ const getMyPayments = async (req, res) => {
   }
 };
 
+const toMoneyCents = (value) => {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? Math.round((amount + Number.EPSILON) * 100) : NaN;
+};
+const fromMoneyCents = (cents) => cents / 100;
+
+const getPaymentCentsForInvoice = (payment, invoiceId) => {
+  if (Array.isArray(payment.allocations) && payment.allocations.length > 0) {
+    return payment.allocations.reduce((sum, allocation) => (
+      String(allocation.invoiceId) === String(invoiceId) ? sum + toMoneyCents(allocation.amount) : sum
+    ), 0);
+  }
+  return String(payment.invoiceId) === String(invoiceId) ? toMoneyCents(payment.amount) : 0;
+};
+
+const getPaymentCentsForOrder = (payment, salesOrderId) => {
+  if (Array.isArray(payment.allocations) && payment.allocations.length > 0) {
+    return payment.allocations.reduce((sum, allocation) => (
+      String(allocation.salesOrderId) === String(salesOrderId) ? sum + toMoneyCents(allocation.amount) : sum
+    ), 0);
+  }
+  return String(payment.salesOrderId) === String(salesOrderId) ? toMoneyCents(payment.amount) : 0;
+};
+
 // Helper to synchronize Invoice and SalesOrder balances after payment changes
 const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
   try {
     if (invoiceId) {
       const invoice = await Invoice.findById(invoiceId);
       if (invoice) {
-        const allPayments = await Payment.find({ invoiceId });
-        const totalPaid = allPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-        const invTotal = Number(invoice.amount) || 0;
-        const outstanding = Math.max(0, invTotal - totalPaid);
+        const allPayments = await Payment.find({ $or: [{ invoiceId }, { 'allocations.invoiceId': invoiceId }] });
+        const totalPaidCents = allPayments.reduce((sum, payment) => sum + getPaymentCentsForInvoice(payment, invoiceId), 0);
+        const invTotalCents = toMoneyCents(invoice.amount) || 0;
+        const outstandingCents = Math.max(0, invTotalCents - totalPaidCents);
+        const totalPaid = fromMoneyCents(totalPaidCents);
+        const outstanding = fromMoneyCents(outstandingCents);
         let invStatus = invoice.status;
-        if (outstanding === 0 && invTotal > 0) {
+        if (outstandingCents === 0 && invTotalCents > 0) {
           invStatus = 'Paid';
         } else if (totalPaid > 0) {
           invStatus = 'Partially Paid';
@@ -3574,13 +3602,15 @@ const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
     if (salesOrderId) {
       const order = await SalesOrder.findById(salesOrderId);
       if (order) {
-        const allOrderPayments = await Payment.find({ salesOrderId });
-        const totalPaid = allOrderPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-        const orderTotal = Number(order.netAmount) || Number(order.totalAmount) || 0;
-        const outstanding = Math.max(0, orderTotal - totalPaid);
+        const allOrderPayments = await Payment.find({ $or: [{ salesOrderId }, { 'allocations.salesOrderId': salesOrderId }] });
+        const totalPaidCents = allOrderPayments.reduce((sum, payment) => sum + getPaymentCentsForOrder(payment, salesOrderId), 0);
+        const orderTotalCents = toMoneyCents(order.netAmount || order.totalAmount) || 0;
+        const outstandingCents = Math.max(0, orderTotalCents - totalPaidCents);
+        const totalPaid = fromMoneyCents(totalPaidCents);
+        const outstanding = fromMoneyCents(outstandingCents);
         let paymentStatus = 'Pending';
-        if (totalPaid === 0) paymentStatus = 'Pending';
-        else if (totalPaid >= orderTotal && orderTotal > 0) paymentStatus = 'Fully Paid';
+        if (totalPaidCents === 0) paymentStatus = 'Pending';
+        else if (outstandingCents === 0 && orderTotalCents > 0) paymentStatus = 'Fully Paid';
         else paymentStatus = 'Partially Paid';
         await SalesOrder.findByIdAndUpdate(salesOrderId, {
           totalPaid,
@@ -3597,36 +3627,89 @@ const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
 const createMyPayment = async (req, res) => {
   try {
     let { customerName, salesOrderId, salesOrderNumber, invoiceId, invoiceNumber, paymentDate, amount, paymentType, paymentMethod, notes } = req.body;
-    if (!customerName || !customerName.trim()) return res.status(400).json({ success: false, message: 'Customer name is required.' });
-    if (!amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'Valid payment amount is required.' });
+    if (!customerName || !customerName.trim()) {
+      return res.status(400).json({ success: false, message: 'Customer name is required.' });
+    }
 
-    const payAmount = Number(amount);
-
+    const requestedAllocations = Array.isArray(req.body.allocations) && req.body.allocations.length > 1
+      ? req.body.allocations
+      : null;
+    const allocations = [];
+    const allocatedInvoiceIds = new Set();
     let resolvedSalesPersonId = null;
     let resolvedSalePerson = '';
 
-    // If invoice is linked, auto-resolve sales order and check against overpayment
-    if (invoiceId) {
-      const invoice = await Invoice.findById(invoiceId).populate('salesPerson');
-      if (invoice) {
-        resolvedSalesPersonId = invoice.salesPerson?._id || invoice.salesPerson || null;
-        resolvedSalePerson = invoice.salePerson || (invoice.salesPerson && invoice.salesPerson.fullName) || '';
-        if (!salesOrderId && invoice.salesOrderId) {
-          salesOrderId = invoice.salesOrderId;
-          salesOrderNumber = invoice.salesOrderNumber || invoice.saleReference || salesOrderNumber;
+    if (requestedAllocations) {
+      for (const requested of requestedAllocations) {
+        if (!requested.invoiceId || !mongoose.Types.ObjectId.isValid(requested.invoiceId)) {
+          return res.status(400).json({ success: false, message: 'Each allocation must select a valid invoice.' });
         }
-        if (!invoiceNumber && invoice.invoiceNumber) {
-          invoiceNumber = invoice.invoiceNumber;
+        if (allocatedInvoiceIds.has(String(requested.invoiceId))) {
+          return res.status(400).json({ success: false, message: 'Each invoice can only appear once on a receipt.' });
         }
-        const invTotal = Number(invoice.amount) || 0;
-        const currentPaid = Number(invoice.paidAmount) || 0;
-        const currentRemaining = Math.max(0, invTotal - currentPaid);
+        allocatedInvoiceIds.add(String(requested.invoiceId));
+        const invoice = await Invoice.findById(requested.invoiceId).populate('salesPerson');
+        if (!invoice) {
+          return res.status(404).json({ success: false, message: 'An invoice selected for allocation was not found.' });
+        }
+        const invoiceCustomer = (invoice.clientName || invoice.customerName || '').trim().toLowerCase();
+        if (invoiceCustomer && invoiceCustomer !== customerName.trim().toLowerCase()) {
+          return res.status(400).json({ success: false, message: 'One receipt can only be allocated to invoices for the same customer.' });
+        }
 
-        if (payAmount > currentRemaining + 0.01) {
+        const allocationCents = toMoneyCents(requested.amount);
+        const remainingCents = Math.max(0, (toMoneyCents(invoice.amount) || 0) - (toMoneyCents(invoice.paidAmount) || 0));
+        if (!Number.isInteger(allocationCents) || allocationCents <= 0) {
+          return res.status(400).json({ success: false, message: 'Each invoice allocation must be greater than 0.00.' });
+        }
+        if (allocationCents > remainingCents) {
           return res.status(400).json({
             success: false,
-            message: `Payment amount (Rs. ${payAmount.toLocaleString()}) exceeds the invoice's remaining receivable of Rs. ${currentRemaining.toLocaleString()}.`
+            message: `Allocation for ${invoice.invoiceNumber} exceeds its remaining receivable of PKR ${fromMoneyCents(remainingCents).toFixed(2)}.`
           });
+        }
+
+        allocations.push({
+          invoiceId: invoice._id,
+          invoiceNumber: invoice.invoiceNumber || '',
+          salesOrderId: invoice.salesOrderId || null,
+          salesOrderNumber: invoice.salesOrderNumber || invoice.saleReference || '',
+          amount: fromMoneyCents(allocationCents)
+        });
+        resolvedSalesPersonId = resolvedSalesPersonId || invoice.salesPerson?._id || invoice.salesPerson || null;
+        resolvedSalePerson = resolvedSalePerson || invoice.salePerson || invoice.salesPerson?.fullName || '';
+      }
+
+      const first = allocations[0];
+      invoiceId = first.invoiceId;
+      invoiceNumber = first.invoiceNumber;
+      salesOrderId = first.salesOrderId;
+      salesOrderNumber = first.salesOrderNumber;
+      amount = fromMoneyCents(allocations.reduce((sum, allocation) => sum + toMoneyCents(allocation.amount), 0));
+    } else {
+      const payAmountCents = toMoneyCents(amount);
+      if (!Number.isInteger(payAmountCents) || payAmountCents <= 0) {
+        return res.status(400).json({ success: false, message: 'Valid payment amount is required.' });
+      }
+      amount = fromMoneyCents(payAmountCents);
+
+      if (invoiceId) {
+        const invoice = await Invoice.findById(invoiceId).populate('salesPerson');
+        if (invoice) {
+          resolvedSalesPersonId = invoice.salesPerson?._id || invoice.salesPerson || null;
+          resolvedSalePerson = invoice.salePerson || invoice.salesPerson?.fullName || '';
+          if (!salesOrderId && invoice.salesOrderId) {
+            salesOrderId = invoice.salesOrderId;
+            salesOrderNumber = invoice.salesOrderNumber || invoice.saleReference || salesOrderNumber;
+          }
+          invoiceNumber = invoiceNumber || invoice.invoiceNumber;
+          const remainingCents = Math.max(0, (toMoneyCents(invoice.amount) || 0) - (toMoneyCents(invoice.paidAmount) || 0));
+          if (payAmountCents > remainingCents) {
+            return res.status(400).json({
+              success: false,
+              message: `Payment amount (PKR ${amount.toFixed(2)}) exceeds the invoice's remaining receivable of PKR ${fromMoneyCents(remainingCents).toFixed(2)}.`
+            });
+          }
         }
       }
     }
@@ -3635,18 +3718,19 @@ const createMyPayment = async (req, res) => {
       const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
       if (parentSo) {
         resolvedSalesPersonId = resolvedSalesPersonId || parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
-        resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || (parentSo.salesPerson && parentSo.salesPerson.fullName) || '';
+        resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || parentSo.salesPerson?.fullName || '';
       }
     }
 
     const payment = await Payment.create({
       customerName: customerName.trim(),
       salesOrderId: salesOrderId || null,
-      salesOrderNumber: salesOrderNumber || '',
+      salesOrderNumber: requestedAllocations ? allocations.map(a => a.salesOrderNumber).filter(Boolean).join(', ') : (salesOrderNumber || ''),
       invoiceId: invoiceId || null,
-      invoiceNumber: invoiceNumber || '',
+      invoiceNumber: requestedAllocations ? allocations.map(a => a.invoiceNumber).join(', ') : (invoiceNumber || ''),
+      allocations: requestedAllocations ? allocations : undefined,
       paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
-      amount: payAmount,
+      amount,
       paymentType: paymentType || 'Partial',
       paymentMethod: paymentMethod || 'Bank Transfer',
       notes: notes || '',
@@ -3655,12 +3739,25 @@ const createMyPayment = async (req, res) => {
       createdBy: req.user._id
     });
 
-    // Auto-update Invoice and Sales Order payment status and outstanding balances
-    await syncInvoiceAndOrderBalances(invoiceId, salesOrderId);
+    const balanceTargets = requestedAllocations
+      ? allocations
+      : [{ invoiceId, salesOrderId }];
+    const syncedInvoices = new Set();
+    const syncedOrders = new Set();
+    for (const target of balanceTargets) {
+      const targetInvoiceId = target.invoiceId ? String(target.invoiceId) : '';
+      const targetOrderId = target.salesOrderId ? String(target.salesOrderId) : '';
+      await syncInvoiceAndOrderBalances(
+        targetInvoiceId && !syncedInvoices.has(targetInvoiceId) ? target.invoiceId : null,
+        targetOrderId && !syncedOrders.has(targetOrderId) ? target.salesOrderId : null
+      );
+      if (targetInvoiceId) syncedInvoices.add(targetInvoiceId);
+      if (targetOrderId) syncedOrders.add(targetOrderId);
+    }
 
     await logSalesActivity({
       type: 'Payment Recorded',
-      description: `Recorded ${paymentType || 'Partial'} payment of Rs. ${payAmount.toLocaleString()} from ${customerName}`,
+      description: `Recorded ${paymentType || 'Partial'} payment of PKR ${Number(amount).toFixed(2)} from ${customerName}`,
       relatedModel: 'Payment',
       relatedId: payment._id,
       relatedCustomer: customerName,
@@ -3672,7 +3769,7 @@ const createMyPayment = async (req, res) => {
       role: 'finance',
       sender: req.user._id,
       title: 'Payment Recorded',
-      message: `Payment of PKR ${Number(payAmount).toLocaleString()} recorded for Invoice ${invoiceNumber || payment.invoiceNumber || 'Direct'}.`,
+      message: `Payment of PKR ${Number(amount).toFixed(2)} recorded for Invoice ${payment.invoiceNumber || 'Direct'}.`,
       type: 'finance',
       link: '/finance/payments'
     });
@@ -3695,10 +3792,14 @@ const updateMyPayment = async (req, res) => {
     const oldInvoiceId = payment.invoiceId;
     const oldSalesOrderId = payment.salesOrderId;
 
+    if (Array.isArray(payment.allocations) && payment.allocations.length > 0 && ['amount', 'invoiceId', 'salesOrderId'].some(field => req.body[field] !== undefined)) {
+      return res.status(400).json({ success: false, message: 'Invoice allocations on a split receipt cannot be changed. Delete it and record a corrected receipt.' });
+    }
+
     const allowedFields = ['customerName', 'paymentDate', 'amount', 'paymentType', 'paymentMethod', 'notes', 'invoiceNumber', 'salesOrderNumber', 'invoiceId', 'salesOrderId'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
-        if (field === 'amount') payment[field] = Number(req.body[field]);
+        if (field === 'amount') payment[field] = fromMoneyCents(toMoneyCents(req.body[field]));
         else payment[field] = req.body[field];
       }
     });
@@ -3728,13 +3829,25 @@ const deleteMyPayment = async (req, res) => {
     if (!checkOwnership(payment, 'createdBy', req.user._id, req.user)) {
       return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own payments.' });
     }
-    const invId = payment.invoiceId;
-    const soId = payment.salesOrderId;
+    const balanceTargets = Array.isArray(payment.allocations) && payment.allocations.length > 0
+      ? payment.allocations.map(allocation => ({ invoiceId: allocation.invoiceId, salesOrderId: allocation.salesOrderId }))
+      : [{ invoiceId: payment.invoiceId, salesOrderId: payment.salesOrderId }];
 
     await Payment.findByIdAndDelete(req.params.id);
 
     // Re-sync balances after deletion
-    await syncInvoiceAndOrderBalances(invId, soId);
+    const syncedInvoices = new Set();
+    const syncedOrders = new Set();
+    for (const target of balanceTargets) {
+      const invoiceKey = target.invoiceId ? String(target.invoiceId) : '';
+      const orderKey = target.salesOrderId ? String(target.salesOrderId) : '';
+      await syncInvoiceAndOrderBalances(
+        invoiceKey && !syncedInvoices.has(invoiceKey) ? target.invoiceId : null,
+        orderKey && !syncedOrders.has(orderKey) ? target.salesOrderId : null
+      );
+      if (invoiceKey) syncedInvoices.add(invoiceKey);
+      if (orderKey) syncedOrders.add(orderKey);
+    }
 
     return res.status(200).json({ success: true, message: 'Payment deleted.' });
   } catch (error) {
@@ -5076,10 +5189,13 @@ const getFinanceReceivables = async (req, res) => {
 
     const now = new Date();
     const receivables = invoices.map(inv => {
-      const total = Number(inv.amount) || 0;
-      const paid = Number(inv.paidAmount) || 0;
-      const remaining = Math.max(0, total - paid);
-      const isOverdue = remaining > 0 && inv.dueDate && new Date(inv.dueDate) < now;
+      const totalCents = toMoneyCents(inv.amount) || 0;
+      const paidCents = toMoneyCents(inv.paidAmount) || 0;
+      const remainingCents = Math.max(0, totalCents - paidCents);
+      const total = fromMoneyCents(totalCents);
+      const paid = fromMoneyCents(paidCents);
+      const remaining = fromMoneyCents(remainingCents);
+      const isOverdue = remainingCents > 0 && inv.dueDate && new Date(inv.dueDate) < now;
       return {
         _id: inv._id,
         invoiceNumber: inv.invoiceNumber,
@@ -5092,7 +5208,7 @@ const getFinanceReceivables = async (req, res) => {
         remainingReceivable: remaining,
         issueDate: inv.issueDate,
         dueDate: inv.dueDate,
-        status: remaining === 0 ? 'Paid' : (paid > 0 ? 'Partially Paid' : (isOverdue ? 'Overdue' : (inv.status || 'Pending'))),
+        status: remainingCents === 0 ? 'Paid' : (paidCents > 0 ? 'Partially Paid' : (isOverdue ? 'Overdue' : (inv.status || 'Pending'))),
         isOverdue
       };
     });
