@@ -72,6 +72,7 @@ const ShipmentSchema = new mongoose.Schema(
         'Shipment Pending',
         'Booked',
         'Dispatched',
+        'Picked Up',
         'In Transit',
         'Arrived',
         'Received in Office',

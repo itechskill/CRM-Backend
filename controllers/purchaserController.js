@@ -1081,7 +1081,7 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
 exports.globalProcurementSendToLogistics = async (req, res) => {
   try {
     const { id } = req.params;
-    const { supplierName, supplierCountry, portOfLoading, portOfDischarge, estimatedArrival, paymentTerms, items, remarks } = req.body;
+    const { supplierName, supplierCountry, paymentTerms, items, remarks } = req.body;
 
     const order = await SalesOrder.findById(id);
     if (!order) {
@@ -1131,8 +1131,6 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
         salesOrderId: order._id,
         salesOrderNumber: order.orderNumber || order.orderReference,
         notes: remarks || '',
-        portOfLoading: portOfLoading || '',
-        portOfDischarge: portOfDischarge || 'Karachi Port',
         paymentTerms: paymentTerms || '',
         createdBy: req.user._id,
         createdByName: req.user.fullName
@@ -1165,13 +1163,56 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
   }
 };
 
+const handoffGlobalOrderToLogistics = async (order, user) => {
+  const previousStatus = order.workflowStatus;
+  const effectivePoNumber = order.supplierPO?.poNumber || order.supplierPoNumber || `GPO-${Date.now().toString().slice(-6)}`;
+
+  order.previousStatus = previousStatus;
+  order.previousDepartment = 'Global Purchaser';
+  order.workflowStatus = 'In Logistics';
+  order.status = 'In Logistics';
+  order.departmentResponsible = 'Logistics';
+  order.currentDepartment = 'Logistics';
+  order.currentStatus = 'GLOBAL_PO_ISSUED_IN_LOGISTICS';
+  order.lastAction = 'Ready to Pick Up confirmed; order sent to Logistics';
+  order.lastActionBy = user._id;
+  order.lastActionByName = user.fullName;
+  order.lastActionAt = new Date();
+
+  await SupplierPO.updateMany(
+    { salesOrderId: order._id },
+    { $set: { status: 'In Logistics' } }
+  );
+  order.workflowHistory.push({
+    user: user._id,
+    userName: user.fullName,
+    department: 'Global Purchaser',
+    action: 'Ready to Pick Up - Sent to Logistics',
+    previousStatus,
+    newStatus: 'In Logistics',
+    timestamp: new Date(),
+    notes: `Global Supplier PO #${effectivePoNumber} handed to Logistics. Logistics will confirm Picked Up and enter shipment details.`
+  });
+  await order.save();
+
+  await notifyRoleHelper(['logistics', 'admin', 'ceo'], {
+    type: 'order',
+    title: 'Blue File Ready for Logistics Pick Up',
+    message: `Global Supplier PO #${effectivePoNumber} for Sales Order ${order.orderNumber || order.orderReference} is ready for Logistics.`,
+    link: '/logistics/shipments',
+    sender: user._id
+  });
+
+  return null;
+};
+
 /**
  * @desc Record the next ordered Global Purchasing checkpoint for a Blue file
  * @route POST /api/purchaser/orders/:id/global-checkpoint
  */
 exports.updateGlobalProcurementCheckpoint = async (req, res) => {
   try {
-    const checkpoints = ['In Manufacturing', 'Ready to Pick Up', 'Picked Up'];
+    const checkpoints = ['In Manufacturing', 'Ready to Pick Up'];
     const checkpoint = req.body.checkpoint;
     if (!checkpoints.includes(checkpoint)) {
       return res.status(400).json({ success: false, message: 'A valid Global Purchasing checkpoint is required.' });
@@ -1185,7 +1226,7 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Global Purchasing checkpoints apply only to Blue file orders.' });
     }
     if (order.currentDepartment !== 'Global Purchaser' || order.workflowStatus === 'In Logistics') {
-      return res.status(400).json({ success: false, message: 'This order is no longer in the Global Purchasing stage.' });
+      return res.status(409).json({ success: false, message: 'This order has already been sent to Logistics.' });
     }
     if (!order.supplierPO || !order.supplierPO.poNumber) {
       return res.status(400).json({ success: false, message: 'Create the Global Supplier PO before updating procurement checkpoints.' });
@@ -1195,6 +1236,16 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
     const currentIndex = checkpoints.indexOf(currentStatus);
     const requestedIndex = checkpoints.indexOf(checkpoint);
 
+    if (checkpoint === 'Ready to Pick Up') {
+      const existingShipment = await Shipment.findOne({ salesOrder: order._id }).select('shipmentId').lean();
+      if (existingShipment) {
+        return res.status(409).json({
+          success: false,
+          message: `Shipment ${existingShipment.shipmentId} already exists for this Sales Order.`
+        });
+      }
+    }
+
     if (requestedIndex <= currentIndex) {
       return res.status(200).json({ success: true, message: `${checkpoint} is already complete.`, data: order });
     }
@@ -1203,11 +1254,13 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
     }
 
     order.supplierPO.status = checkpoint;
-    order.workflowStatus = 'Pending Global Procurement';
-    order.status = 'Pending Global Procurement';
-    order.departmentResponsible = 'Global Purchaser';
-    order.currentDepartment = 'Global Purchaser';
-    order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
+    if (checkpoint !== 'Ready to Pick Up') {
+      order.workflowStatus = 'Pending Global Procurement';
+      order.status = 'Pending Global Procurement';
+      order.departmentResponsible = 'Global Purchaser';
+      order.currentDepartment = 'Global Purchaser';
+      order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
+    }
     order.lastAction = `Global procurement checkpoint completed: ${checkpoint}`;
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
@@ -1223,12 +1276,20 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
       notes: `Global Supplier PO #${order.supplierPO.poNumber}: ${checkpoint}.`
     });
 
-    await order.save();
+    if (checkpoint === 'Ready to Pick Up') {
+      await handoffGlobalOrderToLogistics(order, req.user);
+    } else {
+      await SupplierPO.updateMany(
+        { salesOrderId: order._id },
+        { $set: { status: checkpoint } }
+      );
+      await order.save();
+    }
 
     return res.status(200).json({
       success: true,
-      message: checkpoint === 'Picked Up'
-        ? 'Picked Up recorded. The order is ready for Logistics handoff.'
+      message: checkpoint === 'Ready to Pick Up'
+        ? 'Ready to Pick Up recorded. The order has been sent to Logistics.'
         : `${checkpoint} recorded. The order remains with Global Purchasing.`,
       data: order
     });
@@ -1245,33 +1306,14 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
 exports.sendGlobalOrderToLogistics = async (req, res) => {
   try {
     const { id } = req.params;
-    const {
-      carrier,
-      flightNumber,
-      trackingNumber,
-      shippingMethod,
-      portOfLoading,
-      portOfDischarge,
-      departureLocation,
-      destinationLocation,
-      etd,
-      eta,
-      supplierName,
-      supplierCountry,
-      supplierPoNumber,
-      notes,
-      remarks
-    } = req.body;
-
     let order = null;
+
     if (mongoose.Types.ObjectId.isValid(id)) {
       order = await SalesOrder.findById(id);
       if (!order) {
         const po = await SupplierPO.findById(id);
-        if (po) {
-          if (po.salesOrderId) order = await SalesOrder.findById(po.salesOrderId);
-          else if (po.salesOrderNumber) order = await SalesOrder.findOne({ orderNumber: po.salesOrderNumber });
-        }
+        if (po?.salesOrderId) order = await SalesOrder.findById(po.salesOrderId);
+        else if (po?.salesOrderNumber) order = await SalesOrder.findOne({ orderNumber: po.salesOrderNumber });
       }
     }
     if (!order && req.body.salesOrderId && mongoose.Types.ObjectId.isValid(req.body.salesOrderId)) {
@@ -1283,128 +1325,31 @@ exports.sendGlobalOrderToLogistics = async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'Associated Sales Order not found for moving to Logistics.' });
     }
+
     const alreadySentToLogistics =
       ['Logistics', 'Support', 'Accounts', 'Completed'].includes(order.currentDepartment) ||
-      ['In Logistics', 'Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'].includes(order.workflowStatus) ||
-      ['In Transit', 'In Logistics', 'Shipped', 'Partially Received', 'Fully Received', 'Completed'].includes(order.supplierPO?.status);
+      ['In Logistics', 'Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'].includes(order.workflowStatus);
     if (alreadySentToLogistics) {
       return res.status(409).json({
         success: false,
         message: 'This order has already been sent to Logistics.'
       });
     }
-    if (order.supplierPO?.status !== 'Picked Up') {
-      return res.status(400).json({ success: false, message: 'Complete the Picked Up checkpoint before moving this order to Logistics.' });
-    }
-
-    const effectivePoNumber = supplierPoNumber || order.supplierPO?.poNumber || order.supplierPoNumber || `GPO-${Date.now().toString().slice(-6)}`;
-    const effectiveSupplier = supplierName || order.supplierPO?.supplierName || 'Overseas Supplier';
-    const effectiveCountry = supplierCountry || order.supplierPO?.supplierCountry || 'China';
-
-    // Update order status & department
-    order.workflowStatus = 'In Logistics';
-    order.status = 'In Logistics';
-    order.departmentResponsible = 'Logistics';
-    order.currentDepartment = 'Logistics';
-    order.currentStatus = 'GLOBAL_PO_ISSUED_IN_LOGISTICS';
-    order.previousDepartment = 'Global Purchaser';
-    order.previousStatus = order.workflowStatus;
-    order.lastAction = `Order moved to Logistics (Carrier: ${carrier || 'Overseas Carrier'}, Track: ${trackingNumber || 'Pending'})`;
-    order.lastActionBy = req.user._id;
-    order.lastActionByName = req.user.fullName;
-    order.lastActionAt = new Date();
-
-    if (order.supplierPO) {
-      order.supplierPO.status = 'In Transit';
-      order.supplierPO.portOfLoading = portOfLoading || order.supplierPO.portOfLoading;
-      order.supplierPO.portOfDischarge = portOfDischarge || order.supplierPO.portOfDischarge;
-      order.supplierPO.carrier = carrier || '';
-      order.supplierPO.trackingNumber = trackingNumber || '';
-    }
-
-    // Also update SupplierPO document in database if exists
-    await SupplierPO.updateMany(
-      { salesOrderId: order._id },
-      {
-        $set: {
-          status: 'In Transit',
-          portOfLoading: portOfLoading || '',
-          portOfDischarge: portOfDischarge || 'Karachi Port',
-          carrier: carrier || '',
-          trackingNumber: trackingNumber || '',
-          flightNumber: flightNumber || ''
-        }
-      }
-    );
-
-    // Create or update Shipment in Logistics
-    let shipment = await Shipment.findOne({ salesOrder: order._id });
-    if (!shipment) {
-      shipment = new Shipment({
-        salesOrder: order._id,
-        salesOrderNumber: order.orderNumber || order.orderReference,
-        salesPerson: order.salesPerson || req.user._id,
-        salePerson: order.salePerson || req.user.fullName,
-        clientName: order.clientName,
-        clientEmail: order.clientEmail || '',
-        clientPhone: order.clientPhone || '',
-        supplierName: effectiveSupplier,
-        supplierCountry: effectiveCountry,
-        supplierPoNumber: effectivePoNumber,
-        supplierPoDate: order.supplierPO?.issueDate || new Date(),
-        fileType: 'Blue',
-        status: 'In Transit',
-        description: order.productSummary || 'Imported Goods Scope',
-        items: order.items || [],
-        carrier: carrier || '',
-        flightNumber: flightNumber || '',
-        trackingNumber: trackingNumber || '',
-        shippingMethod: shippingMethod || 'Air Freight',
-        departureLocation: portOfLoading || departureLocation || '',
-        destinationLocation: portOfDischarge || destinationLocation || 'Karachi Port',
-        etd: etd ? new Date(etd) : null,
-        eta: eta ? new Date(eta) : null,
-        notes: notes || remarks || '',
-        createdBy: req.user._id
+    const existingShipment = await Shipment.findOne({ salesOrder: order._id }).select('shipmentId').lean();
+    if (existingShipment) {
+      return res.status(409).json({
+        success: false,
+        message: `Shipment ${existingShipment.shipmentId} already exists for this Sales Order.`
       });
-    } else {
-      shipment.carrier = carrier || shipment.carrier;
-      shipment.flightNumber = flightNumber || shipment.flightNumber;
-      shipment.trackingNumber = trackingNumber || shipment.trackingNumber;
-      shipment.shippingMethod = shippingMethod || shipment.shippingMethod;
-      shipment.departureLocation = portOfLoading || departureLocation || shipment.departureLocation;
-      shipment.destinationLocation = portOfDischarge || destinationLocation || shipment.destinationLocation;
-      if (etd) shipment.etd = new Date(etd);
-      if (eta) shipment.eta = new Date(eta);
-      if (notes || remarks) shipment.notes = notes || remarks;
-      shipment.status = 'In Transit';
+    }
+    if (!['Ready to Pick Up', 'Picked Up'].includes(order.supplierPO?.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Complete the Ready to Pick Up checkpoint before moving this order to Logistics.'
+      });
     }
 
-    await shipment.save();
-    order.shipmentId = shipment._id;
-    order.shipmentNumber = shipment.shipmentId;
-
-    order.workflowHistory.push({
-      user: req.user._id,
-      userName: req.user.fullName,
-      department: 'Global Purchaser',
-      action: 'Moved to Logistics with Flight & Tracking Details',
-      previousStatus: 'Pending Global Procurement',
-      newStatus: 'In Logistics',
-      timestamp: new Date(),
-      notes: `Order moved to Logistics. Carrier: ${carrier || '—'}, Tracking: ${trackingNumber || '—'}, Flight/Vessel: ${flightNumber || '—'}.`
-    });
-
-    await order.save();
-
-    await notifyRoleHelper(['logistics', 'admin', 'ceo'], {
-      type: 'order',
-      title: 'New Blue File Shipment in Logistics',
-      message: `Global Supplier PO #${effectivePoNumber} for Sales Order ${order.orderNumber || order.orderReference} moved to Logistics with tracking details.`,
-      link: '/logistics/shipments',
-      sender: req.user._id
-    });
-
+    const shipment = await handoffGlobalOrderToLogistics(order, req.user);
     return res.status(200).json({
       success: true,
       message: `Sales Order ${order.orderNumber || order.orderReference} and Supplier PO successfully moved to Logistics Department!`,

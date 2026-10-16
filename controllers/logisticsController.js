@@ -284,7 +284,7 @@ const createShipment = async (req, res) => {
     // Check if shipment already exists
     const existing = await Shipment.findOne({ salesOrder: order._id });
     if (existing) {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
         message: `Shipment ${existing.shipmentId} already exists for this Sales Order.`,
         data: existing
@@ -405,6 +405,13 @@ const updateShipmentTracking = async (req, res) => {
 
     const previousStatus = shipment.status;
 
+    if (shipment.fileType === 'Blue' && status === 'In Transit' && !['Picked Up', 'In Transit'].includes(previousStatus)) {
+      return res.status(400).json({ success: false, message: 'Confirm Picked Up before marking this shipment In Transit.' });
+    }
+    if (shipment.fileType === 'Blue' && status === 'Picked Up' && ['In Transit', 'Arrived', 'Received in Office'].includes(previousStatus)) {
+      return res.status(200).json({ success: true, message: 'Picked Up is already complete for this shipment.', data: shipment });
+    }
+
     if (etd !== undefined) shipment.etd = etd ? new Date(etd) : null;
     if (eta !== undefined) shipment.eta = eta ? new Date(eta) : null;
     if (actualDepartureDate !== undefined) shipment.actualDepartureDate = actualDepartureDate ? new Date(actualDepartureDate) : null;
@@ -503,6 +510,9 @@ const updateCustomsClearance = async (req, res) => {
     }
     if (shipment.receivedInOffice || shipment.customsClearanceStatus === 'Received in Office') {
       return res.status(400).json({ success: false, message: 'This shipment has already been received in office.' });
+    }
+    if (!['In Transit', 'Arrived'].includes(shipment.status)) {
+      return res.status(400).json({ success: false, message: 'Mark the shipment In Transit before updating customs clearance.' });
     }
 
     const state = req.body.state;
