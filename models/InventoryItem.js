@@ -71,6 +71,7 @@ const InventoryItemSchema = new mongoose.Schema(
         type: { type: String, enum: ['IN', 'OUT'], default: 'IN' },
         quantity: { type: Number, default: 0 },
         reference: { type: String, trim: true, default: '' },
+        grnNumber: { type: String, trim: true, default: '' },
         salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
         orderNumber: { type: String, trim: true, default: '' },
         remarks: { type: String, default: '' },

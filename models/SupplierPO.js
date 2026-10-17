@@ -62,6 +62,10 @@ const supplierPOSchema = new mongoose.Schema(
       required: true,
       min: 0
     },
+    subtotal: { type: Number, default: 0, min: 0 },
+    gstRate: { type: Number, default: 0, min: 0 },
+    gstAmount: { type: Number, default: 0, min: 0 },
+    total: { type: Number, default: 0, min: 0 },
     salesOrderId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'SalesOrder',

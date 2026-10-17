@@ -7,6 +7,8 @@ const CustomerPOSchema = new mongoose.Schema(
     customerName: { type: String, required: [true, 'Customer name is required'], trim: true },
     quotationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation', default: null },
     quotationNumber: { type: String, trim: true, default: '' },
+    fileNumber: { type: String, trim: true, default: '' },
+    fileType: { type: String, enum: ['Blue', 'Green', ''], default: '' },
     productFileId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductFile', default: null },
     salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
     amount: { type: Number, default: 0 },

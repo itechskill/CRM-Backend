@@ -14,6 +14,7 @@ const {
   createPurchaserGRN,
   getLocalPayables,
   createLocalPayable,
+  recordLocalPayablePayment,
   getFinancialCharges,
   createFinancialCharge,
   getPurchaserDashboardStats,
@@ -55,6 +56,13 @@ const localPurchaserAccess = [purchaserAccess, requirePurchaserSubDept('Local')]
 const globalPurchaserAccess = [purchaserAccess, requirePurchaserSubDept('Global')];
 const localPayablesReadAccess = [
   authorize('purchaser', 'finance', 'accountant', 'admin', 'ceo'),
+  (req, res, next) => {
+    if (req.user.role !== 'purchaser') return next();
+    return requirePurchaserSubDept('Local')(req, res, next);
+  }
+];
+const localPayablePaymentAccess = [
+  authorize('purchaser', 'finance', 'admin', 'ceo'),
   (req, res, next) => {
     if (req.user.role !== 'purchaser') return next();
     return requirePurchaserSubDept('Local')(req, res, next);
@@ -246,6 +254,7 @@ router.post('/grns', localPurchaserAccess, createPurchaserGRN);
 // Local Payables
 router.get('/payables', localPayablesReadAccess, getLocalPayables);
 router.post('/payables', localPurchaserAccess, createLocalPayable);
+router.post('/payables/:id/payments', localPayablePaymentAccess, recordLocalPayablePayment);
 
 // Financial Charges (Accessible by Finance, Admin, CEO, Accountant)
 router.get('/financial-charges', financialChargesAccess, getFinancialCharges);
