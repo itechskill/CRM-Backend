@@ -95,12 +95,18 @@ const SalesOrderSchema = new mongoose.Schema(
         }
       ],
       totalAmount: { type: Number, default: 0 },
+      subtotal: { type: Number, default: 0 },
+      gstRate: { type: Number, default: 0 },
+      gstAmount: { type: Number, default: 0 },
+      total: { type: Number, default: 0 },
       currency: { type: String, default: 'PKR' },
       notes: { type: String, default: '' },
       issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
       issuedByName: { type: String, default: '' },
       issuedAt: { type: Date, default: null }
     },
+    supplierPoId: { type: mongoose.Schema.Types.ObjectId, ref: 'SupplierPO', default: null },
+    supplierPoNumber: { type: String, default: '' },
     goodsReceivedInOffice: {
       received: { type: Boolean, default: false },
       receivedAt: { type: Date, default: null },
@@ -111,9 +117,12 @@ const SalesOrderSchema = new mongoose.Schema(
       remarks: { type: String, default: '' }
     },
     inventoryReceived: { type: Boolean, default: false },
+    inventoryFulfilledFromExistingStock: { type: Boolean, default: false },
+    inventoryGrnNumbers: [{ type: String, trim: true }],
     inventoryReceipts: [
       {
         receiptId: { type: String, default: '' },
+        grnNumber: { type: String, default: '' },
         receivedAt: { type: Date, default: Date.now },
         receivedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
         receivedByName: { type: String, default: '' },

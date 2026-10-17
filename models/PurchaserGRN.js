@@ -61,6 +61,8 @@ const purchaserGRNSchema = new mongoose.Schema(
       type: String,
       default: ''
     },
+    supplierBillNumber: { type: String, default: '' },
+    supplierBillDate: { type: Date, default: null },
     grnDate: {
       type: Date,
       default: Date.now
