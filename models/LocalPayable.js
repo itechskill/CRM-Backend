@@ -42,8 +42,12 @@ const localPayableSchema = new mongoose.Schema(
     },
     paymentMethod: {
       type: String,
-      enum: ['Cash', 'Cheque', 'PDC'],
-      required: true
+      enum: ['', 'Cash', 'Cheque', 'PDC'],
+      default: ''
+    },
+    paymentTerms: {
+      type: String,
+      default: ''
     },
     amount: {
       type: Number,
@@ -52,7 +56,7 @@ const localPayableSchema = new mongoose.Schema(
     },
     paymentDate: {
       type: Date,
-      default: Date.now
+      default: null
     },
     // Cheque & PDC specific fields
     chequeNumber: {

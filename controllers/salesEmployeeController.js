@@ -71,6 +71,49 @@ const hasValidCustomerPOAttachment = (po) => {
   );
 };
 
+const normalizeInventoryName = (value) => {
+  const normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const duplicatedSuffix = normalized.match(/^(.*?)\s*\((.*?)\)$/);
+  if (duplicatedSuffix && duplicatedSuffix[1].trim() === duplicatedSuffix[2].trim()) {
+    return duplicatedSuffix[1].trim();
+  }
+  return normalized;
+};
+
+const getInventoryMatches = (orderItem, inventoryItems) => {
+  const productName = normalizeInventoryName(orderItem?.description || orderItem?.name);
+  const sku = String(orderItem?.sku || '').trim().toLowerCase();
+  return inventoryItems.filter(item => {
+    const nameMatches = productName && normalizeInventoryName(item.name) === productName;
+    const skuMatches = sku && String(item.sku || '').trim().toLowerCase() === sku;
+    return Boolean(nameMatches || skuMatches);
+  });
+};
+
+const hasInventoryContextMismatch = (inventoryItem, fileType) => {
+  const context = `${inventoryItem?.category || ''} ${inventoryItem?.location || ''}`.toLowerCase();
+  if (fileType === 'Green') return /(import|logistic|international|global)/.test(context);
+  if (fileType === 'Blue') return /(local|domestic)/.test(context);
+  return false;
+};
+
+const getReceivedQuantityByOrderItem = (order) => {
+  const totals = new Map();
+  (order.inventoryReceipts || []).forEach(receipt => {
+    (receipt.items || []).forEach(item => {
+      const key = String(item.orderItemId || '');
+      totals.set(key, (totals.get(key) || 0) + (Number(item.receivedQty) || 0));
+    });
+  });
+  return totals;
+};
+
+const createHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
 // ══════════════════════════════════════════════
 // ══════════════════════════════════════════════
 // DASHBOARD STATS & FINANCIALS FOR SALES TEAM MEMBER
@@ -2211,25 +2254,28 @@ const checkOrderStock = async (req, res) => {
       { description: order.productSummary || 'Product Scope Items', quantity: 1 }
     ];
 
+    const inventoryItems = await InventoryItem.find({});
+    const receivedInventoryByOrderItem = new Map();
+    (order.inventoryReceipts || []).forEach(receipt => {
+      (receipt.items || []).forEach(item => {
+        if (item.orderItemId && item.inventoryItem) {
+          receivedInventoryByOrderItem.set(String(item.orderItemId), String(item.inventoryItem));
+        }
+      });
+    });
+
     const stockCheckResults = [];
     let allAvailable = true;
 
     for (const item of orderItems) {
       const desc = (item.description || item.name || '').trim();
       const requiredQty = Number(item.quantity) || 1;
-
-      // Search matching InventoryItem in MongoDB
-      let inv = null;
-      if (desc) {
-        inv = await InventoryItem.findOne({
-          name: { $regex: new RegExp('^' + desc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') }
-        });
-        if (!inv) {
-          inv = await InventoryItem.findOne({
-            name: { $regex: new RegExp(desc.split(' ')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }
-          });
-        }
-      }
+      const receivedInventoryId = receivedInventoryByOrderItem.get(String(item._id));
+      const matches = getInventoryMatches(item, inventoryItems);
+      const inv = receivedInventoryId
+        ? inventoryItems.find(inventoryItem => String(inventoryItem._id) === receivedInventoryId)
+        : (matches.length === 1 ? matches[0] : null);
+      const isAmbiguous = !receivedInventoryId && matches.length > 1;
 
       const onHand = inv ? (inv.quantityOnHand || 0) : 0;
       const reserved = inv ? (inv.reservedQuantity || 0) : 0;
@@ -2247,9 +2293,13 @@ const checkOrderStock = async (req, res) => {
         reservedQuantity: reserved,
         availableQty: available,
         unit: inv?.unit || 'pcs',
-        status: !inv ? 'Missing from Inventory' : (isItemInStock ? 'In Stock' : 'Insufficient Stock'),
+        status: isAmbiguous ? 'Ambiguous Inventory Match' : (!inv ? 'Missing from Inventory' : (isItemInStock ? 'In Stock' : 'Insufficient Stock')),
         shortageQty: Math.max(0, requiredQty - available),
-        inventoryItemId: inv?._id || null
+        inventoryItemId: inv?._id || null,
+        inventoryName: inv?.name || '',
+        inventorySku: inv?.sku || '',
+        inventoryCategory: inv?.category || '',
+        inventoryLocation: inv?.location || ''
       });
     }
 
@@ -2274,6 +2324,76 @@ const checkOrderStock = async (req, res) => {
   } catch (error) {
     console.error('[Check Order Stock Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error checking inventory stock.' });
+  }
+};
+
+/**
+ * @desc    Preview inventory matches and receipt balances for a Support order
+ * @route   GET /api/sales-employee/orders/:id/receiving-preview
+ */
+const getGoodsReceivingPreview = async (req, res) => {
+  try {
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+    const inventoryItems = await InventoryItem.find({}).sort({ name: 1 });
+    const receivedTotals = getReceivedQuantityByOrderItem(order);
+    const orderItems = order.items && order.items.length ? order.items : [
+      { _id: 'product-summary', description: order.productSummary || 'Product Scope Items', quantity: 1 }
+    ];
+
+    const items = orderItems.map(item => {
+      const orderItemId = String(item._id || 'product-summary');
+      const orderedQty = Number(item.quantity) || 1;
+      const previouslyReceivedQty = receivedTotals.get(orderItemId) || 0;
+      const matches = getInventoryMatches(item, inventoryItems).map(match => ({
+        _id: match._id,
+        name: match.name,
+        sku: match.sku,
+        category: match.category,
+        location: match.location,
+        unit: match.unit,
+        quantityOnHand: match.quantityOnHand,
+        reservedQuantity: match.reservedQuantity,
+        contextMismatch: hasInventoryContextMismatch(match, order.fileType)
+      }));
+
+      return {
+        orderItemId,
+        productName: item.description || item.name || 'Item',
+        sku: item.sku || '',
+        orderedQty,
+        previouslyReceivedQty,
+        remainingQty: Math.max(0, orderedQty - previouslyReceivedQty),
+        matches,
+        recommendedInventoryItemId: matches.length === 1 ? matches[0]._id : null
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        orderId: order._id,
+        orderNumber: order.orderNumber || order.orderReference,
+        fileType: order.fileType,
+        inventoryReceived: order.inventoryReceived === true,
+        items,
+        inventoryOptions: inventoryItems.map(item => ({
+          _id: item._id,
+          name: item.name,
+          sku: item.sku,
+          category: item.category,
+          location: item.location,
+          unit: item.unit,
+          quantityOnHand: item.quantityOnHand,
+          reservedQuantity: item.reservedQuantity,
+          contextMismatch: hasInventoryContextMismatch(item, order.fileType)
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('[Goods Receiving Preview Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error loading inventory receiving details.' });
   }
 };
 
@@ -4324,102 +4444,271 @@ const sendSalesOrderToFinance = async (req, res) => {
  * @route   POST /api/sales-employee/orders/:id/goods-received
  */
 const recordGoodsReceivedInOffice = async (req, res) => {
+  const session = await mongoose.startSession();
+  let savedOrder = null;
   try {
-    const order = await SalesOrder.findById(req.params.id);
-    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    await session.withTransaction(async () => {
+      const order = await SalesOrder.findById(req.params.id).session(session);
+      if (!order) throw createHttpError(404, 'Sales order not found.');
+      if (order.isOverdueBlocked) {
+        throw createHttpError(400, 'Cannot receive goods: Order is on Finance HOLD due to customer overdue balance.');
+      }
+      if (order.currentDepartment !== 'Support' && order.departmentResponsible !== 'Support') {
+        throw createHttpError(400, 'Goods can only be received after the order reaches Support.');
+      }
 
-    if (order.isOverdueBlocked) {
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot record goods received: Order is on Finance HOLD due to customer overdue balance.'
-      });
-    }
+      if (order.fileType === 'Blue') {
+        const shipment = await Shipment.findOne({ salesOrder: order._id }).session(session);
+        if (!shipment || (!shipment.receivedInOffice && shipment.status !== 'Received in Office')) {
+          throw createHttpError(400, 'Cannot receive goods for Blue File: Logistics has not confirmed the shipment as Received in Office.');
+        }
+      }
 
-    // For Blue File, must be confirmed received in office by Logistics first!
-    if (order.fileType === 'Blue') {
-      const shipment = await Shipment.findOne({ salesOrder: order._id });
-      if (!shipment || (!shipment.receivedInOffice && shipment.status !== 'Received in Office')) {
-        return res.status(400).json({
-          success: false,
-          message: 'Cannot record goods received for Blue File: International shipment has not yet been confirmed as "Received in Office" by the Logistics Department.'
+      const receiptId = String(req.body.receiptId || '').trim();
+      if (!receiptId) throw createHttpError(400, 'Receipt ID is required. Please reopen the Receive Goods form and try again.');
+      if ((order.inventoryReceipts || []).some(receipt => receipt.receiptId === receiptId)) {
+        throw createHttpError(409, 'This goods receipt was already saved. Refresh the order before entering another receipt.');
+      }
+
+      const submittedItems = Array.isArray(req.body.items) ? req.body.items : [];
+      if (!submittedItems.length) throw createHttpError(400, 'Enter at least one received product quantity.');
+
+      const receivedTotals = getReceivedQuantityByOrderItem(order);
+      const inventoryItems = await InventoryItem.find({}).session(session);
+      const receiptItems = [];
+      const newlyCreatedByName = new Map();
+      let receiptQuantity = 0;
+
+      for (const submitted of submittedItems) {
+        const receivedQty = Number(submitted.receivedQty);
+        if (!Number.isFinite(receivedQty) || receivedQty < 0) {
+          throw createHttpError(400, 'Received quantities must be zero or greater.');
+        }
+        if (receivedQty === 0) continue;
+
+        const orderItem = (order.items || []).find(item => String(item._id) === String(submitted.orderItemId));
+        if (!orderItem) throw createHttpError(400, 'One of the submitted order lines is invalid. Refresh and try again.');
+
+        const orderedQty = Number(orderItem.quantity) || 1;
+        const previouslyReceivedQty = receivedTotals.get(String(orderItem._id)) || 0;
+        if (previouslyReceivedQty + receivedQty > orderedQty) {
+          throw createHttpError(400, `${orderItem.description || 'Order item'} can receive at most ${Math.max(0, orderedQty - previouslyReceivedQty)} more.`);
+        }
+
+        const matches = getInventoryMatches(orderItem, inventoryItems);
+        let inventoryItem = null;
+        let createdNew = false;
+
+        if (submitted.createNew) {
+          const newProduct = submitted.newProduct || {};
+          const newName = String(newProduct.name || orderItem.description || '').trim();
+          const newSku = String(newProduct.sku || '').trim();
+          const canonicalName = normalizeInventoryName(newName);
+          inventoryItem = newlyCreatedByName.get(canonicalName) || null;
+
+          if (!inventoryItem) {
+            const duplicate = inventoryItems.find(item =>
+              normalizeInventoryName(item.name) === canonicalName ||
+              (newSku && String(item.sku || '').trim().toLowerCase() === newSku.toLowerCase())
+            );
+            if (duplicate) {
+              throw createHttpError(409, `Inventory already contains ${duplicate.name}${duplicate.sku ? ` (${duplicate.sku})` : ''}. Select that existing row instead of creating another product.`);
+            }
+
+            const created = await InventoryItem.create([{
+              name: newName,
+              sku: newSku,
+              category: String(newProduct.category || (order.fileType === 'Blue' ? 'Imported Goods' : 'General')).trim(),
+              unit: String(newProduct.unit || 'pcs').trim(),
+              quantityOnHand: 0,
+              reservedQuantity: 0,
+              minStockLevel: Number(newProduct.minStockLevel) || 5,
+              unitPrice: Number(newProduct.unitPrice) || Number(orderItem.unitPrice) || 0,
+              location: String(newProduct.location || 'WH/Stock').trim(),
+              description: String(newProduct.description || orderItem.description || '').trim(),
+              supplierName: String(req.body.supplierName || order.supplierPO?.supplierName || '').trim(),
+              supplierPoNumber: String(order.supplierPO?.poNumber || '').trim(),
+              orderReference: order.orderNumber || order.orderReference || ''
+            }], { session });
+            inventoryItem = created[0];
+            inventoryItems.push(inventoryItem);
+            newlyCreatedByName.set(canonicalName, inventoryItem);
+            createdNew = true;
+          }
+        } else {
+          if (!submitted.inventoryItemId || !mongoose.Types.ObjectId.isValid(submitted.inventoryItemId)) {
+            if (matches.length > 1) throw createHttpError(409, `Multiple inventory rows match ${orderItem.description}. Select the correct row explicitly.`);
+            if (matches.length === 0) throw createHttpError(409, `No inventory row matches ${orderItem.description}. Select another row or create the product once.`);
+            inventoryItem = matches[0];
+          } else {
+            inventoryItem = inventoryItems.find(item => String(item._id) === String(submitted.inventoryItemId));
+            if (!inventoryItem) throw createHttpError(404, 'The selected inventory row no longer exists. Refresh and try again.');
+          }
+
+          const isAutomaticMatch = matches.some(match => String(match._id) === String(inventoryItem._id));
+          const needsConfirmation = !isAutomaticMatch || hasInventoryContextMismatch(inventoryItem, order.fileType);
+          if (needsConfirmation && submitted.confirmedSelection !== true) {
+            throw createHttpError(409, `Confirm the selected inventory row for ${orderItem.description}. Its product or warehouse context does not automatically match this ${order.fileType || ''} order.`);
+          }
+        }
+
+        const movement = {
+          type: 'IN',
+          quantity: receivedQty,
+          reference: String(req.body.referenceNumber || receiptId).trim(),
+          salesOrder: order._id,
+          orderNumber: order.orderNumber || order.orderReference || '',
+          remarks: String(req.body.remarks || 'Goods received by Support').trim(),
+          performedBy: req.user._id,
+          performedByName: req.user.fullName,
+          timestamp: new Date()
+        };
+        const updatedInventory = await InventoryItem.findByIdAndUpdate(
+          inventoryItem._id,
+          { $inc: { quantityOnHand: receivedQty }, $push: { stockMovements: movement } },
+          { new: true, runValidators: true, session }
+        );
+        const available = Math.max(0, (updatedInventory.quantityOnHand || 0) - (updatedInventory.reservedQuantity || 0));
+        const status = available <= 0 ? 'Out of Stock' : (available <= (updatedInventory.minStockLevel || 5) ? 'Low Stock' : 'In Stock');
+        if (updatedInventory.status !== status) {
+          await InventoryItem.updateOne({ _id: updatedInventory._id }, { $set: { status } }, { session });
+        }
+
+        receiptQuantity += receivedQty;
+        receivedTotals.set(String(orderItem._id), previouslyReceivedQty + receivedQty);
+        receiptItems.push({
+          orderItemId: String(orderItem._id),
+          productName: orderItem.description || 'Item',
+          sku: submitted.sku || '',
+          orderedQty,
+          receivedQty,
+          inventoryItem: updatedInventory._id,
+          inventoryName: updatedInventory.name,
+          inventorySku: updatedInventory.sku || '',
+          inventoryCategory: updatedInventory.category || '',
+          inventoryLocation: updatedInventory.location || '',
+          createdNew
         });
       }
-    }
 
-    const { receivedQuantity, orderedQuantity, remarks, receivedDate } = req.body;
-    const totalOrdered = (order.items && order.items.reduce((s, i) => s + (Number(i.quantity) || 1), 0)) || 1;
-    const rQty = Number(receivedQuantity) || totalOrdered;
-    const oQty = Number(orderedQuantity) || totalOrdered;
+      if (!receiptItems.length) throw createHttpError(400, 'Enter a received quantity greater than zero for at least one product.');
 
-    order.goodsReceivedInOffice = {
-      received: true,
-      receivedAt: receivedDate ? new Date(receivedDate) : new Date(),
-      receivedBy: req.user._id,
-      receivedByName: req.user.fullName,
-      receivedQuantity: rQty,
-      orderedQuantity: oQty,
-      remarks: remarks || 'Goods received in office and verified by Support Department.'
-    };
+      const totalOrdered = (order.items || []).reduce((sum, item) => sum + (Number(item.quantity) || 1), 0);
+      const totalReceived = (order.items || []).reduce((sum, item) => sum + (receivedTotals.get(String(item._id)) || 0), 0);
+      const allReceived = (order.items || []).length > 0 && (order.items || []).every(item =>
+        (receivedTotals.get(String(item._id)) || 0) >= (Number(item.quantity) || 1)
+      );
+      const receivedAt = req.body.referenceDate ? new Date(req.body.referenceDate) : new Date();
+      const referenceType = order.fileType === 'Blue' ? 'BL / AWB' : 'Supplier Delivery / Bill';
 
-    const prevStatus = order.workflowStatus;
-    order.workflowStatus = 'Goods Received in Office';
-    order.status = 'Goods Received in Office';
-    order.departmentResponsible = 'Support';
-    order.currentDepartment = 'Support';
-    order.currentStatus = 'GOODS_RECEIVED_IN_OFFICE';
-    order.previousDepartment = 'Logistics';
-    order.previousStatus = prevStatus;
-    order.lastAction = 'Goods Received in Office';
-    order.lastActionBy = req.user._id;
-    order.lastActionByName = req.user.fullName;
-    order.lastActionAt = new Date();
+      order.inventoryReceipts.push({
+        receiptId,
+        receivedAt,
+        receivedBy: req.user._id,
+        receivedByName: req.user.fullName,
+        referenceType,
+        referenceNumber: String(req.body.referenceNumber || '').trim(),
+        referenceDate: req.body.referenceDate ? new Date(req.body.referenceDate) : null,
+        supplierName: String(req.body.supplierName || order.supplierPO?.supplierName || '').trim(),
+        carrier: order.fileType === 'Blue' ? String(req.body.carrier || '').trim() : '',
+        containerNo: order.fileType === 'Blue' ? String(req.body.containerNo || '').trim() : '',
+        portOfLoading: order.fileType === 'Blue' ? String(req.body.portOfLoading || '').trim() : '',
+        portOfDischarge: order.fileType === 'Blue' ? String(req.body.portOfDischarge || '').trim() : '',
+        remarks: String(req.body.remarks || '').trim(),
+        items: receiptItems
+      });
+      order.inventoryReceived = allReceived;
+      order.goodsReceivedInOffice = {
+        received: allReceived,
+        receivedAt,
+        receivedBy: req.user._id,
+        receivedByName: req.user.fullName,
+        receivedQuantity: totalReceived,
+        orderedQuantity: totalOrdered,
+        remarks: String(req.body.remarks || (allReceived ? 'All ordered goods received into inventory.' : 'Partial goods receipt recorded.')).trim()
+      };
 
-    order.workflowHistory.push({
-      user: req.user._id,
-      userName: req.user.fullName,
-      department: 'Support',
-      action: 'Goods Received in Office',
-      previousStatus: prevStatus,
-      newStatus: 'Goods Received in Office',
-      timestamp: new Date(),
-      notes: remarks || `Goods received: ${rQty} of ${oQty} units verified in office.`
+      if (order.fileType === 'Blue' && req.body.referenceNumber) {
+        order.blNumber = String(req.body.referenceNumber).trim();
+        order.blInput = {
+          blNumber: order.blNumber,
+          blDate: req.body.referenceDate ? new Date(req.body.referenceDate) : null,
+          carrier: String(req.body.carrier || '').trim(),
+          containerNo: String(req.body.containerNo || '').trim(),
+          portOfLoading: String(req.body.portOfLoading || '').trim(),
+          portOfDischarge: String(req.body.portOfDischarge || '').trim(),
+          enteredBy: req.user._id,
+          enteredByName: req.user.fullName,
+          enteredAt: new Date()
+        };
+      }
+
+      const prevStatus = order.workflowStatus;
+      order.workflowStatus = 'Goods Received in Office';
+      order.status = 'Goods Received in Office';
+      order.departmentResponsible = 'Support';
+      order.currentDepartment = 'Support';
+      order.currentStatus = allReceived ? 'GOODS_RECEIVED_IN_OFFICE' : 'PARTIAL_INVENTORY_RECEIPT';
+      order.previousStatus = prevStatus;
+      order.lastAction = allReceived ? 'Inventory IN Completed' : 'Partial Inventory IN Recorded';
+      order.lastActionBy = req.user._id;
+      order.lastActionByName = req.user.fullName;
+      order.lastActionAt = new Date();
+      order.workflowHistory.push({
+        user: req.user._id,
+        userName: req.user.fullName,
+        department: 'Support',
+        action: allReceived ? 'Inventory IN Completed' : 'Partial Inventory IN Recorded',
+        previousStatus: prevStatus,
+        newStatus: 'Goods Received in Office',
+        timestamp: new Date(),
+        notes: `${receiptQuantity} unit(s) received in this entry; ${totalReceived} of ${totalOrdered} total units received.`
+      });
+
+      await order.save({ session });
+      savedOrder = order;
     });
 
-    await order.save();
-
     await logSalesActivity({
-      type: 'Goods Received in Office',
-      description: `Goods received in office for Sales Order ${order.orderNumber || order.orderReference} by Support (${req.user.fullName}). Verified: ${rQty} units.`,
+      type: 'Inventory IN',
+      description: `Support recorded Inventory IN for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference}.`,
       relatedModel: 'SalesOrder',
-      relatedId: order._id,
+      relatedId: savedOrder._id,
       performedBy: req.user._id
     });
 
-    // Notify Sales Person
-    if (order.salesPerson) {
-      await createNotificationHelper({
-        recipient: order.salesPerson,
-        sender: req.user._id,
-        title: 'Goods Received in Office',
-        message: `Goods for your Sales Order ${order.orderNumber || order.orderReference} have been received in office by Support (${rQty} units).`,
-        type: 'order',
-        link: '/employee/sales/orders'
-      });
+    if (savedOrder.inventoryReceived && savedOrder.salesPerson) {
+      try {
+        await createNotificationHelper({
+          recipient: savedOrder.salesPerson,
+          sender: req.user._id,
+          title: 'Inventory IN Completed',
+          message: `All goods for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference} have been received into inventory by Support.`,
+          type: 'order',
+          link: '/employee/sales/orders'
+        });
+      } catch (notificationError) {
+        console.error('[Inventory IN Notification Error]:', notificationError.message);
+      }
     }
 
     return res.status(200).json({
       success: true,
-      message: `Goods receipt confirmed in office for Sales Order ${order.orderNumber || order.orderReference}!`,
-      data: order
+      message: savedOrder.inventoryReceived
+        ? `Inventory IN completed for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference}.`
+        : `Partial Inventory IN recorded for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference}.`,
+      data: savedOrder
     });
   } catch (err) {
     console.error('[Record Goods Received Error]:', err);
-    return res.status(500).json({ success: false, message: 'Server error recording goods received.' });
+    return res.status(err.statusCode || 500).json({ success: false, message: err.statusCode ? err.message : 'Server error recording goods received.' });
+  } finally {
+    await session.endSession();
   }
 };
 
 /**
- * @desc    Record Inventory Check and Bill of Lading (BL) input (Support Department Action)
+ * @desc    Record Bill of Lading (BL) / receiving reference metadata (Support Department Action)
  * @route   POST /api/sales-employee/orders/:id/bl-input
  */
 const recordBLInput = async (req, res) => {
@@ -4434,10 +4723,7 @@ const recordBLInput = async (req, res) => {
       });
     }
 
-    const { blNumber, blDate, carrier, containerNo, portOfLoading, portOfDischarge, stockVerified } = req.body;
-    if (!blNumber && !order.blNumber) {
-      return res.status(400).json({ success: false, message: 'BL Number is required.' });
-    }
+    const { blNumber, blDate, carrier, containerNo, portOfLoading, portOfDischarge } = req.body;
 
     const finalBlNumber = (blNumber || order.blNumber || '').trim();
     order.blNumber = finalBlNumber;
@@ -4453,15 +4739,8 @@ const recordBLInput = async (req, res) => {
       enteredAt: new Date()
     };
 
-    const prevStatus = order.workflowStatus;
-    order.workflowStatus = 'Inventory & BL Verified';
-    order.status = 'Inventory & BL Verified';
-    order.departmentResponsible = 'Support';
-    order.currentDepartment = 'Support';
-    order.currentStatus = 'BL_RECORDED';
-    order.previousDepartment = 'Logistics';
-    order.previousStatus = prevStatus;
-    order.lastAction = 'Inventory Check and BL Input';
+    const currentWorkflowStatus = order.workflowStatus;
+    order.lastAction = 'BL / Reference Details Recorded';
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
     order.lastActionAt = new Date();
@@ -4470,18 +4749,18 @@ const recordBLInput = async (req, res) => {
       user: req.user._id,
       userName: req.user.fullName,
       department: 'Support',
-      action: 'Inventory Check and BL Input',
-      previousStatus: prevStatus,
-      newStatus: 'Inventory & BL Verified',
+      action: 'BL / Reference Details Recorded',
+      previousStatus: currentWorkflowStatus,
+      newStatus: currentWorkflowStatus,
       timestamp: new Date(),
-      notes: `BL #${finalBlNumber} recorded, warehouse inventory verified. Ready for Delivery Note creation.`
+      notes: finalBlNumber ? `BL / reference #${finalBlNumber} recorded as metadata.` : 'BL / reference metadata updated.'
     });
 
     await order.save();
 
     await logSalesActivity({
-      type: 'Inventory & BL Verified',
-      description: `Support (${req.user.fullName}) recorded BL #${finalBlNumber} and verified inventory for Sales Order ${order.orderNumber || order.orderReference}`,
+      type: 'BL / Reference Details Recorded',
+      description: `Support (${req.user.fullName}) updated BL / reference metadata for Sales Order ${order.orderNumber || order.orderReference}`,
       relatedModel: 'SalesOrder',
       relatedId: order._id,
       performedBy: req.user._id
@@ -4489,7 +4768,7 @@ const recordBLInput = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: `BL #${finalBlNumber} and inventory check verified! Ready for Delivery Note (DN).`,
+      message: 'BL / reference details recorded. Inventory quantities were not changed.',
       data: order
     });
   } catch (err) {
@@ -4715,6 +4994,20 @@ const createOrUpdateInventoryItem = async (req, res) => {
     const { id, name, sku, category, unit, quantityOnHand, minStockLevel, unitPrice, location, description } = req.body;
     if (!name) return res.status(400).json({ success: false, message: 'Product name is required.' });
 
+    const inventoryItems = await InventoryItem.find(id ? { _id: { $ne: id } } : {});
+    const normalizedName = normalizeInventoryName(name);
+    const normalizedSku = String(sku || '').trim().toLowerCase();
+    const duplicate = inventoryItems.find(existing =>
+      normalizeInventoryName(existing.name) === normalizedName ||
+      (normalizedSku && String(existing.sku || '').trim().toLowerCase() === normalizedSku)
+    );
+    if (duplicate) {
+      return res.status(409).json({
+        success: false,
+        message: `Inventory already contains ${duplicate.name}${duplicate.sku ? ` (${duplicate.sku})` : ''}. Use Inventory IN on the existing row.`
+      });
+    }
+
     let item;
     if (id) {
       item = await InventoryItem.findByIdAndUpdate(
@@ -4732,6 +5025,45 @@ const createOrUpdateInventoryItem = async (req, res) => {
   } catch (error) {
     console.error('[Save Inventory Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error saving inventory item.' });
+  }
+};
+
+const addInventoryStock = async (req, res) => {
+  try {
+    const quantity = Number(req.body.quantity);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({ success: false, message: 'Inventory IN quantity must be greater than zero.' });
+    }
+
+    const item = await InventoryItem.findByIdAndUpdate(
+      req.params.id,
+      {
+        $inc: { quantityOnHand: quantity },
+        $push: {
+          stockMovements: {
+            type: 'IN',
+            quantity,
+            reference: String(req.body.reference || '').trim(),
+            orderNumber: String(req.body.orderNumber || '').trim(),
+            remarks: String(req.body.remarks || '').trim(),
+            performedBy: req.user._id,
+            performedByName: req.user.fullName,
+            timestamp: new Date()
+          }
+        }
+      },
+      { new: true, runValidators: true }
+    );
+    if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+
+    const available = Math.max(0, (item.quantityOnHand || 0) - (item.reservedQuantity || 0));
+    item.status = available <= 0 ? 'Out of Stock' : (available <= (item.minStockLevel || 5) ? 'Low Stock' : 'In Stock');
+    await item.save();
+
+    return res.status(200).json({ success: true, message: `${quantity} ${item.unit || 'pcs'} added to ${item.name}.`, data: item });
+  } catch (error) {
+    console.error('[Inventory IN Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error adding inventory stock.' });
   }
 };
 
@@ -5324,6 +5656,7 @@ module.exports = {
   deleteMyOrder,
   financeReviewSalesOrder,
   checkOrderStock,
+  getGoodsReceivingPreview,
   getAvailableOrdersForDelivery,
   getMyProformaInvoices,
   createMyProformaInvoice,
@@ -5362,6 +5695,7 @@ module.exports = {
   getSupportStats,
   getInventoryItems,
   createOrUpdateInventoryItem,
+  addInventoryStock,
   confirmDeliveryNoteWithInventory,
   getAccountsStats,
   getAccountsPendingDeliveryNotes,

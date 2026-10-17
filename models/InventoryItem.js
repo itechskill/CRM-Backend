@@ -66,6 +66,19 @@ const InventoryItemSchema = new mongoose.Schema(
       trim: true,
       default: ''
     },
+    stockMovements: [
+      {
+        type: { type: String, enum: ['IN', 'OUT'], default: 'IN' },
+        quantity: { type: Number, default: 0 },
+        reference: { type: String, trim: true, default: '' },
+        salesOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
+        orderNumber: { type: String, trim: true, default: '' },
+        remarks: { type: String, default: '' },
+        performedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+        performedByName: { type: String, default: '' },
+        timestamp: { type: Date, default: Date.now }
+      }
+    ],
     status: {
       type: String,
       enum: ['In Stock', 'Low Stock', 'Out of Stock'],

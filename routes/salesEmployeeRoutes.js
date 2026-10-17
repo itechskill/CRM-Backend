@@ -29,6 +29,7 @@ const {
   getMyOrders,
   getAvailableOrdersForDelivery,
   checkOrderStock,
+  getGoodsReceivingPreview,
   createMyOrder,
   updateMyOrder,
   deleteMyOrder,
@@ -64,6 +65,7 @@ const {
   getSupportStats,
   getInventoryItems,
   createOrUpdateInventoryItem,
+  addInventoryStock,
   confirmDeliveryNoteWithInventory,
   getAccountsStats,
   getAccountsPendingDeliveryNotes,
@@ -80,6 +82,7 @@ const {
 
 // All Departmental Roles, Admin & CEO access departmental CRM endpoints
 const salesEmployeeGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'logistics', 'purchaser', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
+const supportInventoryGuard = [protect, authorize('support', 'admin', 'ceo')];
 
 // Dashboard stats
 router.get('/stats', salesEmployeeGuard, getMySalesStats);
@@ -124,12 +127,13 @@ router.delete('/quotations/:id', salesEmployeeGuard, deleteMyQuotation);
 router.get('/orders', salesEmployeeGuard, getMyOrders);
 router.get('/orders/available-for-delivery', salesEmployeeGuard, getAvailableOrdersForDelivery);
 router.get('/orders/:id/stock-check', salesEmployeeGuard, checkOrderStock);
+router.get('/orders/:id/receiving-preview', supportInventoryGuard, getGoodsReceivingPreview);
 router.post('/orders', salesEmployeeGuard, createMyOrder);
 router.post('/orders/:id/send-to-support', salesEmployeeGuard, sendOrderToSupport);
 router.post('/orders/:id/send-to-finance', salesEmployeeGuard, sendSalesOrderToFinance);
 router.post('/orders/:id/finance-review', salesEmployeeGuard, financeReviewSalesOrder);
-router.post('/orders/:id/goods-received', salesEmployeeGuard, recordGoodsReceivedInOffice);
-router.post('/orders/:id/bl-input', salesEmployeeGuard, recordBLInput);
+router.post('/orders/:id/goods-received', supportInventoryGuard, recordGoodsReceivedInOffice);
+router.post('/orders/:id/bl-input', supportInventoryGuard, recordBLInput);
 router.post('/orders/:id/issue-supplier-po', salesEmployeeGuard, issueSupplierPO);
 router.patch('/orders/:id', salesEmployeeGuard, updateMyOrder);
 router.delete('/orders/:id', salesEmployeeGuard, deleteMyOrder);
@@ -137,7 +141,8 @@ router.delete('/orders/:id', salesEmployeeGuard, deleteMyOrder);
 // Support & Inventory Department Routes
 router.get('/support/stats', salesEmployeeGuard, getSupportStats);
 router.get('/inventory', salesEmployeeGuard, getInventoryItems);
-router.post('/inventory', salesEmployeeGuard, createOrUpdateInventoryItem);
+router.post('/inventory', supportInventoryGuard, createOrUpdateInventoryItem);
+router.post('/inventory/:id/in', supportInventoryGuard, addInventoryStock);
 
 // Proforma Invoices
 router.get('/proforma-invoices', salesEmployeeGuard, getMyProformaInvoices);

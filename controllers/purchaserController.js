@@ -12,6 +12,66 @@ const Shipment = require('../models/Shipment');
 const logAudit = require('../utils/auditLogger');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
 
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const findExistingLocalPayable = async ({ supplierPOId, poNumber, salesOrderId }) => {
+  const duplicateChecks = [];
+  if (supplierPOId) duplicateChecks.push({ supplierPO: supplierPOId });
+  if (salesOrderId) duplicateChecks.push({ salesOrderId });
+  if (poNumber) {
+    duplicateChecks.push({
+      poNumber: { $regex: `^${escapeRegex(poNumber.trim())}$`, $options: 'i' }
+    });
+  }
+  if (duplicateChecks.length === 0) return null;
+  return LocalPayable.findOne({ $or: duplicateChecks });
+};
+
+const ensureLocalPayableForSupplierPO = async ({ po, linkedOrder, user }) => {
+  const salesOrderId = po.salesOrderId || linkedOrder?._id || null;
+  const existingPayable = await findExistingLocalPayable({
+    supplierPOId: po._id,
+    poNumber: po.poNumber,
+    salesOrderId
+  });
+  if (existingPayable) return { payable: existingPayable, created: false };
+
+  let isBlocked = false;
+  let blockReason = '';
+  if (linkedOrder && (linkedOrder.advanceRequired || linkedOrder.advanceRequiredAmount > 0)) {
+    const received = linkedOrder.advanceReceived ? (linkedOrder.netAmount || 1) : (linkedOrder.advanceReceivedAmount || 0);
+    const required = linkedOrder.advanceRequiredAmount || 1;
+    if (!linkedOrder.advanceReceived && received < required) {
+      isBlocked = true;
+      blockReason = `Required customer advance has not been received (Received: PKR ${received.toLocaleString()}).`;
+    }
+  }
+
+  const payableNumber = `LP-${Date.now().toString().slice(-6)}`;
+  const payable = await LocalPayable.create({
+    payableNumber,
+    supplier: po.supplier || null,
+    supplierName: po.supplierName,
+    supplierPO: po._id,
+    poNumber: po.poNumber,
+    salesOrderId,
+    salesOrderNumber: po.salesOrderNumber || linkedOrder?.orderNumber || linkedOrder?.orderReference || '',
+    paymentMethod: '',
+    paymentTerms: po.paymentTerms || '',
+    amount: Number(po.totalAmount) || 0,
+    paymentDate: null,
+    status: isBlocked ? 'Payment Blocked – Awaiting Customer Advance' : 'Pending',
+    isBlockedByAdvance: isBlocked,
+    remarks: isBlocked
+      ? `[BLOCKED] ${blockReason} | Automatically created from Local Supplier PO ${po.poNumber}.`
+      : `Automatically created from Local Supplier PO ${po.poNumber}.`,
+    createdBy: user._id,
+    createdByName: user.fullName
+  });
+
+  return { payable, created: true };
+};
+
 // ── SUPPLIER MANAGEMENT ────────────────────────────────────────────────────────
 exports.getSuppliers = async (req, res) => {
   try {
@@ -170,6 +230,10 @@ exports.createSupplierPO = async (req, res) => {
       createdBy: req.user._id,
       createdByName: req.user.fullName
     });
+
+    if (type === 'Local') {
+      await ensureLocalPayableForSupplierPO({ po, linkedOrder, user: req.user });
+    }
 
     if (linkedOrder) {
       linkedOrder.supplierPO = {
@@ -515,7 +579,9 @@ exports.getLocalPayables = async (req, res) => {
       filter.$or = [
         { payableNumber: { $regex: search, $options: 'i' } },
         { supplierName: { $regex: search, $options: 'i' } },
-        { chequeNumber: { $regex: search, $options: 'i' } }
+        { chequeNumber: { $regex: search, $options: 'i' } },
+        { poNumber: { $regex: search, $options: 'i' } },
+        { salesOrderNumber: { $regex: search, $options: 'i' } }
       ];
     }
     const payables = await LocalPayable.find(filter).populate('supplier supplierPO grn').sort({ createdAt: -1 });
@@ -556,20 +622,36 @@ exports.createLocalPayable = async (req, res) => {
 
     let poNumber = '';
     let targetPoId = supplierPoId;
+    let targetPo = null;
     let linkedOrder = null;
     if (targetPoId && mongoose.Types.ObjectId.isValid(targetPoId)) {
-      const po = await SupplierPO.findById(targetPoId);
-      if (po) poNumber = po.poNumber;
+      targetPo = await SupplierPO.findById(targetPoId);
+      if (targetPo) poNumber = targetPo.poNumber;
     }
     if (!poNumber && supplierPONumber) {
-      const po = await SupplierPO.findOne({ poNumber: supplierPONumber.trim() });
-      if (po) {
-        poNumber = po.poNumber;
-        targetPoId = po._id;
+      targetPo = await SupplierPO.findOne({ poNumber: supplierPONumber.trim() });
+      if (targetPo) {
+        poNumber = targetPo.poNumber;
+        targetPoId = targetPo._id;
       }
     }
     if (salesOrderId) {
       linkedOrder = await SalesOrder.findById(salesOrderId);
+    } else if (targetPo?.salesOrderId) {
+      linkedOrder = await SalesOrder.findById(targetPo.salesOrderId);
+    }
+
+    const existingPayable = await findExistingLocalPayable({
+      supplierPOId: targetPoId,
+      poNumber: poNumber || supplierPONumber,
+      salesOrderId: linkedOrder?._id || salesOrderId
+    });
+    if (existingPayable) {
+      return res.status(409).json({
+        success: false,
+        message: `A Local Payable already exists for ${existingPayable.salesOrderNumber ? `Sales Order ${existingPayable.salesOrderNumber}` : `Supplier PO ${existingPayable.poNumber || supplierPONumber}`}.`,
+        data: existingPayable
+      });
     }
 
     // SERVER-SIDE FINANCIAL CONTROL: Customer Advance Check
@@ -602,6 +684,7 @@ exports.createLocalPayable = async (req, res) => {
       salesOrderNumber: linkedOrder ? (linkedOrder.orderNumber || linkedOrder.orderReference) : '',
       grn: grnId || null,
       paymentMethod,
+      paymentTerms: req.body.paymentTerms || targetPo?.paymentTerms || '',
       amount: finalAmount,
       paymentDate: paymentDate || Date.now(),
       chequeNumber: chequeNumber || '',
@@ -984,7 +1067,7 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
     const poTotal = Number(totalAmountPKR ?? req.body.totalAmount) || calculatedTotal || Number(order.netAmount || order.totalAmount) || 0;
     const issuedAt = new Date();
 
-    await SupplierPO.create({
+    const supplierPO = await SupplierPO.create({
       poNumber: finalPoNumber,
       supplierName: finalSupplierName,
       supplierCountry: 'Pakistan',
@@ -1058,6 +1141,8 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
     });
 
     await order.save();
+
+    await ensureLocalPayableForSupplierPO({ po: supplierPO, linkedOrder: order, user: req.user });
 
     await notifyRoleHelper(['support', 'operations', 'admin', 'ceo'], {
       type: 'order',
