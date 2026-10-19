@@ -7,6 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "lint": "node --check models/PriceRequest.js && node --check models/PriceRequestRoutingRule.js && node --check controllers/priceRequestController.js && node --check routes/priceRequestRoutes.js && node --check tests/priceRequests.api.test.js",
+    "test:price-requests": "node --test tests/priceRequests.api.test.js",
     "seed:admin": "node scripts/seedAdmin.js",
     "reset:admin": "node scripts/resetAdmin.js"
   },
