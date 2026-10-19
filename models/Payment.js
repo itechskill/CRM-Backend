@@ -1,5 +1,13 @@
 const mongoose = require('mongoose');
 
+const PaymentAllocationSchema = new mongoose.Schema({
+  invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: true },
+  invoiceNumber: { type: String, trim: true, default: '' },
+  salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
+  salesOrderNumber: { type: String, trim: true, default: '' },
+  amount: { type: Number, required: true, min: 0 }
+}, { _id: false });
+
 const PaymentSchema = new mongoose.Schema(
   {
     paymentRefNumber: { type: String, trim: true, default: '' },
@@ -8,6 +16,7 @@ const PaymentSchema = new mongoose.Schema(
     salesOrderNumber: { type: String, trim: true, default: '' },
     invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
     invoiceNumber: { type: String, trim: true, default: '' },
+    allocations: { type: [PaymentAllocationSchema], default: undefined },
     paymentDate: { type: Date, default: Date.now },
     amount: { type: Number, required: [true, 'Payment amount is required'], min: 0 },
     paymentType: {

@@ -20,6 +20,11 @@ const Attendance = require('../models/Attendance');
 const Leave = require('../models/Leave');
 const User = require('../models/User');
 const Shipment = require('../models/Shipment');
+const SupplierPO = require('../models/SupplierPO');
+const PurchaserGRN = require('../models/PurchaserGRN');
+const LocalPayable = require('../models/LocalPayable');
+const Counter = require('../models/Counter');
+const { getCounterKey } = require('../utils/counterKey');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
 const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const { getSalesManagerScope } = require('../utils/salesManagerScope');
@@ -52,6 +57,9 @@ const CUSTOMER_PO_ATTACHMENT_EXTENSION = /\.(pdf|xls|xlsx|png|jpe?g|webp|gif|bmp
 const CUSTOMER_PO_ATTACHMENT_DATA_URL = /^data:(application\/pdf|application\/vnd\.ms-excel|application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet|image\/(png|jpeg|webp|gif|bmp));base64,/i;
 const CUSTOMER_PO_ATTACHMENT_MAX_SIZE = 3 * 1024 * 1024;
 const CUSTOMER_PO_ATTACHMENT_MESSAGE = 'Attach the Customer PO as a PDF, Excel file, or screenshot (maximum 3 MB) before continuing.';
+const SIGNED_DN_ATTACHMENT_EXTENSION = /\.(pdf|png|jpe?g|webp|gif|bmp)$/i;
+const SIGNED_DN_ATTACHMENT_DATA_URL = /^data:(application\/pdf|image\/(png|jpeg|webp|gif|bmp));base64,/i;
+const SIGNED_DN_ATTACHMENT_MESSAGE = 'Attach the signed Delivery Note as a PDF or image (maximum 3 MB) before confirming delivery.';
 
 const getBase64DataSize = (dataUrl) => {
   const base64 = String(dataUrl || '').split(',')[1] || '';
@@ -69,6 +77,237 @@ const hasValidCustomerPOAttachment = (po) => {
     CUSTOMER_PO_ATTACHMENT_DATA_URL.test(uploadedDocument) &&
     getBase64DataSize(uploadedDocument) <= CUSTOMER_PO_ATTACHMENT_MAX_SIZE
   );
+};
+
+const hasValidSignedDeliveryNoteAttachment = (document, documentName) => Boolean(
+  String(document || '').trim() &&
+  String(documentName || '').trim() &&
+  SIGNED_DN_ATTACHMENT_EXTENSION.test(String(documentName).trim()) &&
+  SIGNED_DN_ATTACHMENT_DATA_URL.test(String(document).trim()) &&
+  getBase64DataSize(document) <= CUSTOMER_PO_ATTACHMENT_MAX_SIZE
+);
+
+const normalizeInventoryName = (value) => {
+  const normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const duplicatedSuffix = normalized.match(/^(.*?)\s*\((.*?)\)$/);
+  if (duplicatedSuffix && duplicatedSuffix[1].trim() === duplicatedSuffix[2].trim()) {
+    return duplicatedSuffix[1].trim();
+  }
+  return normalized;
+};
+
+const getInventoryMatches = (orderItem, inventoryItems) => {
+  const productName = normalizeInventoryName(orderItem?.description || orderItem?.name);
+  const sku = String(orderItem?.sku || '').trim().toLowerCase();
+  return inventoryItems.filter(item => {
+    const nameMatches = productName && normalizeInventoryName(item.name) === productName;
+    const skuMatches = sku && String(item.sku || '').trim().toLowerCase() === sku;
+    return Boolean(nameMatches || skuMatches);
+  });
+};
+
+const hasInventoryContextMismatch = (inventoryItem, fileType) => {
+  const context = `${inventoryItem?.category || ''} ${inventoryItem?.location || ''}`.toLowerCase();
+  if (fileType === 'Green') return /(import|logistic|international|global)/.test(context);
+  if (fileType === 'Blue') return /(local|domestic)/.test(context);
+  return false;
+};
+
+const getReceivedQuantityByOrderItem = (order) => {
+  const totals = new Map();
+  (order.inventoryReceipts || []).forEach(receipt => {
+    (receipt.items || []).forEach(item => {
+      const key = String(item.orderItemId || '');
+      totals.set(key, (totals.get(key) || 0) + (Number(item.receivedQty) || 0));
+    });
+  });
+  return totals;
+};
+
+const getSupplierPOForOrder = async (order, session) => {
+  let supplierPO = null;
+  if (order.supplierPoId && mongoose.Types.ObjectId.isValid(order.supplierPoId)) {
+    supplierPO = await SupplierPO.findById(order.supplierPoId).session(session || null);
+  }
+  if (!supplierPO && order.supplierPO?.poNumber) {
+    supplierPO = await SupplierPO.findOne({
+      salesOrderId: order._id,
+      poNumber: order.supplierPO.poNumber
+    }).sort({ createdAt: -1 }).session(session || null);
+  }
+  if (!supplierPO) {
+    supplierPO = await SupplierPO.findOne({ salesOrderId: order._id }).sort({ createdAt: -1 }).session(session || null);
+  }
+  return supplierPO;
+};
+
+const CONFIRMED_DELIVERY_STATUSES = ['Done', 'Delivered', 'Confirmed', 'Fully Delivered'];
+
+const getDeliveryStockRequirements = async (order, { session = null, excludeDeliveryNoteId = null } = {}) => {
+  const orderItems = order.items && order.items.length
+    ? order.items
+    : [{ _id: 'product-summary', description: order.productSummary || 'Product Scope Items', quantity: 1, quantityAssumed: true }];
+  const deliveredQuery = {
+    salesOrder: order._id,
+    status: { $in: CONFIRMED_DELIVERY_STATUSES }
+  };
+  if (excludeDeliveryNoteId) deliveredQuery._id = { $ne: excludeDeliveryNoteId };
+  const [inventoryItems, earlierDeliveryNotes] = await Promise.all([
+    InventoryItem.find({}).session(session || null),
+    DeliveryNote.find(deliveredQuery).session(session || null)
+  ]);
+
+  const deliveredByName = new Map();
+  earlierDeliveryNotes.forEach(note => {
+    (note.items || []).forEach(item => {
+      const name = normalizeInventoryName(item.product || item.description);
+      if (!name) return;
+      deliveredByName.set(name, (deliveredByName.get(name) || 0) + (Number(item.quantity) || Number(item.demand) || 1));
+    });
+  });
+
+  const receiptInventoryByOrderItem = new Map();
+  (order.inventoryReceipts || []).forEach(receipt => {
+    (receipt.items || []).forEach(item => {
+      if (item.orderItemId && item.inventoryItem) {
+        receiptInventoryByOrderItem.set(String(item.orderItemId), String(item.inventoryItem));
+      }
+    });
+  });
+
+  const requirements = orderItems.map((item, index) => {
+    const itemName = String(item.description || item.name || order.productSummary || 'Item').trim();
+    const orderedQty = Number(item.quantity) || 1;
+    const normalizedItemName = normalizeInventoryName(itemName);
+    const deliveredAvailable = deliveredByName.get(normalizedItemName) || 0;
+    const deliveredQty = Math.min(orderedQty, deliveredAvailable);
+    deliveredByName.set(normalizedItemName, Math.max(0, deliveredAvailable - deliveredQty));
+    const requiredQty = Math.max(0, orderedQty - deliveredQty);
+    const receiptInventoryId = receiptInventoryByOrderItem.get(String(item._id || 'product-summary'));
+    const checkedInventoryId = order.inventoryAnalysis?.[index]?.productId;
+    const preferredInventoryId = receiptInventoryId || checkedInventoryId;
+    const exactMatches = getInventoryMatches(item, inventoryItems);
+    const inventoryItem = preferredInventoryId
+      ? inventoryItems.find(candidate => String(candidate._id) === String(preferredInventoryId))
+      : (exactMatches.length === 1 ? exactMatches[0] : null);
+
+    return {
+      item: itemName,
+      quantityAssumed: item.quantityAssumed === true || !(order.items && order.items.length),
+      orderedQty,
+      deliveredQty,
+      requiredQty,
+      inventoryItem,
+      ambiguous: !preferredInventoryId && exactMatches.length > 1
+    };
+  });
+
+  const totalsByInventoryId = new Map();
+  requirements.forEach(line => {
+    if (!line.inventoryItem || line.requiredQty <= 0) return;
+    const key = String(line.inventoryItem._id);
+    totalsByInventoryId.set(key, (totalsByInventoryId.get(key) || 0) + line.requiredQty);
+  });
+
+  const shortages = [];
+  const availableByInventoryId = new Map();
+  requirements.forEach(line => {
+    if (line.requiredQty <= 0) return;
+    const inventoryItemId = line.inventoryItem ? String(line.inventoryItem._id) : '';
+    if (inventoryItemId && !availableByInventoryId.has(inventoryItemId)) {
+      availableByInventoryId.set(
+        inventoryItemId,
+        Math.max(0, (Number(line.inventoryItem.quantityOnHand) || 0) - (Number(line.inventoryItem.reservedQuantity) || 0))
+      );
+    }
+    const available = inventoryItemId ? availableByInventoryId.get(inventoryItemId) : 0;
+    line.availableQty = available;
+    if (inventoryItemId) availableByInventoryId.set(inventoryItemId, Math.max(0, available - line.requiredQty));
+    if (!line.inventoryItem || available < line.requiredQty) {
+      shortages.push({
+        item: line.item,
+        required: line.requiredQty,
+        available,
+        reason: line.ambiguous ? 'Multiple exact inventory matches' : (!line.inventoryItem ? 'Not in inventory' : 'Insufficient stock')
+      });
+    }
+  });
+
+  const deductions = Array.from(totalsByInventoryId.entries()).map(([inventoryItemId, quantity]) => ({
+    inventoryItemId,
+    quantity,
+    item: requirements.filter(line => String(line.inventoryItem?._id) === inventoryItemId).map(line => line.item).join(', ')
+  }));
+
+  return {
+    requirements,
+    shortages,
+    deductions,
+    isFullyInStock: requirements.some(line => line.requiredQty > 0) && shortages.length === 0
+  };
+};
+
+const formatStockShortageMessage = (shortages) => {
+  const details = shortages.map(item => `${item.item} (required ${item.required}, available ${item.available})`).join('; ');
+  return `Add inventory first. Insufficient stock: ${details}.`;
+};
+
+const allocateGrnNumber = async (session) => {
+  const counterKey = getCounterKey('grn-number');
+  const counter = await Counter.findOneAndUpdate(
+    { _id: counterKey, sequence: { $lt: 999999 } },
+    { $inc: { sequence: 1 } },
+    { new: true, session }
+  );
+  if (!counter) {
+    const exists = await Counter.exists({ _id: counterKey }).session(session || null);
+    if (!exists) throw createHttpError(503, 'The GRN counter has not been initialized. Run the approved one-time seed before receiving inventory.');
+    throw createHttpError(409, 'The GRN sequence has reached GRN-999999. No further GRNs can be allocated.');
+  }
+  return `GRN-${String(counter.sequence).padStart(6, '0')}`;
+};
+
+const allocateFileNumber = async (fileType) => {
+  const normalizedType = fileType === 'Blue' ? 'Blue' : (fileType === 'Green' ? 'Green' : '');
+  if (!normalizedType) throw createHttpError(400, 'Select Green or Blue before creating the record.');
+  const counterKey = getCounterKey('file-number');
+  const counter = await Counter.findOneAndUpdate(
+    { _id: counterKey },
+    { $inc: { sequence: 1 } },
+    { new: true }
+  );
+  if (!counter) {
+    throw createHttpError(503, 'The file-number counter has not been initialized. Run the approved one-time seed before creating files.');
+  }
+  return `${counter.sequence} ${normalizedType}`;
+};
+
+const withFileColour = (fileNumber, fileType) => {
+  const match = String(fileNumber || '').trim().match(/^(\d+)(?:\s+(?:Green|Blue))?$/i);
+  return match ? `${match[1]} ${fileType}` : String(fileNumber || '').trim();
+};
+
+const updateLinkedFileColour = async (order, fileType) => {
+  const linkedRecords = [
+    [Quotation, order.quotationId, 'fileNo'],
+    [CustomerPO, order.customerPOId, 'fileNumber'],
+    [ProductFile, order.productFileId, 'fileNumber']
+  ];
+
+  for (const [Model, recordId, numberField] of linkedRecords) {
+    if (!recordId) continue;
+    const record = await Model.findById(recordId);
+    if (!record) continue;
+    record[numberField] = withFileColour(record[numberField], fileType);
+    record.fileType = fileType;
+    await record.save();
+  }
+};
+
+const createHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 };
 
 // ══════════════════════════════════════════════
@@ -993,6 +1232,8 @@ const convertQuotationToCustomerPO = async (req, res) => {
       customerName: quotation.clientName,
       quotationId: quotation._id,
       quotationNumber: quotation.orderReference || quotation.quotationNumber || '',
+      fileNumber: quotation.fileNo || '',
+      fileType: quotation.fileType || '',
       amount: netAmt,
       notes: notes || quotation.notes || '',
       uploadedDocument: uploadedDocument || '',
@@ -1042,16 +1283,17 @@ const convertCustomerPOToProductFile = async (req, res) => {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
 
-    const { fileNumber, fileType, products, notes } = req.body;
+    const { fileType, products, notes } = req.body;
 
     let quoteItems = [];
     let quotationNumber = po.quotationNumber || '';
+    let linkedQuotation = null;
     if (po.quotationId) {
-      const q = await Quotation.findById(po.quotationId);
-      if (q) {
-        quotationNumber = q.orderReference || q.quotationNumber || quotationNumber;
-        if (q.items && q.items.length) {
-          quoteItems = q.items.map(it => ({
+      linkedQuotation = await Quotation.findById(po.quotationId);
+      if (linkedQuotation) {
+        quotationNumber = linkedQuotation.orderReference || linkedQuotation.quotationNumber || quotationNumber;
+        if (linkedQuotation.items && linkedQuotation.items.length) {
+          quoteItems = linkedQuotation.items.map(it => ({
             name: it.description || 'Item',
             quantity: it.quantity || 1,
             unit: 'pcs',
@@ -1061,9 +1303,12 @@ const convertCustomerPOToProductFile = async (req, res) => {
       }
     }
 
+    const resolvedFileType = po.fileType || linkedQuotation?.fileType || fileType;
+    const resolvedFileNumber = po.fileNumber || linkedQuotation?.fileNo || await allocateFileNumber(resolvedFileType);
+
     const file = await ProductFile.create({
-      fileNumber: fileNumber?.trim() || '',
-      fileType: fileType || 'Blue',
+      fileNumber: resolvedFileNumber,
+      fileType: resolvedFileType,
       customerName: po.customerName,
       quotationId: po.quotationId || null,
       quotationNumber: quotationNumber,
@@ -1077,6 +1322,8 @@ const convertCustomerPOToProductFile = async (req, res) => {
 
     // Mark PO as Processed so it is removed from active POs list
     po.status = 'Processed';
+    if (!po.fileNumber) po.fileNumber = resolvedFileNumber;
+    if (!po.fileType) po.fileType = resolvedFileType;
     await po.save();
 
     await logSalesActivity({
@@ -1096,7 +1343,7 @@ const convertCustomerPOToProductFile = async (req, res) => {
     });
   } catch (error) {
     console.error('[Convert PO to File Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error converting customer PO to product file.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error converting customer PO to product file.' });
   }
 };
 
@@ -1457,8 +1704,7 @@ const createMyQuotation = async (req, res) => {
     const {
       orderReference,
       clientName,
-      salePerson,
-      fileNo,
+      fileType,
       productSummary,
       clientEmail,
       clientPhone,
@@ -1477,12 +1723,14 @@ const createMyQuotation = async (req, res) => {
     } = req.body;
 
     if (!clientName) return res.status(400).json({ success: false, message: 'Customer/Client name is required.' });
+    const assignedFileNumber = await allocateFileNumber(fileType);
 
     const quotation = await Quotation.create({
       orderReference: orderReference?.trim() || '',
       clientName: clientName.trim(),
-      salePerson: salePerson?.trim() || req.user.fullName || '',
-      fileNo: fileNo?.trim() || '',
+      salePerson: req.user.fullName || '',
+      fileNo: assignedFileNumber,
+      fileType,
       productSummary: productSummary?.trim() || '',
       clientEmail: clientEmail?.trim() || '',
       clientPhone: clientPhone?.trim() || '',
@@ -1512,7 +1760,7 @@ const createMyQuotation = async (req, res) => {
     return res.status(201).json({ success: true, message: 'Quotation created successfully.', data: quotation });
   } catch (error) {
     console.error('[Create Quotation Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error creating quotation.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error creating quotation.' });
   }
 };
 
@@ -1528,8 +1776,6 @@ const updateMyQuotation = async (req, res) => {
     const allowedFields = [
       'orderReference',
       'clientName',
-      'salePerson',
-      'fileNo',
       'productSummary',
       'clientEmail',
       'clientPhone',
@@ -1725,7 +1971,6 @@ const createMyOrder = async (req, res) => {
       clientName,
       clientAddress,
       salePerson,
-      fileNo,
       fileType,
       productSummary,
       clientEmail,
@@ -1757,6 +2002,16 @@ const createMyOrder = async (req, res) => {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
 
+    const linkedProductFile = productFileId && mongoose.Types.ObjectId.isValid(productFileId)
+      ? await ProductFile.findById(productFileId)
+      : null;
+    const linkedQuotationId = quotationId && mongoose.Types.ObjectId.isValid(quotationId)
+      ? quotationId
+      : (linkedProductFile?.quotationId || customerPO.quotationId || null);
+    const linkedQuotation = linkedQuotationId ? await Quotation.findById(linkedQuotationId) : null;
+    const resolvedFileType = linkedProductFile?.fileType || linkedQuotation?.fileType || customerPO.fileType || fileType;
+    const resolvedFileNumber = linkedProductFile?.fileNumber || linkedQuotation?.fileNo || customerPO.fileNumber || await allocateFileNumber(resolvedFileType);
+
     // Check customer overdue balance
     const overdueInfo = await calculateCustomerOverdue(clientName);
     const requiresApproval = overdueInfo.isOverdue;
@@ -1767,8 +2022,8 @@ const createMyOrder = async (req, res) => {
       clientName: clientName.trim(),
       clientAddress: clientAddress?.trim() || '',
       salePerson: salePerson?.trim() || req.user.fullName || '',
-      fileNo: fileNo?.trim() || '',
-      fileType: fileType || '',
+      fileNo: resolvedFileNumber,
+      fileType: resolvedFileType,
       productSummary: productSummary?.trim() || '',
       clientEmail: clientEmail?.trim() || '',
       clientPhone: clientPhone?.trim() || '',
@@ -1850,7 +2105,7 @@ const createMyOrder = async (req, res) => {
     return res.status(201).json({ success: true, message: 'Sales order created successfully.', data: order });
   } catch (error) {
     console.error('[Create Order Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error creating order.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error creating order.' });
   }
 };
 
@@ -1936,6 +2191,7 @@ const financeReviewSalesOrder = async (req, res) => {
         ? fileTypeChoice
         : (order.fileType === 'Blue' ? 'Blue' : 'Green');
       order.fileType = resolvedFileType;
+      order.fileNo = withFileColour(order.fileNo, resolvedFileType);
 
       const isBlue = resolvedFileType === 'Blue';
 
@@ -2009,6 +2265,7 @@ const financeReviewSalesOrder = async (req, res) => {
       }
 
       await order.save();
+      await updateLinkedFileColour(order, resolvedFileType);
 
       await logSalesActivity({
         type: `Finance Approved (${resolvedFileType} File)`,
@@ -2139,7 +2396,7 @@ const updateMyOrder = async (req, res) => {
 
     const changes = {};
     const allowedFields = [
-      'orderReference', 'orderNumber', 'clientName', 'clientAddress', 'salePerson', 'fileNo', 'fileType',
+      'orderReference', 'orderNumber', 'clientName', 'clientAddress', 'salePerson', 'fileType',
       'productSummary', 'clientEmail', 'clientPhone', 'items', 'totalAmount', 'discount',
       'tax', 'netAmount', 'status', 'deliveryDate', 'creationDate', 'notes',
       'stockStatus', 'deliveryStatus', 'invoiceStatus', 'invoiceNumber',
@@ -2206,55 +2463,33 @@ const checkOrderStock = async (req, res) => {
   try {
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
-
-    const orderItems = order.items && order.items.length ? order.items : [
-      { description: order.productSummary || 'Product Scope Items', quantity: 1 }
-    ];
-
-    const stockCheckResults = [];
-    let allAvailable = true;
-
-    for (const item of orderItems) {
-      const desc = (item.description || item.name || '').trim();
-      const requiredQty = Number(item.quantity) || 1;
-
-      // Search matching InventoryItem in MongoDB
-      let inv = null;
-      if (desc) {
-        inv = await InventoryItem.findOne({
-          name: { $regex: new RegExp('^' + desc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') }
-        });
-        if (!inv) {
-          inv = await InventoryItem.findOne({
-            name: { $regex: new RegExp(desc.split(' ')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }
-          });
-        }
-      }
-
-      const onHand = inv ? (inv.quantityOnHand || 0) : 0;
-      const reserved = inv ? (inv.reservedQuantity || 0) : 0;
-      const available = Math.max(0, onHand - reserved);
-      const isItemInStock = available >= requiredQty;
-
-      if (!isItemInStock) {
-        allAvailable = false;
-      }
-
-      stockCheckResults.push({
-        productName: desc || 'Item',
-        requiredQty,
-        quantityOnHand: onHand,
-        reservedQuantity: reserved,
+    const stock = await getDeliveryStockRequirements(order);
+    const stockCheckResults = stock.requirements.map(line => {
+      const inv = line.inventoryItem;
+      const available = Number(line.availableQty) || 0;
+      const isItemInStock = Boolean(inv) && available >= line.requiredQty;
+      return {
+        productName: line.item,
+        requiredQty: line.requiredQty,
+        orderedQty: line.orderedQty,
+        deliveredQty: line.deliveredQty,
+        quantityAssumed: line.quantityAssumed,
+        quantityOnHand: Number(inv?.quantityOnHand) || 0,
+        reservedQuantity: Number(inv?.reservedQuantity) || 0,
         availableQty: available,
         unit: inv?.unit || 'pcs',
-        status: !inv ? 'Missing from Inventory' : (isItemInStock ? 'In Stock' : 'Insufficient Stock'),
-        shortageQty: Math.max(0, requiredQty - available),
-        inventoryItemId: inv?._id || null
-      });
-    }
+        status: line.ambiguous ? 'Ambiguous Inventory Match' : (!inv ? 'Missing from Inventory' : (isItemInStock ? 'In Stock' : 'Insufficient Stock')),
+        shortageQty: Math.max(0, line.requiredQty - available),
+        inventoryItemId: inv?._id || null,
+        inventoryName: inv?.name || '',
+        inventorySku: inv?.sku || '',
+        inventoryCategory: inv?.category || '',
+        inventoryLocation: inv?.location || ''
+      };
+    });
 
     // Update order stock status
-    const newStockStatus = allAvailable ? 'Available' : 'Purchase Required';
+    const newStockStatus = stock.isFullyInStock ? 'Available' : 'Purchase Required';
     if (order.stockStatus !== newStockStatus) {
       order.stockStatus = newStockStatus;
       await order.save();
@@ -2267,13 +2502,84 @@ const checkOrderStock = async (req, res) => {
         orderNumber: order.orderNumber || order.orderReference,
         clientName: order.clientName,
         stockStatus: newStockStatus,
-        isFullyInStock: allAvailable,
+        isFullyInStock: stock.isFullyInStock,
         items: stockCheckResults
       }
     });
   } catch (error) {
     console.error('[Check Order Stock Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error checking inventory stock.' });
+  }
+};
+
+/**
+ * @desc    Preview inventory matches and receipt balances for a Support order
+ * @route   GET /api/sales-employee/orders/:id/receiving-preview
+ */
+const getGoodsReceivingPreview = async (req, res) => {
+  try {
+    const order = await SalesOrder.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+
+    const inventoryItems = await InventoryItem.find({}).sort({ name: 1 });
+    const receivedTotals = getReceivedQuantityByOrderItem(order);
+    const orderItems = order.items && order.items.length ? order.items : [
+      { _id: 'product-summary', description: order.productSummary || 'Product Scope Items', quantity: 1, quantityAssumed: true }
+    ];
+
+    const items = orderItems.map(item => {
+      const orderItemId = String(item._id || 'product-summary');
+      const orderedQty = Number(item.quantity) || 1;
+      const previouslyReceivedQty = receivedTotals.get(orderItemId) || 0;
+      const matches = getInventoryMatches(item, inventoryItems).map(match => ({
+        _id: match._id,
+        name: match.name,
+        sku: match.sku,
+        category: match.category,
+        location: match.location,
+        unit: match.unit,
+        quantityOnHand: match.quantityOnHand,
+        reservedQuantity: match.reservedQuantity,
+        contextMismatch: hasInventoryContextMismatch(match, order.fileType)
+      }));
+
+      return {
+        orderItemId,
+        productName: item.description || item.name || 'Item',
+        sku: item.sku || '',
+        orderedQty,
+        quantityAssumed: item.quantityAssumed === true,
+        previouslyReceivedQty,
+        remainingQty: Math.max(0, orderedQty - previouslyReceivedQty),
+        matches,
+        recommendedInventoryItemId: matches.length === 1 ? matches[0]._id : null
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        orderId: order._id,
+        orderNumber: order.orderNumber || order.orderReference,
+        fileType: order.fileType,
+        inventoryReceived: order.inventoryReceived === true,
+        items,
+        inventoryOptions: inventoryItems.map(item => ({
+          _id: item._id,
+          name: item.name,
+          sku: item.sku,
+          category: item.category,
+          location: item.location,
+          unit: item.unit,
+          quantityOnHand: item.quantityOnHand,
+          reservedQuantity: item.reservedQuantity,
+          contextMismatch: hasInventoryContextMismatch(item, order.fileType)
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('[Goods Receiving Preview Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error loading inventory receiving details.' });
   }
 };
 
@@ -2354,7 +2660,8 @@ const createMyDeliveryNote = async (req, res) => {
       starred
     } = req.body;
 
-    const dnStatus = status || 'Done';
+    const requestedStatus = status || 'Ready';
+    const dnStatus = CONFIRMED_DELIVERY_STATUSES.includes(requestedStatus) ? 'Ready' : requestedStatus;
 
     let resolvedSalesPersonId = null;
     let resolvedSalePerson = req.body.salePerson || '';
@@ -2399,6 +2706,18 @@ const createMyDeliveryNote = async (req, res) => {
       });
     }
 
+    const stock = await getDeliveryStockRequirements(parentSo);
+    if (!stock.isFullyInStock) {
+      const shortages = stock.shortages.length
+        ? stock.shortages
+        : [{ item: parentSo.productSummary || 'Order items', required: 1, available: 0 }];
+      return res.status(409).json({
+        success: false,
+        message: formatStockShortageMessage(shortages),
+        shortages
+      });
+    }
+
     resolvedSalesPersonId = parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
     resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || (parentSo.salesPerson && parentSo.salesPerson.fullName) || '';
     resolvedFileType = parentSo.fileType || resolvedFileType;
@@ -2407,17 +2726,17 @@ const createMyDeliveryNote = async (req, res) => {
     resolvedShipmentId = parentSo.shipmentId || null;
     resolvedShipmentNum = parentSo.shipmentNumber || '';
 
-    if (dnItems.length === 0 && parentSo.items && parentSo.items.length > 0) {
-      dnItems = parentSo.items.map(it => ({
-        product: it.description || 'Delivered Product',
-        description: it.description || '',
-        demand: Number(it.quantity) || 1,
-        quantity: Number(it.quantity) || 1,
-        unit: 'Units',
+    dnItems = stock.requirements
+      .filter(line => line.requiredQty > 0)
+      .map(line => ({
+        product: line.item || 'Delivered Product',
+        description: line.item || '',
+        demand: line.requiredQty,
+        quantity: line.requiredQty,
+        unit: line.inventoryItem?.unit || 'Units',
         availability: 'Available',
-        totalOrderedQty: Number(it.quantity) || 1
+        totalOrderedQty: line.orderedQty
       }));
-    }
 
     const deliveryNote = await DeliveryNote.create({
       salesOrder: parentSo._id,
@@ -2450,29 +2769,6 @@ const createMyDeliveryNote = async (req, res) => {
       salePerson: resolvedSalePerson || (req.user.department === 'Sales' ? req.user.fullName : ''),
       createdBy: req.user._id
     });
-
-    // Deduct actual delivered quantities from InventoryItem stock in MongoDB if status is Done/Confirmed
-    let isDeducted = false;
-    if ((dnStatus === 'Done' || dnStatus === 'Confirmed' || dnStatus === 'Delivered') && dnItems && Array.isArray(dnItems)) {
-      for (const item of dnItems) {
-        const pName = (item.product || item.description || '').trim();
-        const delQty = Number(item.quantity) || 1;
-        if (pName && delQty > 0) {
-          const inv = await InventoryItem.findOne({
-            name: { $regex: new RegExp('^' + pName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') }
-          });
-          if (inv) {
-            inv.quantityOnHand = Math.max(0, inv.quantityOnHand - delQty);
-            await inv.save();
-            isDeducted = true;
-          }
-        }
-      }
-    }
-    if (isDeducted) {
-      deliveryNote.isStockDeducted = true;
-      await deliveryNote.save();
-    }
 
     // Auto-update Sales Order delivery status and link Delivery Note (removes SO from Support Pending Queue, hands off to Accounts)
     if (salesOrderId) {
@@ -2518,7 +2814,7 @@ const createMyDeliveryNote = async (req, res) => {
     return res.status(201).json({ success: true, message: 'Delivery note created successfully.', data: deliveryNote });
   } catch (error) {
     console.error('[Create Delivery Note Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error creating delivery note.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error creating delivery note.' });
   }
 };
 
@@ -3144,7 +3440,7 @@ const deleteMyOrder = async (req, res) => {
 
 const updateMyDeliveryNote = async (req, res) => {
   try {
-    const deliveryNote = await DeliveryNote.findById(req.params.id);
+    const deliveryNote = await DeliveryNote.findById(req.params.id).session(session);
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
 
     const changes = {};
@@ -3272,11 +3568,16 @@ const createMyCustomerPO = async (req, res) => {
     if (!hasValidCustomerPOAttachment({ uploadedDocument, documentName })) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
+    const linkedQuotation = quotationId && mongoose.Types.ObjectId.isValid(quotationId)
+      ? await Quotation.findById(quotationId)
+      : null;
 
     const po = await CustomerPO.create({
       customerName: customerName.trim(),
       quotationId: quotationId || null,
       quotationNumber: quotationNumber || '',
+      fileNumber: linkedQuotation?.fileNo || '',
+      fileType: linkedQuotation?.fileType || '',
       poDate: poDate ? new Date(poDate) : new Date(),
       amount: Number(amount) || 0,
       notes: notes || '',
@@ -3390,7 +3691,7 @@ const getMyProductFiles = async (req, res) => {
 
 const createMyProductFile = async (req, res) => {
   try {
-    const { fileNumber, fileType, customerName, quotationId, quotationNumber, customerPOId, customerPONumber, salesOrderId, salesOrderNumber, products, notes } = req.body;
+    const { fileType, customerName, quotationId, quotationNumber, customerPOId, customerPONumber, salesOrderId, salesOrderNumber, products, notes } = req.body;
     if (!customerName) return res.status(400).json({ success: false, message: 'Customer name is required.' });
 
     const safeQuotationId = quotationId && mongoose.Types.ObjectId.isValid(quotationId) ? quotationId : null;
@@ -3401,13 +3702,17 @@ const createMyProductFile = async (req, res) => {
     if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
+    const linkedQuotationId = safeQuotationId || customerPO.quotationId || null;
+    const linkedQuotation = linkedQuotationId ? await Quotation.findById(linkedQuotationId) : null;
+    const resolvedFileType = customerPO.fileType || linkedQuotation?.fileType || fileType;
+    const resolvedFileNumber = customerPO.fileNumber || linkedQuotation?.fileNo || await allocateFileNumber(resolvedFileType);
 
     const pf = await ProductFile.create({
-      fileNumber: fileNumber || '',
-      fileType: fileType || 'Blue',
+      fileNumber: resolvedFileNumber,
+      fileType: resolvedFileType,
       customerName: customerName.trim(),
-      quotationId: safeQuotationId,
-      quotationNumber: quotationNumber || '',
+      quotationId: linkedQuotationId,
+      quotationNumber: linkedQuotation?.orderReference || linkedQuotation?.quotationNumber || quotationNumber || customerPO.quotationNumber || '',
       customerPOId: customerPO._id,
       customerPONumber: customerPO.poNumber || customerPONumber || '',
       salesOrderId: safeSalesOrderId,
@@ -3438,7 +3743,7 @@ const createMyProductFile = async (req, res) => {
     return res.status(201).json({ success: true, message: 'Product file created successfully.', data: pf });
   } catch (error) {
     console.error('[Create ProductFile Error]:', error);
-    return res.status(500).json({ success: false, message: error.message || 'Server error creating product file.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : (error.message || 'Server error creating product file.') });
   }
 };
 
@@ -3450,7 +3755,7 @@ const updateMyProductFile = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied. You can only edit your own product files.' });
     }
 
-    const allowedFields = ['fileNumber', 'fileType', 'customerName', 'quotationNumber', 'customerPONumber', 'salesOrderNumber', 'products', 'notes', 'status'];
+    const allowedFields = ['fileType', 'customerName', 'quotationNumber', 'customerPONumber', 'salesOrderNumber', 'products', 'notes', 'status'];
     allowedFields.forEach(field => { if (req.body[field] !== undefined) pf[field] = req.body[field]; });
 
     if (req.body.quotationId !== undefined) {
@@ -3529,6 +3834,8 @@ const getMyPayments = async (req, res) => {
         { customerName: regex },
         { salesOrderNumber: regex },
         { invoiceNumber: regex },
+        { 'allocations.salesOrderNumber': regex },
+        { 'allocations.invoiceNumber': regex },
         { salePerson: regex },
         { paymentMethod: regex },
         { paymentType: regex }
@@ -3545,18 +3852,44 @@ const getMyPayments = async (req, res) => {
   }
 };
 
+const toMoneyCents = (value) => {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? Math.round((amount + Number.EPSILON) * 100) : NaN;
+};
+const fromMoneyCents = (cents) => cents / 100;
+
+const getPaymentCentsForInvoice = (payment, invoiceId) => {
+  if (Array.isArray(payment.allocations) && payment.allocations.length > 0) {
+    return payment.allocations.reduce((sum, allocation) => (
+      String(allocation.invoiceId) === String(invoiceId) ? sum + toMoneyCents(allocation.amount) : sum
+    ), 0);
+  }
+  return String(payment.invoiceId) === String(invoiceId) ? toMoneyCents(payment.amount) : 0;
+};
+
+const getPaymentCentsForOrder = (payment, salesOrderId) => {
+  if (Array.isArray(payment.allocations) && payment.allocations.length > 0) {
+    return payment.allocations.reduce((sum, allocation) => (
+      String(allocation.salesOrderId) === String(salesOrderId) ? sum + toMoneyCents(allocation.amount) : sum
+    ), 0);
+  }
+  return String(payment.salesOrderId) === String(salesOrderId) ? toMoneyCents(payment.amount) : 0;
+};
+
 // Helper to synchronize Invoice and SalesOrder balances after payment changes
 const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
   try {
     if (invoiceId) {
       const invoice = await Invoice.findById(invoiceId);
       if (invoice) {
-        const allPayments = await Payment.find({ invoiceId });
-        const totalPaid = allPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-        const invTotal = Number(invoice.amount) || 0;
-        const outstanding = Math.max(0, invTotal - totalPaid);
+        const allPayments = await Payment.find({ $or: [{ invoiceId }, { 'allocations.invoiceId': invoiceId }] });
+        const totalPaidCents = allPayments.reduce((sum, payment) => sum + getPaymentCentsForInvoice(payment, invoiceId), 0);
+        const invTotalCents = toMoneyCents(invoice.amount) || 0;
+        const outstandingCents = Math.max(0, invTotalCents - totalPaidCents);
+        const totalPaid = fromMoneyCents(totalPaidCents);
+        const outstanding = fromMoneyCents(outstandingCents);
         let invStatus = invoice.status;
-        if (outstanding === 0 && invTotal > 0) {
+        if (outstandingCents === 0 && invTotalCents > 0) {
           invStatus = 'Paid';
         } else if (totalPaid > 0) {
           invStatus = 'Partially Paid';
@@ -3574,13 +3907,15 @@ const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
     if (salesOrderId) {
       const order = await SalesOrder.findById(salesOrderId);
       if (order) {
-        const allOrderPayments = await Payment.find({ salesOrderId });
-        const totalPaid = allOrderPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-        const orderTotal = Number(order.netAmount) || Number(order.totalAmount) || 0;
-        const outstanding = Math.max(0, orderTotal - totalPaid);
+        const allOrderPayments = await Payment.find({ $or: [{ salesOrderId }, { 'allocations.salesOrderId': salesOrderId }] });
+        const totalPaidCents = allOrderPayments.reduce((sum, payment) => sum + getPaymentCentsForOrder(payment, salesOrderId), 0);
+        const orderTotalCents = toMoneyCents(order.netAmount || order.totalAmount) || 0;
+        const outstandingCents = Math.max(0, orderTotalCents - totalPaidCents);
+        const totalPaid = fromMoneyCents(totalPaidCents);
+        const outstanding = fromMoneyCents(outstandingCents);
         let paymentStatus = 'Pending';
-        if (totalPaid === 0) paymentStatus = 'Pending';
-        else if (totalPaid >= orderTotal && orderTotal > 0) paymentStatus = 'Fully Paid';
+        if (totalPaidCents === 0) paymentStatus = 'Pending';
+        else if (outstandingCents === 0 && orderTotalCents > 0) paymentStatus = 'Fully Paid';
         else paymentStatus = 'Partially Paid';
         await SalesOrder.findByIdAndUpdate(salesOrderId, {
           totalPaid,
@@ -3597,36 +3932,89 @@ const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
 const createMyPayment = async (req, res) => {
   try {
     let { customerName, salesOrderId, salesOrderNumber, invoiceId, invoiceNumber, paymentDate, amount, paymentType, paymentMethod, notes } = req.body;
-    if (!customerName || !customerName.trim()) return res.status(400).json({ success: false, message: 'Customer name is required.' });
-    if (!amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: 'Valid payment amount is required.' });
+    if (!customerName || !customerName.trim()) {
+      return res.status(400).json({ success: false, message: 'Customer name is required.' });
+    }
 
-    const payAmount = Number(amount);
-
+    const requestedAllocations = Array.isArray(req.body.allocations) && req.body.allocations.length > 1
+      ? req.body.allocations
+      : null;
+    const allocations = [];
+    const allocatedInvoiceIds = new Set();
     let resolvedSalesPersonId = null;
     let resolvedSalePerson = '';
 
-    // If invoice is linked, auto-resolve sales order and check against overpayment
-    if (invoiceId) {
-      const invoice = await Invoice.findById(invoiceId).populate('salesPerson');
-      if (invoice) {
-        resolvedSalesPersonId = invoice.salesPerson?._id || invoice.salesPerson || null;
-        resolvedSalePerson = invoice.salePerson || (invoice.salesPerson && invoice.salesPerson.fullName) || '';
-        if (!salesOrderId && invoice.salesOrderId) {
-          salesOrderId = invoice.salesOrderId;
-          salesOrderNumber = invoice.salesOrderNumber || invoice.saleReference || salesOrderNumber;
+    if (requestedAllocations) {
+      for (const requested of requestedAllocations) {
+        if (!requested.invoiceId || !mongoose.Types.ObjectId.isValid(requested.invoiceId)) {
+          return res.status(400).json({ success: false, message: 'Each allocation must select a valid invoice.' });
         }
-        if (!invoiceNumber && invoice.invoiceNumber) {
-          invoiceNumber = invoice.invoiceNumber;
+        if (allocatedInvoiceIds.has(String(requested.invoiceId))) {
+          return res.status(400).json({ success: false, message: 'Each invoice can only appear once on a receipt.' });
         }
-        const invTotal = Number(invoice.amount) || 0;
-        const currentPaid = Number(invoice.paidAmount) || 0;
-        const currentRemaining = Math.max(0, invTotal - currentPaid);
+        allocatedInvoiceIds.add(String(requested.invoiceId));
+        const invoice = await Invoice.findById(requested.invoiceId).populate('salesPerson');
+        if (!invoice) {
+          return res.status(404).json({ success: false, message: 'An invoice selected for allocation was not found.' });
+        }
+        const invoiceCustomer = (invoice.clientName || invoice.customerName || '').trim().toLowerCase();
+        if (invoiceCustomer && invoiceCustomer !== customerName.trim().toLowerCase()) {
+          return res.status(400).json({ success: false, message: 'One receipt can only be allocated to invoices for the same customer.' });
+        }
 
-        if (payAmount > currentRemaining + 0.01) {
+        const allocationCents = toMoneyCents(requested.amount);
+        const remainingCents = Math.max(0, (toMoneyCents(invoice.amount) || 0) - (toMoneyCents(invoice.paidAmount) || 0));
+        if (!Number.isInteger(allocationCents) || allocationCents <= 0) {
+          return res.status(400).json({ success: false, message: 'Each invoice allocation must be greater than 0.00.' });
+        }
+        if (allocationCents > remainingCents) {
           return res.status(400).json({
             success: false,
-            message: `Payment amount (Rs. ${payAmount.toLocaleString()}) exceeds the invoice's remaining receivable of Rs. ${currentRemaining.toLocaleString()}.`
+            message: `Allocation for ${invoice.invoiceNumber} exceeds its remaining receivable of PKR ${fromMoneyCents(remainingCents).toFixed(2)}.`
           });
+        }
+
+        allocations.push({
+          invoiceId: invoice._id,
+          invoiceNumber: invoice.invoiceNumber || '',
+          salesOrderId: invoice.salesOrderId || null,
+          salesOrderNumber: invoice.salesOrderNumber || invoice.saleReference || '',
+          amount: fromMoneyCents(allocationCents)
+        });
+        resolvedSalesPersonId = resolvedSalesPersonId || invoice.salesPerson?._id || invoice.salesPerson || null;
+        resolvedSalePerson = resolvedSalePerson || invoice.salePerson || invoice.salesPerson?.fullName || '';
+      }
+
+      const first = allocations[0];
+      invoiceId = first.invoiceId;
+      invoiceNumber = first.invoiceNumber;
+      salesOrderId = first.salesOrderId;
+      salesOrderNumber = first.salesOrderNumber;
+      amount = fromMoneyCents(allocations.reduce((sum, allocation) => sum + toMoneyCents(allocation.amount), 0));
+    } else {
+      const payAmountCents = toMoneyCents(amount);
+      if (!Number.isInteger(payAmountCents) || payAmountCents <= 0) {
+        return res.status(400).json({ success: false, message: 'Valid payment amount is required.' });
+      }
+      amount = fromMoneyCents(payAmountCents);
+
+      if (invoiceId) {
+        const invoice = await Invoice.findById(invoiceId).populate('salesPerson');
+        if (invoice) {
+          resolvedSalesPersonId = invoice.salesPerson?._id || invoice.salesPerson || null;
+          resolvedSalePerson = invoice.salePerson || invoice.salesPerson?.fullName || '';
+          if (!salesOrderId && invoice.salesOrderId) {
+            salesOrderId = invoice.salesOrderId;
+            salesOrderNumber = invoice.salesOrderNumber || invoice.saleReference || salesOrderNumber;
+          }
+          invoiceNumber = invoiceNumber || invoice.invoiceNumber;
+          const remainingCents = Math.max(0, (toMoneyCents(invoice.amount) || 0) - (toMoneyCents(invoice.paidAmount) || 0));
+          if (payAmountCents > remainingCents) {
+            return res.status(400).json({
+              success: false,
+              message: `Payment amount (PKR ${amount.toFixed(2)}) exceeds the invoice's remaining receivable of PKR ${fromMoneyCents(remainingCents).toFixed(2)}.`
+            });
+          }
         }
       }
     }
@@ -3635,18 +4023,19 @@ const createMyPayment = async (req, res) => {
       const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
       if (parentSo) {
         resolvedSalesPersonId = resolvedSalesPersonId || parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
-        resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || (parentSo.salesPerson && parentSo.salesPerson.fullName) || '';
+        resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || parentSo.salesPerson?.fullName || '';
       }
     }
 
     const payment = await Payment.create({
       customerName: customerName.trim(),
       salesOrderId: salesOrderId || null,
-      salesOrderNumber: salesOrderNumber || '',
+      salesOrderNumber: requestedAllocations ? allocations.map(a => a.salesOrderNumber).filter(Boolean).join(', ') : (salesOrderNumber || ''),
       invoiceId: invoiceId || null,
-      invoiceNumber: invoiceNumber || '',
+      invoiceNumber: requestedAllocations ? allocations.map(a => a.invoiceNumber).join(', ') : (invoiceNumber || ''),
+      allocations: requestedAllocations ? allocations : undefined,
       paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
-      amount: payAmount,
+      amount,
       paymentType: paymentType || 'Partial',
       paymentMethod: paymentMethod || 'Bank Transfer',
       notes: notes || '',
@@ -3655,12 +4044,25 @@ const createMyPayment = async (req, res) => {
       createdBy: req.user._id
     });
 
-    // Auto-update Invoice and Sales Order payment status and outstanding balances
-    await syncInvoiceAndOrderBalances(invoiceId, salesOrderId);
+    const balanceTargets = requestedAllocations
+      ? allocations
+      : [{ invoiceId, salesOrderId }];
+    const syncedInvoices = new Set();
+    const syncedOrders = new Set();
+    for (const target of balanceTargets) {
+      const targetInvoiceId = target.invoiceId ? String(target.invoiceId) : '';
+      const targetOrderId = target.salesOrderId ? String(target.salesOrderId) : '';
+      await syncInvoiceAndOrderBalances(
+        targetInvoiceId && !syncedInvoices.has(targetInvoiceId) ? target.invoiceId : null,
+        targetOrderId && !syncedOrders.has(targetOrderId) ? target.salesOrderId : null
+      );
+      if (targetInvoiceId) syncedInvoices.add(targetInvoiceId);
+      if (targetOrderId) syncedOrders.add(targetOrderId);
+    }
 
     await logSalesActivity({
       type: 'Payment Recorded',
-      description: `Recorded ${paymentType || 'Partial'} payment of Rs. ${payAmount.toLocaleString()} from ${customerName}`,
+      description: `Recorded ${paymentType || 'Partial'} payment of PKR ${Number(amount).toFixed(2)} from ${customerName}`,
       relatedModel: 'Payment',
       relatedId: payment._id,
       relatedCustomer: customerName,
@@ -3672,7 +4074,7 @@ const createMyPayment = async (req, res) => {
       role: 'finance',
       sender: req.user._id,
       title: 'Payment Recorded',
-      message: `Payment of PKR ${Number(payAmount).toLocaleString()} recorded for Invoice ${invoiceNumber || payment.invoiceNumber || 'Direct'}.`,
+      message: `Payment of PKR ${Number(amount).toFixed(2)} recorded for Invoice ${payment.invoiceNumber || 'Direct'}.`,
       type: 'finance',
       link: '/finance/payments'
     });
@@ -3695,10 +4097,14 @@ const updateMyPayment = async (req, res) => {
     const oldInvoiceId = payment.invoiceId;
     const oldSalesOrderId = payment.salesOrderId;
 
+    if (Array.isArray(payment.allocations) && payment.allocations.length > 0 && ['amount', 'invoiceId', 'salesOrderId'].some(field => req.body[field] !== undefined)) {
+      return res.status(400).json({ success: false, message: 'Invoice allocations on a split receipt cannot be changed. Delete it and record a corrected receipt.' });
+    }
+
     const allowedFields = ['customerName', 'paymentDate', 'amount', 'paymentType', 'paymentMethod', 'notes', 'invoiceNumber', 'salesOrderNumber', 'invoiceId', 'salesOrderId'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
-        if (field === 'amount') payment[field] = Number(req.body[field]);
+        if (field === 'amount') payment[field] = fromMoneyCents(toMoneyCents(req.body[field]));
         else payment[field] = req.body[field];
       }
     });
@@ -3728,13 +4134,25 @@ const deleteMyPayment = async (req, res) => {
     if (!checkOwnership(payment, 'createdBy', req.user._id, req.user)) {
       return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own payments.' });
     }
-    const invId = payment.invoiceId;
-    const soId = payment.salesOrderId;
+    const balanceTargets = Array.isArray(payment.allocations) && payment.allocations.length > 0
+      ? payment.allocations.map(allocation => ({ invoiceId: allocation.invoiceId, salesOrderId: allocation.salesOrderId }))
+      : [{ invoiceId: payment.invoiceId, salesOrderId: payment.salesOrderId }];
 
     await Payment.findByIdAndDelete(req.params.id);
 
     // Re-sync balances after deletion
-    await syncInvoiceAndOrderBalances(invId, soId);
+    const syncedInvoices = new Set();
+    const syncedOrders = new Set();
+    for (const target of balanceTargets) {
+      const invoiceKey = target.invoiceId ? String(target.invoiceId) : '';
+      const orderKey = target.salesOrderId ? String(target.salesOrderId) : '';
+      await syncInvoiceAndOrderBalances(
+        invoiceKey && !syncedInvoices.has(invoiceKey) ? target.invoiceId : null,
+        orderKey && !syncedOrders.has(orderKey) ? target.salesOrderId : null
+      );
+      if (invoiceKey) syncedInvoices.add(invoiceKey);
+      if (orderKey) syncedOrders.add(orderKey);
+    }
 
     return res.status(200).json({ success: true, message: 'Payment deleted.' });
   } catch (error) {
@@ -4211,102 +4629,322 @@ const sendSalesOrderToFinance = async (req, res) => {
  * @route   POST /api/sales-employee/orders/:id/goods-received
  */
 const recordGoodsReceivedInOffice = async (req, res) => {
+  const session = await mongoose.startSession();
+  let savedOrder = null;
   try {
-    const order = await SalesOrder.findById(req.params.id);
-    if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    await session.withTransaction(async () => {
+      const order = await SalesOrder.findById(req.params.id).session(session);
+      if (!order) throw createHttpError(404, 'Sales order not found.');
+      if (order.isOverdueBlocked) {
+        throw createHttpError(400, 'Cannot receive goods: Order is on Finance HOLD due to customer overdue balance.');
+      }
+      if (order.currentDepartment !== 'Support' && order.departmentResponsible !== 'Support') {
+        throw createHttpError(400, 'Goods can only be received after the order reaches Support.');
+      }
+      if (order.inventoryFulfilledFromExistingStock === true) {
+        throw createHttpError(409, 'This order is using existing warehouse stock. Do not record another Inventory IN; create the Delivery Note when ready.');
+      }
 
-    if (order.isOverdueBlocked) {
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot record goods received: Order is on Finance HOLD due to customer overdue balance.'
-      });
-    }
+      if (order.fileType === 'Blue') {
+        const shipment = await Shipment.findOne({ salesOrder: order._id }).session(session);
+        if (!shipment || (!shipment.receivedInOffice && shipment.status !== 'Received in Office')) {
+          throw createHttpError(400, 'Cannot receive goods for Blue File: Logistics has not confirmed the shipment as Received in Office.');
+        }
+      }
 
-    // For Blue File, must be confirmed received in office by Logistics first!
-    if (order.fileType === 'Blue') {
-      const shipment = await Shipment.findOne({ salesOrder: order._id });
-      if (!shipment || (!shipment.receivedInOffice && shipment.status !== 'Received in Office')) {
-        return res.status(400).json({
-          success: false,
-          message: 'Cannot record goods received for Blue File: International shipment has not yet been confirmed as "Received in Office" by the Logistics Department.'
+      const supplierPO = await getSupplierPOForOrder(order, session);
+      const supplierName = String(supplierPO?.supplierName || order.supplierPO?.supplierName || '').trim();
+
+      const receiptId = String(req.body.receiptId || '').trim();
+      if (!receiptId) throw createHttpError(400, 'Receipt ID is required. Please reopen the Receive Goods form and try again.');
+      if ((order.inventoryReceipts || []).some(receipt => receipt.receiptId === receiptId)) {
+        throw createHttpError(409, 'This goods receipt was already saved. Refresh the order before entering another receipt.');
+      }
+
+      const submittedItems = Array.isArray(req.body.items) ? req.body.items : [];
+      if (!submittedItems.length) throw createHttpError(400, 'Enter at least one received product quantity.');
+      const grnNumber = await allocateGrnNumber(session);
+
+      const receivedTotals = getReceivedQuantityByOrderItem(order);
+      const inventoryItems = await InventoryItem.find({}).session(session);
+      const receiptItems = [];
+      const newlyCreatedByName = new Map();
+      let receiptQuantity = 0;
+
+      for (const submitted of submittedItems) {
+        const receivedQty = Number(submitted.receivedQty);
+        if (!Number.isFinite(receivedQty) || receivedQty < 0) {
+          throw createHttpError(400, 'Received quantities must be zero or greater.');
+        }
+        if (receivedQty === 0) continue;
+
+        const orderItem = (order.items || []).find(item => String(item._id) === String(submitted.orderItemId));
+        if (!orderItem) throw createHttpError(400, 'One of the submitted order lines is invalid. Refresh and try again.');
+
+        const orderedQty = Number(orderItem.quantity) || 1;
+        const previouslyReceivedQty = receivedTotals.get(String(orderItem._id)) || 0;
+        if (previouslyReceivedQty + receivedQty > orderedQty) {
+          throw createHttpError(400, `${orderItem.description || 'Order item'} can receive at most ${Math.max(0, orderedQty - previouslyReceivedQty)} more.`);
+        }
+
+        const matches = getInventoryMatches(orderItem, inventoryItems);
+        let inventoryItem = null;
+        let createdNew = false;
+
+        if (submitted.createNew) {
+          const newProduct = submitted.newProduct || {};
+          const newName = String(newProduct.name || orderItem.description || '').trim();
+          const newSku = String(newProduct.sku || '').trim();
+          const canonicalName = normalizeInventoryName(newName);
+          inventoryItem = newlyCreatedByName.get(canonicalName) || null;
+
+          if (!inventoryItem) {
+            const duplicate = inventoryItems.find(item =>
+              normalizeInventoryName(item.name) === canonicalName ||
+              (newSku && String(item.sku || '').trim().toLowerCase() === newSku.toLowerCase())
+            );
+            if (duplicate) {
+              throw createHttpError(409, `Inventory already contains ${duplicate.name}${duplicate.sku ? ` (${duplicate.sku})` : ''}. Select that existing row instead of creating another product.`);
+            }
+
+            const created = await InventoryItem.create([{
+              name: newName,
+              sku: newSku,
+              category: String(newProduct.category || (order.fileType === 'Blue' ? 'Imported Goods' : 'General')).trim(),
+              unit: String(newProduct.unit || 'pcs').trim(),
+              quantityOnHand: 0,
+              reservedQuantity: 0,
+              minStockLevel: Number(newProduct.minStockLevel) || 5,
+              unitPrice: Number(newProduct.unitPrice) || Number(orderItem.unitPrice) || 0,
+              location: String(newProduct.location || 'WH/Stock').trim(),
+              description: String(newProduct.description || orderItem.description || '').trim(),
+              supplierName,
+              supplierPoNumber: String(order.supplierPO?.poNumber || '').trim(),
+              orderReference: order.orderNumber || order.orderReference || ''
+            }], { session });
+            inventoryItem = created[0];
+            inventoryItems.push(inventoryItem);
+            newlyCreatedByName.set(canonicalName, inventoryItem);
+            createdNew = true;
+          }
+        } else {
+          if (!submitted.inventoryItemId || !mongoose.Types.ObjectId.isValid(submitted.inventoryItemId)) {
+            if (matches.length > 1) throw createHttpError(409, `Multiple inventory rows match ${orderItem.description}. Select the correct row explicitly.`);
+            if (matches.length === 0) throw createHttpError(409, `No inventory row matches ${orderItem.description}. Select another row or create the product once.`);
+            inventoryItem = matches[0];
+          } else {
+            inventoryItem = inventoryItems.find(item => String(item._id) === String(submitted.inventoryItemId));
+            if (!inventoryItem) throw createHttpError(404, 'The selected inventory row no longer exists. Refresh and try again.');
+          }
+
+          const isAutomaticMatch = matches.some(match => String(match._id) === String(inventoryItem._id));
+          const needsConfirmation = !isAutomaticMatch || hasInventoryContextMismatch(inventoryItem, order.fileType);
+          if (needsConfirmation && submitted.confirmedSelection !== true) {
+            throw createHttpError(409, `Confirm the selected inventory row for ${orderItem.description}. Its product or warehouse context does not automatically match this ${order.fileType || ''} order.`);
+          }
+        }
+
+        const movement = {
+          type: 'IN',
+          quantity: receivedQty,
+          reference: String(req.body.referenceNumber || receiptId).trim(),
+          grnNumber,
+          salesOrder: order._id,
+          orderNumber: order.orderNumber || order.orderReference || '',
+          remarks: String(req.body.remarks || 'Goods received by Support').trim(),
+          performedBy: req.user._id,
+          performedByName: req.user.fullName,
+          timestamp: new Date()
+        };
+        const updatedInventory = await InventoryItem.findByIdAndUpdate(
+          inventoryItem._id,
+          { $inc: { quantityOnHand: receivedQty }, $push: { stockMovements: movement } },
+          { new: true, runValidators: true, session }
+        );
+        const available = Math.max(0, (updatedInventory.quantityOnHand || 0) - (updatedInventory.reservedQuantity || 0));
+        const status = available <= 0 ? 'Out of Stock' : (available <= (updatedInventory.minStockLevel || 5) ? 'Low Stock' : 'In Stock');
+        if (updatedInventory.status !== status) {
+          await InventoryItem.updateOne({ _id: updatedInventory._id }, { $set: { status } }, { session });
+        }
+
+        receiptQuantity += receivedQty;
+        receivedTotals.set(String(orderItem._id), previouslyReceivedQty + receivedQty);
+        receiptItems.push({
+          orderItemId: String(orderItem._id),
+          productName: orderItem.description || 'Item',
+          sku: submitted.sku || '',
+          orderedQty,
+          receivedQty,
+          inventoryItem: updatedInventory._id,
+          inventoryName: updatedInventory.name,
+          inventorySku: updatedInventory.sku || '',
+          inventoryCategory: updatedInventory.category || '',
+          inventoryLocation: updatedInventory.location || '',
+          createdNew
         });
       }
-    }
 
-    const { receivedQuantity, orderedQuantity, remarks, receivedDate } = req.body;
-    const totalOrdered = (order.items && order.items.reduce((s, i) => s + (Number(i.quantity) || 1), 0)) || 1;
-    const rQty = Number(receivedQuantity) || totalOrdered;
-    const oQty = Number(orderedQuantity) || totalOrdered;
+      if (!receiptItems.length) throw createHttpError(400, 'Enter a received quantity greater than zero for at least one product.');
 
-    order.goodsReceivedInOffice = {
-      received: true,
-      receivedAt: receivedDate ? new Date(receivedDate) : new Date(),
-      receivedBy: req.user._id,
-      receivedByName: req.user.fullName,
-      receivedQuantity: rQty,
-      orderedQuantity: oQty,
-      remarks: remarks || 'Goods received in office and verified by Support Department.'
-    };
+      const totalOrdered = (order.items || []).reduce((sum, item) => sum + (Number(item.quantity) || 1), 0);
+      const totalReceived = (order.items || []).reduce((sum, item) => sum + (receivedTotals.get(String(item._id)) || 0), 0);
+      const allReceived = (order.items || []).length > 0 && (order.items || []).every(item =>
+        (receivedTotals.get(String(item._id)) || 0) >= (Number(item.quantity) || 1)
+      );
+      const receivedAt = req.body.referenceDate ? new Date(req.body.referenceDate) : new Date();
+      const referenceType = order.fileType === 'Blue' ? 'BL / AWB' : 'Supplier Bill';
 
-    const prevStatus = order.workflowStatus;
-    order.workflowStatus = 'Goods Received in Office';
-    order.status = 'Goods Received in Office';
-    order.departmentResponsible = 'Support';
-    order.currentDepartment = 'Support';
-    order.currentStatus = 'GOODS_RECEIVED_IN_OFFICE';
-    order.previousDepartment = 'Logistics';
-    order.previousStatus = prevStatus;
-    order.lastAction = 'Goods Received in Office';
-    order.lastActionBy = req.user._id;
-    order.lastActionByName = req.user.fullName;
-    order.lastActionAt = new Date();
+      order.inventoryReceipts.push({
+        receiptId,
+        grnNumber,
+        receivedAt,
+        receivedBy: req.user._id,
+        receivedByName: req.user.fullName,
+        referenceType,
+        referenceNumber: String(req.body.referenceNumber || '').trim(),
+        referenceDate: req.body.referenceDate ? new Date(req.body.referenceDate) : null,
+        supplierName,
+        carrier: order.fileType === 'Blue' ? String(req.body.carrier || '').trim() : '',
+        containerNo: order.fileType === 'Blue' ? String(req.body.containerNo || '').trim() : '',
+        portOfLoading: order.fileType === 'Blue' ? String(req.body.portOfLoading || '').trim() : '',
+        portOfDischarge: order.fileType === 'Blue' ? String(req.body.portOfDischarge || '').trim() : '',
+        remarks: String(req.body.remarks || '').trim(),
+        items: receiptItems
+      });
+      if (!order.inventoryGrnNumbers.includes(grnNumber)) order.inventoryGrnNumbers.push(grnNumber);
+      order.inventoryReceived = allReceived;
+      order.goodsReceivedInOffice = {
+        received: allReceived,
+        receivedAt,
+        receivedBy: req.user._id,
+        receivedByName: req.user.fullName,
+        receivedQuantity: totalReceived,
+        orderedQuantity: totalOrdered,
+        remarks: String(req.body.remarks || (allReceived ? 'All ordered goods received into inventory.' : 'Partial goods receipt recorded.')).trim()
+      };
 
-    order.workflowHistory.push({
-      user: req.user._id,
-      userName: req.user.fullName,
-      department: 'Support',
-      action: 'Goods Received in Office',
-      previousStatus: prevStatus,
-      newStatus: 'Goods Received in Office',
-      timestamp: new Date(),
-      notes: remarks || `Goods received: ${rQty} of ${oQty} units verified in office.`
+      if (order.fileType === 'Blue' && req.body.referenceNumber) {
+        order.blNumber = String(req.body.referenceNumber).trim();
+        order.blInput = {
+          blNumber: order.blNumber,
+          blDate: req.body.referenceDate ? new Date(req.body.referenceDate) : null,
+          carrier: String(req.body.carrier || '').trim(),
+          containerNo: String(req.body.containerNo || '').trim(),
+          portOfLoading: String(req.body.portOfLoading || '').trim(),
+          portOfDischarge: String(req.body.portOfDischarge || '').trim(),
+          enteredBy: req.user._id,
+          enteredByName: req.user.fullName,
+          enteredAt: new Date()
+        };
+      }
+
+      const prevStatus = order.workflowStatus;
+      order.workflowStatus = 'Goods Received in Office';
+      order.status = 'Goods Received in Office';
+      order.departmentResponsible = 'Support';
+      order.currentDepartment = 'Support';
+      order.currentStatus = allReceived ? 'GOODS_RECEIVED_IN_OFFICE' : 'PARTIAL_INVENTORY_RECEIPT';
+      order.previousStatus = prevStatus;
+      order.lastAction = allReceived ? 'Inventory IN Completed' : 'Partial Inventory IN Recorded';
+      order.lastActionBy = req.user._id;
+      order.lastActionByName = req.user.fullName;
+      order.lastActionAt = new Date();
+      order.workflowHistory.push({
+        user: req.user._id,
+        userName: req.user.fullName,
+        department: 'Support',
+        action: allReceived ? 'Inventory IN Completed' : 'Partial Inventory IN Recorded',
+        previousStatus: prevStatus,
+        newStatus: 'Goods Received in Office',
+        timestamp: new Date(),
+        notes: `${receiptQuantity} unit(s) received in this entry; ${totalReceived} of ${totalOrdered} total units received.`
+      });
+
+      const createdGrns = await PurchaserGRN.create([{
+        grnNumber,
+        grnType: order.fileType === 'Green' ? 'Supplier' : 'Support Inventory IN',
+        supplier: supplierPO?.supplier || null,
+        supplierName: supplierName || '-',
+        supplierPO: supplierPO?._id || null,
+        supplierPOId: supplierPO?._id || null,
+        poNumber: supplierPO?.poNumber || order.supplierPO?.poNumber || '',
+        salesOrder: order._id,
+        salesOrderId: order._id,
+        salesOrderNumber: order.orderNumber || order.orderReference || '',
+        supplierBillNumber: order.fileType === 'Green' ? String(req.body.referenceNumber || '').trim() : '',
+        supplierBillDate: order.fileType === 'Green' && req.body.referenceDate ? new Date(req.body.referenceDate) : null,
+        grnDate: receivedAt,
+        items: receiptItems.map(item => ({
+          productId: String(item.inventoryItem || ''),
+          productName: item.productName,
+          orderedQty: item.orderedQty,
+          receivedQty: item.receivedQty,
+          quantity: item.receivedQty,
+          quantityReceived: item.receivedQty,
+          remainingQty: Math.max(0, item.orderedQty - (receivedTotals.get(String(item.orderItemId)) || 0)),
+          condition: 'Good'
+        })),
+        status: allReceived ? 'Completed' : 'Partial',
+        remarks: String(req.body.remarks || `${referenceType} inventory receipt`).trim(),
+        createdBy: req.user._id,
+        createdByName: req.user.fullName
+      }], { session });
+
+      if (order.fileType === 'Green' && supplierPO) {
+        const payable = await LocalPayable.findOne({
+          $or: [{ supplierPO: supplierPO._id }, { salesOrderId: order._id }]
+        }).session(session);
+        if (payable) {
+          if (!payable.grn) payable.grn = createdGrns[0]._id;
+          if (!payable.grns.some(id => String(id) === String(createdGrns[0]._id))) payable.grns.push(createdGrns[0]._id);
+          await payable.save({ session });
+        }
+      }
+
+      await order.save({ session });
+      savedOrder = order;
     });
 
-    await order.save();
-
     await logSalesActivity({
-      type: 'Goods Received in Office',
-      description: `Goods received in office for Sales Order ${order.orderNumber || order.orderReference} by Support (${req.user.fullName}). Verified: ${rQty} units.`,
+      type: 'Inventory IN',
+      description: `Support recorded Inventory IN for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference}.`,
       relatedModel: 'SalesOrder',
-      relatedId: order._id,
+      relatedId: savedOrder._id,
       performedBy: req.user._id
     });
 
-    // Notify Sales Person
-    if (order.salesPerson) {
-      await createNotificationHelper({
-        recipient: order.salesPerson,
-        sender: req.user._id,
-        title: 'Goods Received in Office',
-        message: `Goods for your Sales Order ${order.orderNumber || order.orderReference} have been received in office by Support (${rQty} units).`,
-        type: 'order',
-        link: '/employee/sales/orders'
-      });
+    if (savedOrder.inventoryReceived && savedOrder.salesPerson) {
+      try {
+        await createNotificationHelper({
+          recipient: savedOrder.salesPerson,
+          sender: req.user._id,
+          title: 'Inventory IN Completed',
+          message: `All goods for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference} have been received into inventory by Support.`,
+          type: 'order',
+          link: '/employee/sales/orders'
+        });
+      } catch (notificationError) {
+        console.error('[Inventory IN Notification Error]:', notificationError.message);
+      }
     }
 
     return res.status(200).json({
       success: true,
-      message: `Goods receipt confirmed in office for Sales Order ${order.orderNumber || order.orderReference}!`,
-      data: order
+      message: savedOrder.inventoryReceived
+        ? `Inventory IN completed for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference}. GRN ${savedOrder.inventoryGrnNumbers[savedOrder.inventoryGrnNumbers.length - 1]} created.`
+        : `Partial Inventory IN recorded for Sales Order ${savedOrder.orderNumber || savedOrder.orderReference}. GRN ${savedOrder.inventoryGrnNumbers[savedOrder.inventoryGrnNumbers.length - 1]} created.`,
+      data: savedOrder
     });
   } catch (err) {
     console.error('[Record Goods Received Error]:', err);
-    return res.status(500).json({ success: false, message: 'Server error recording goods received.' });
+    return res.status(err.statusCode || 500).json({ success: false, message: err.statusCode ? err.message : 'Server error recording goods received.' });
+  } finally {
+    await session.endSession();
   }
 };
 
 /**
- * @desc    Record Inventory Check and Bill of Lading (BL) input (Support Department Action)
+ * @desc    Record Bill of Lading (BL) / receiving reference metadata (Support Department Action)
  * @route   POST /api/sales-employee/orders/:id/bl-input
  */
 const recordBLInput = async (req, res) => {
@@ -4321,10 +4959,7 @@ const recordBLInput = async (req, res) => {
       });
     }
 
-    const { blNumber, blDate, carrier, containerNo, portOfLoading, portOfDischarge, stockVerified } = req.body;
-    if (!blNumber && !order.blNumber) {
-      return res.status(400).json({ success: false, message: 'BL Number is required.' });
-    }
+    const { blNumber, blDate, carrier, containerNo, portOfLoading, portOfDischarge } = req.body;
 
     const finalBlNumber = (blNumber || order.blNumber || '').trim();
     order.blNumber = finalBlNumber;
@@ -4340,15 +4975,8 @@ const recordBLInput = async (req, res) => {
       enteredAt: new Date()
     };
 
-    const prevStatus = order.workflowStatus;
-    order.workflowStatus = 'Inventory & BL Verified';
-    order.status = 'Inventory & BL Verified';
-    order.departmentResponsible = 'Support';
-    order.currentDepartment = 'Support';
-    order.currentStatus = 'BL_RECORDED';
-    order.previousDepartment = 'Logistics';
-    order.previousStatus = prevStatus;
-    order.lastAction = 'Inventory Check and BL Input';
+    const currentWorkflowStatus = order.workflowStatus;
+    order.lastAction = 'BL / Reference Details Recorded';
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
     order.lastActionAt = new Date();
@@ -4357,18 +4985,18 @@ const recordBLInput = async (req, res) => {
       user: req.user._id,
       userName: req.user.fullName,
       department: 'Support',
-      action: 'Inventory Check and BL Input',
-      previousStatus: prevStatus,
-      newStatus: 'Inventory & BL Verified',
+      action: 'BL / Reference Details Recorded',
+      previousStatus: currentWorkflowStatus,
+      newStatus: currentWorkflowStatus,
       timestamp: new Date(),
-      notes: `BL #${finalBlNumber} recorded, warehouse inventory verified. Ready for Delivery Note creation.`
+      notes: finalBlNumber ? `BL / reference #${finalBlNumber} recorded as metadata.` : 'BL / reference metadata updated.'
     });
 
     await order.save();
 
     await logSalesActivity({
-      type: 'Inventory & BL Verified',
-      description: `Support (${req.user.fullName}) recorded BL #${finalBlNumber} and verified inventory for Sales Order ${order.orderNumber || order.orderReference}`,
+      type: 'BL / Reference Details Recorded',
+      description: `Support (${req.user.fullName}) updated BL / reference metadata for Sales Order ${order.orderNumber || order.orderReference}`,
       relatedModel: 'SalesOrder',
       relatedId: order._id,
       performedBy: req.user._id
@@ -4376,7 +5004,7 @@ const recordBLInput = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: `BL #${finalBlNumber} and inventory check verified! Ready for Delivery Note (DN).`,
+      message: 'BL / reference details recorded. Inventory quantities were not changed.',
       data: order
     });
   } catch (err) {
@@ -4602,6 +5230,20 @@ const createOrUpdateInventoryItem = async (req, res) => {
     const { id, name, sku, category, unit, quantityOnHand, minStockLevel, unitPrice, location, description } = req.body;
     if (!name) return res.status(400).json({ success: false, message: 'Product name is required.' });
 
+    const inventoryItems = await InventoryItem.find(id ? { _id: { $ne: id } } : {});
+    const normalizedName = normalizeInventoryName(name);
+    const normalizedSku = String(sku || '').trim().toLowerCase();
+    const duplicate = inventoryItems.find(existing =>
+      normalizeInventoryName(existing.name) === normalizedName ||
+      (normalizedSku && String(existing.sku || '').trim().toLowerCase() === normalizedSku)
+    );
+    if (duplicate) {
+      return res.status(409).json({
+        success: false,
+        message: `Inventory already contains ${duplicate.name}${duplicate.sku ? ` (${duplicate.sku})` : ''}. Use Inventory IN on the existing row.`
+      });
+    }
+
     let item;
     if (id) {
       item = await InventoryItem.findByIdAndUpdate(
@@ -4622,52 +5264,238 @@ const createOrUpdateInventoryItem = async (req, res) => {
   }
 };
 
+const addInventoryStock = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const quantity = Number(req.body.quantity);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({ success: false, message: 'Inventory IN quantity must be greater than zero.' });
+    }
+    let savedItem = null;
+    let grnNumber = '';
+    await session.withTransaction(async () => {
+      const existingItem = await InventoryItem.findById(req.params.id).session(session);
+      if (!existingItem) throw createHttpError(404, 'Inventory item not found.');
+
+      let order = null;
+      if (req.body.salesOrderId) {
+        if (!mongoose.Types.ObjectId.isValid(req.body.salesOrderId)) throw createHttpError(400, 'The selected Sales Order is invalid.');
+        order = await SalesOrder.findById(req.body.salesOrderId).session(session);
+        if (!order) throw createHttpError(404, 'The selected Sales Order was not found.');
+      }
+
+      grnNumber = await allocateGrnNumber(session);
+      const orderNumber = order ? (order.orderNumber || order.orderReference || '') : '';
+      const movement = {
+        type: 'IN',
+        quantity,
+        reference: String(req.body.reference || grnNumber).trim(),
+        grnNumber,
+        salesOrder: order?._id || null,
+        orderNumber,
+        remarks: String(req.body.remarks || 'Manual Inventory IN by Support').trim(),
+        performedBy: req.user._id,
+        performedByName: req.user.fullName,
+        timestamp: new Date()
+      };
+      savedItem = await InventoryItem.findByIdAndUpdate(
+        existingItem._id,
+        { $inc: { quantityOnHand: quantity }, $push: { stockMovements: movement } },
+        { new: true, runValidators: true, session }
+      );
+      const available = Math.max(0, (savedItem.quantityOnHand || 0) - (savedItem.reservedQuantity || 0));
+      savedItem.status = available <= 0 ? 'Out of Stock' : (available <= (savedItem.minStockLevel || 5) ? 'Low Stock' : 'In Stock');
+      await savedItem.save({ session });
+
+      const supplierPO = order ? await getSupplierPOForOrder(order, session) : null;
+      const createdGrns = await PurchaserGRN.create([{
+        grnNumber,
+        grnType: order?.fileType === 'Green' ? 'Supplier' : 'Manual Inventory IN',
+        supplier: supplierPO?.supplier || null,
+        supplierName: supplierPO?.supplierName || order?.supplierPO?.supplierName || '-',
+        supplierPO: supplierPO?._id || null,
+        supplierPOId: supplierPO?._id || null,
+        poNumber: supplierPO?.poNumber || order?.supplierPO?.poNumber || '',
+        salesOrder: order?._id || null,
+        salesOrderId: order?._id || null,
+        salesOrderNumber: orderNumber,
+        supplierBillNumber: order?.fileType === 'Green' ? String(req.body.reference || '').trim() : '',
+        supplierBillDate: order?.fileType === 'Green' ? new Date() : null,
+        grnDate: new Date(),
+        items: [{
+          productId: String(savedItem._id),
+          productName: savedItem.name,
+          orderedQty: 0,
+          receivedQty: quantity,
+          quantity,
+          quantityReceived: quantity,
+          remainingQty: 0,
+          condition: 'Good'
+        }],
+        status: 'Completed',
+        remarks: String(req.body.remarks || 'Manual Inventory IN by Support').trim(),
+        createdBy: req.user._id,
+        createdByName: req.user.fullName
+      }], { session });
+
+      if (order) {
+        if (!order.inventoryGrnNumbers.includes(grnNumber)) order.inventoryGrnNumbers.push(grnNumber);
+        order.inventoryReceipts.push({
+          receiptId: `MANUAL-${grnNumber}`,
+          grnNumber,
+          receivedAt: new Date(),
+          receivedBy: req.user._id,
+          receivedByName: req.user.fullName,
+          referenceType: 'Manual Inventory IN',
+          referenceNumber: String(req.body.reference || '').trim(),
+          supplierName: supplierPO?.supplierName || order.supplierPO?.supplierName || '',
+          remarks: String(req.body.remarks || 'Manual Inventory IN by Support').trim(),
+          items: [{
+            orderItemId: '',
+            productName: savedItem.name,
+            sku: savedItem.sku || '',
+            orderedQty: 0,
+            receivedQty: quantity,
+            inventoryItem: savedItem._id,
+            inventoryName: savedItem.name,
+            inventorySku: savedItem.sku || '',
+            inventoryCategory: savedItem.category || '',
+            inventoryLocation: savedItem.location || '',
+            createdNew: false
+          }]
+        });
+        await order.save({ session });
+        if (order.fileType === 'Green' && supplierPO) {
+          const payable = await LocalPayable.findOne({
+            $or: [{ supplierPO: supplierPO._id }, { salesOrderId: order._id }]
+          }).session(session);
+          if (payable) {
+            if (!payable.grn) payable.grn = createdGrns[0]._id;
+            if (!payable.grns.some(id => String(id) === String(createdGrns[0]._id))) payable.grns.push(createdGrns[0]._id);
+            await payable.save({ session });
+          }
+        }
+      }
+    });
+
+    return res.status(200).json({ success: true, message: `${quantity} ${savedItem.unit || 'pcs'} added to ${savedItem.name}. GRN ${grnNumber} created.`, data: savedItem, grnNumber });
+  } catch (error) {
+    console.error('[Inventory IN Error]:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error adding inventory stock.' });
+  } finally {
+    await session.endSession();
+  }
+};
+
 const confirmDeliveryNoteWithInventory = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const deliveryNote = await DeliveryNote.findById(req.params.id);
     if (!deliveryNote) {
       return res.status(404).json({ success: false, message: 'Delivery Note not found.' });
     }
 
-    if (deliveryNote.status === 'Done' || deliveryNote.status === 'Delivered') {
+    if (deliveryNote.status === 'Done' || deliveryNote.status === 'Delivered' || deliveryNote.status === 'Confirmed') {
       return res.status(400).json({ success: false, message: 'Delivery Note is already confirmed.' });
     }
 
-    if (!deliveryNote.isStockDeducted && deliveryNote.items && deliveryNote.items.length > 0) {
-      for (const item of deliveryNote.items) {
-        const qtyToDeduct = Number(item.quantity) || Number(item.demand) || 1;
-        const itemName = item.product || item.description || '';
-
-        let invItem = await InventoryItem.findOne({
-          $or: [
-            { name: new RegExp('^' + itemName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') },
-            { description: new RegExp(itemName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }
-          ]
-        });
-
-        if (invItem) {
-          const newQty = Math.max(0, (invItem.quantityOnHand || 0) - qtyToDeduct);
-          invItem.quantityOnHand = newQty;
-          invItem.reservedQuantity = Math.max(0, (invItem.reservedQuantity || 0) - qtyToDeduct);
-          await invItem.save();
-        }
-      }
-      deliveryNote.isStockDeducted = true;
+    const signedDocument = req.body.signedDeliveryNoteDocument;
+    const signedDocumentName = req.body.signedDeliveryNoteDocumentName;
+    if (!hasValidSignedDeliveryNoteAttachment(signedDocument, signedDocumentName)) {
+      return res.status(400).json({ success: false, message: SIGNED_DN_ATTACHMENT_MESSAGE });
     }
 
-    deliveryNote.status = 'Done';
-    deliveryNote.deliveryDate = new Date();
-    deliveryNote.receivedBy = req.body.receivedBy || req.user.fullName;
-    await deliveryNote.save();
+    if (!deliveryNote.salesOrder) {
+      return res.status(400).json({ success: false, message: 'A linked Sales Order is required before this Delivery Note can be confirmed.' });
+    }
 
-    if (deliveryNote.salesOrder) {
-      const order = await SalesOrder.findById(deliveryNote.salesOrder);
-      if (order) {
+    const order = await SalesOrder.findById(deliveryNote.salesOrder).session(session);
+    if (!order) return res.status(404).json({ success: false, message: 'The Sales Order linked to this Delivery Note was not found.' });
+
+    if (!deliveryNote.isStockDeducted) {
+      const stock = await getDeliveryStockRequirements(order, { session, excludeDeliveryNoteId: deliveryNote._id });
+      if (!stock.isFullyInStock) {
+        const shortages = stock.shortages.length
+          ? stock.shortages
+          : [{ item: order.productSummary || 'Order items', required: 1, available: 0 }];
+        return res.status(409).json({ success: false, message: formatStockShortageMessage(shortages), shortages });
+      }
+
+      await session.withTransaction(async () => {
+        for (const deduction of stock.deductions) {
+          const quantity = Number(deduction.quantity) || 0;
+          if (quantity <= 0) continue;
+          const updated = await InventoryItem.findOneAndUpdate(
+            {
+              _id: deduction.inventoryItemId,
+              $expr: {
+                $gte: [
+                  { $subtract: [{ $ifNull: ['$quantityOnHand', 0] }, { $ifNull: ['$reservedQuantity', 0] }] },
+                  quantity
+                ]
+              }
+            },
+            [
+              {
+                $set: {
+                  quantityOnHand: { $subtract: [{ $ifNull: ['$quantityOnHand', 0] }, quantity] },
+                  reservedQuantity: { $max: [0, { $subtract: [{ $ifNull: ['$reservedQuantity', 0] }, quantity] }] },
+                  stockMovements: {
+                    $concatArrays: [
+                      { $ifNull: ['$stockMovements', []] },
+                      [{
+                        type: 'OUT',
+                        quantity,
+                        reference: deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber || '',
+                        salesOrder: order._id,
+                        orderNumber: order.orderNumber || order.orderReference || '',
+                        remarks: 'Stock deducted on Delivery Note confirmation.',
+                        performedBy: req.user._id,
+                        performedByName: req.user.fullName || '',
+                        timestamp: new Date()
+                      }]
+                    ]
+                  }
+                }
+              },
+              {
+                $set: {
+                  status: {
+                    $cond: [
+                      { $lte: [{ $subtract: ['$quantityOnHand', '$reservedQuantity'] }, 0] },
+                      'Out of Stock',
+                      { $cond: [{ $lte: [{ $subtract: ['$quantityOnHand', '$reservedQuantity'] }, { $ifNull: ['$minStockLevel', 5] }] }, 'Low Stock', 'In Stock'] }
+                    ]
+                  }
+                }
+              }
+            ],
+            { new: true, session }
+          );
+          if (!updated) {
+            const latest = await InventoryItem.findById(deduction.inventoryItemId).session(session);
+            const available = Math.max(0, (Number(latest?.quantityOnHand) || 0) - (Number(latest?.reservedQuantity) || 0));
+            throw createHttpError(409, `Add inventory first. Insufficient stock: ${deduction.item} (required ${quantity}, available ${available}).`);
+          }
+        }
+        deliveryNote.isStockDeducted = true;
+
+        deliveryNote.status = 'Done';
+        deliveryNote.deliveryDate = new Date();
+        deliveryNote.receivedBy = req.body.receivedBy || req.user.fullName;
+        deliveryNote.signedDeliveryNoteDocument = signedDocument;
+        deliveryNote.signedDeliveryNoteDocumentName = signedDocumentName.trim();
+        deliveryNote.signedDeliveryNoteUploadedAt = new Date();
+        deliveryNote.signedDeliveryNoteUploadedBy = req.user._id;
+        deliveryNote.signedDeliveryNoteUploadedByName = req.user.fullName || '';
+        await deliveryNote.save({ session });
+
         const prevStatus = order.workflowStatus || 'Sent to Support';
         order.deliveryStatus = 'Fully Delivered';
         order.workflowStatus = 'Sent to Accounts';
         order.status = 'Delivery Note Confirmed';
         order.departmentResponsible = 'Accounts';
+        order.currentDepartment = 'Accounts';
         order.workflowHistory.push({
           user: req.user._id,
           userName: req.user.fullName,
@@ -4678,8 +5506,8 @@ const confirmDeliveryNoteWithInventory = async (req, res) => {
           timestamp: new Date(),
           notes: `Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} confirmed.`
         });
-        await order.save();
-      }
+        await order.save({ session });
+      });
     }
 
     const soRef = (deliveryNote.salesOrderNumber || deliveryNote.salesOrder?.orderReference || deliveryNote.salesOrder?.orderNumber || 'SO-—');
@@ -4699,7 +5527,9 @@ const confirmDeliveryNoteWithInventory = async (req, res) => {
     });
   } catch (error) {
     console.error('[Confirm Delivery Note Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error confirming delivery note.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error confirming delivery note.' });
+  } finally {
+    await session.endSession();
   }
 };
 
@@ -5076,10 +5906,13 @@ const getFinanceReceivables = async (req, res) => {
 
     const now = new Date();
     const receivables = invoices.map(inv => {
-      const total = Number(inv.amount) || 0;
-      const paid = Number(inv.paidAmount) || 0;
-      const remaining = Math.max(0, total - paid);
-      const isOverdue = remaining > 0 && inv.dueDate && new Date(inv.dueDate) < now;
+      const totalCents = toMoneyCents(inv.amount) || 0;
+      const paidCents = toMoneyCents(inv.paidAmount) || 0;
+      const remainingCents = Math.max(0, totalCents - paidCents);
+      const total = fromMoneyCents(totalCents);
+      const paid = fromMoneyCents(paidCents);
+      const remaining = fromMoneyCents(remainingCents);
+      const isOverdue = remainingCents > 0 && inv.dueDate && new Date(inv.dueDate) < now;
       return {
         _id: inv._id,
         invoiceNumber: inv.invoiceNumber,
@@ -5092,7 +5925,7 @@ const getFinanceReceivables = async (req, res) => {
         remainingReceivable: remaining,
         issueDate: inv.issueDate,
         dueDate: inv.dueDate,
-        status: remaining === 0 ? 'Paid' : (paid > 0 ? 'Partially Paid' : (isOverdue ? 'Overdue' : (inv.status || 'Pending'))),
+        status: remainingCents === 0 ? 'Paid' : (paidCents > 0 ? 'Partially Paid' : (isOverdue ? 'Overdue' : (inv.status || 'Pending'))),
         isOverdue
       };
     });
@@ -5208,6 +6041,7 @@ module.exports = {
   deleteMyOrder,
   financeReviewSalesOrder,
   checkOrderStock,
+  getGoodsReceivingPreview,
   getAvailableOrdersForDelivery,
   getMyProformaInvoices,
   createMyProformaInvoice,
@@ -5246,6 +6080,7 @@ module.exports = {
   getSupportStats,
   getInventoryItems,
   createOrUpdateInventoryItem,
+  addInventoryStock,
   confirmDeliveryNoteWithInventory,
   getAccountsStats,
   getAccountsPendingDeliveryNotes,

@@ -12,6 +12,155 @@ const Shipment = require('../models/Shipment');
 const logAudit = require('../utils/auditLogger');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
 
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+const toCents = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100);
+const getPayableBalances = (payable) => {
+  const source = payable?._doc || payable;
+  const totalAmountCents = Number.isInteger(source?.totalAmountCents)
+    ? source.totalAmountCents
+    : toCents(source?.amount);
+  const paymentTotal = (source?.payments || []).reduce((sum, payment) => sum + (Number(payment.amountCents) || 0), 0);
+  const paidAmountCents = Number.isInteger(source?.paidAmountCents)
+    ? source.paidAmountCents
+    : (['Paid', 'Cleared'].includes(source?.status) ? totalAmountCents : paymentTotal);
+  return {
+    totalAmountCents,
+    paidAmountCents: Math.min(totalAmountCents, Math.max(0, paidAmountCents)),
+    outstandingAmountCents: Math.max(0, totalAmountCents - paidAmountCents)
+  };
+};
+const normalizeInventoryName = (value) => {
+  const normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const duplicatedSuffix = normalized.match(/^(.*?)\s*\((.*?)\)$/);
+  if (duplicatedSuffix && duplicatedSuffix[1].trim() === duplicatedSuffix[2].trim()) {
+    return duplicatedSuffix[1].trim();
+  }
+  return normalized;
+};
+
+const getInventoryMatches = (orderItem, inventoryItems) => {
+  const productName = normalizeInventoryName(orderItem?.description || orderItem?.productName || orderItem?.name);
+  const sku = String(orderItem?.productCode || orderItem?.sku || '').trim().toLowerCase();
+  return inventoryItems.filter(item => {
+    const nameMatches = productName && normalizeInventoryName(item.name) === productName;
+    const skuMatches = sku && String(item.sku || '').trim().toLowerCase() === sku;
+    return Boolean(nameMatches || skuMatches);
+  });
+};
+
+const findExistingLocalPayable = async ({ supplierPOId, poNumber, salesOrderId, session = null }) => {
+  const duplicateChecks = [];
+  if (supplierPOId) duplicateChecks.push({ supplierPO: supplierPOId });
+  if (salesOrderId) duplicateChecks.push({ salesOrderId });
+  if (poNumber) {
+    duplicateChecks.push({
+      poNumber: { $regex: `^${escapeRegex(poNumber.trim())}$`, $options: 'i' }
+    });
+  }
+  if (duplicateChecks.length === 0) return null;
+  return LocalPayable.findOne({ $or: duplicateChecks }).session(session || null);
+};
+
+const ensureLocalPayableForSupplierPO = async ({ po, linkedOrder, user, session = null }) => {
+  const salesOrderId = po.salesOrderId || linkedOrder?._id || null;
+  const existingPayable = await findExistingLocalPayable({
+    supplierPOId: po._id,
+    poNumber: po.poNumber,
+    salesOrderId,
+    session
+  });
+  if (existingPayable) return { payable: existingPayable, created: false };
+
+  let isBlocked = false;
+  let blockReason = '';
+  if (linkedOrder && (linkedOrder.advanceRequired || linkedOrder.advanceRequiredAmount > 0)) {
+    const received = linkedOrder.advanceReceived ? (linkedOrder.netAmount || 1) : (linkedOrder.advanceReceivedAmount || 0);
+    const required = linkedOrder.advanceRequiredAmount || 1;
+    if (!linkedOrder.advanceReceived && received < required) {
+      isBlocked = true;
+      blockReason = `Required customer advance has not been received (Received: PKR ${received.toLocaleString()}).`;
+    }
+  }
+
+  const payableNumber = `LP-${Date.now().toString().slice(-6)}`;
+  const amount = Number(po.totalAmount) || 0;
+  const payableData = {
+    payableNumber,
+    supplier: po.supplier || null,
+    supplierName: po.supplierName,
+    supplierPO: po._id,
+    poNumber: po.poNumber,
+    salesOrderId,
+    salesOrderNumber: po.salesOrderNumber || linkedOrder?.orderNumber || linkedOrder?.orderReference || '',
+    paymentMethod: '',
+    paymentTerms: po.paymentTerms || '',
+    amount,
+    totalAmountCents: toCents(amount),
+    paidAmountCents: 0,
+    outstandingAmountCents: toCents(amount),
+    subtotal: Number(po.subtotal) || 0,
+    gstRate: Number(po.gstRate) || 0,
+    gstAmount: Number(po.gstAmount) || 0,
+    paymentDate: null,
+    status: isBlocked ? 'Payment Blocked – Awaiting Customer Advance' : 'Pending',
+    isBlockedByAdvance: isBlocked,
+    remarks: isBlocked
+      ? `[BLOCKED] ${blockReason} | Automatically created from Local Supplier PO ${po.poNumber}.`
+      : `Automatically created from Local Supplier PO ${po.poNumber}.`,
+    createdBy: user._id,
+    createdByName: user.fullName
+  };
+  const payable = session
+    ? (await LocalPayable.create([payableData], { session }))[0]
+    : await LocalPayable.create(payableData);
+
+  return { payable, created: true };
+};
+
+const claimLocalSupplierPOOrder = async ({ salesOrderId, supplierPOId, poNumber, session }) => {
+  const order = await SalesOrder.findById(salesOrderId).session(session);
+  if (!order) {
+    const error = new Error('Sales Order not found.');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const activePO = await SupplierPO.findOne({
+    salesOrderId: order._id,
+    poType: 'Local',
+    status: { $ne: 'Cancelled' }
+  }).session(session);
+  if (activePO) {
+    const error = new Error(`Sales Order ${order.orderNumber || order.orderReference} already has active Local Supplier PO ${activePO.poNumber}. Cancel it before issuing another.`);
+    error.statusCode = 409;
+    throw error;
+  }
+
+  let claimCondition = { $or: [{ supplierPoId: null }, { supplierPoId: { $exists: false } }] };
+  if (order.supplierPoId) {
+    const claimedPO = await SupplierPO.findById(order.supplierPoId).session(session);
+    if (!claimedPO || claimedPO.status !== 'Cancelled') {
+      const error = new Error(`Sales Order ${order.orderNumber || order.orderReference} already has a Supplier PO assigned. Cancel it before issuing another Local Supplier PO.`);
+      error.statusCode = 409;
+      throw error;
+    }
+    claimCondition = { supplierPoId: order.supplierPoId };
+  }
+
+  const claimedOrder = await SalesOrder.findOneAndUpdate(
+    { _id: order._id, ...claimCondition },
+    { $set: { supplierPoId: supplierPOId, supplierPoNumber: poNumber } },
+    { new: true, session }
+  );
+  if (!claimedOrder) {
+    const error = new Error(`Sales Order ${order.orderNumber || order.orderReference} was assigned another Supplier PO while this request was being processed. Refresh and try again.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  return claimedOrder;
+};
+
 // ── SUPPLIER MANAGEMENT ────────────────────────────────────────────────────────
 exports.getSuppliers = async (req, res) => {
   try {
@@ -40,9 +189,17 @@ exports.createSupplier = async (req, res) => {
     if (!name || !name.trim()) {
       return res.status(400).json({ success: false, message: 'Supplier name is required.' });
     }
+    const resolvedType = supplierType === 'Global' ? 'Global' : 'Local';
+    const duplicate = await Supplier.findOne({
+      name: { $regex: `^${escapeRegex(name.trim())}$`, $options: 'i' },
+      supplierType: resolvedType
+    });
+    if (duplicate) {
+      return res.status(409).json({ success: false, message: `Supplier "${duplicate.name}" already exists. Select it from the supplier list.` });
+    }
     const supplier = await Supplier.create({
       name: name.trim(),
-      supplierType: supplierType === 'Global' ? 'Global' : 'Local',
+      supplierType: resolvedType,
       country: country || (supplierType === 'Global' ? 'International' : 'Pakistan'),
       contactPerson: contactPerson || '',
       email: email || '',
@@ -86,7 +243,9 @@ exports.createSupplierPO = async (req, res) => {
 
     const type = poType || subType || (req.user.purchaserSubDept === 'Global' ? 'Global' : 'Local');
     const prefix = type === 'Global' ? 'GPO' : 'LPO';
-    const poNumber = req.body.poNumber || `${prefix}-${Date.now().toString().slice(-6)}`;
+    const poNumber = type === 'Local'
+      ? `${prefix}-${Date.now().toString().slice(-6)}`
+      : (req.body.poNumber || `${prefix}-${Date.now().toString().slice(-6)}`);
 
     // Resolve or auto-create supplier
     let supplier = null;
@@ -94,8 +253,13 @@ exports.createSupplierPO = async (req, res) => {
     if (supplierId && supplierId !== 'NEW' && mongoose.Types.ObjectId.isValid(supplierId)) {
       supplier = await Supplier.findById(supplierId);
     }
+    if (type === 'Local') {
+      if (!supplier || supplier.supplierType !== 'Local') {
+        return res.status(400).json({ success: false, message: 'Select a valid Local supplier before issuing the purchase order.' });
+      }
+    }
     const resolvedName = (supplierName || req.body.supplier || (supplier ? supplier.name : '')).trim();
-    if (!supplier && resolvedName) {
+    if (type !== 'Local' && !supplier && resolvedName) {
       supplier = await Supplier.findOne({ name: new RegExp('^' + resolvedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
       if (!supplier) {
         supplier = await Supplier.create({
@@ -114,12 +278,14 @@ exports.createSupplierPO = async (req, res) => {
     const finalSupplierName = supplier ? supplier.name : resolvedName;
     const finalSupplierCountry = supplier?.country || supplierCountry || (type === 'Global' ? 'China' : 'Pakistan');
 
-    let totalAmount = 0;
+    let subtotal = 0;
     const formattedItems = (items || []).map(item => {
       const qty = Number(item.quantity || item.requiredQty || item.quantityOrdered) || 1;
       const price = Number(item.unitPrice || item.unitPricePKR) || 0;
-      const itemTotal = Number(item.totalPricePKR || item.total) || (qty * price);
-      totalAmount += itemTotal;
+      const itemTotal = type === 'Local'
+        ? roundMoney(qty * price)
+        : (Number(item.totalPricePKR || item.total) || (qty * price));
+      subtotal = roundMoney(subtotal + itemTotal);
       return {
         productName: item.productName || item.description || 'Product Item',
         description: item.description || '',
@@ -129,9 +295,12 @@ exports.createSupplierPO = async (req, res) => {
       };
     });
 
-    if (totalAmount === 0 && (req.body.totalAmountPKR || req.body.totalAmount)) {
-      totalAmount = Number(req.body.totalAmountPKR || req.body.totalAmount);
+    if (subtotal === 0 && (req.body.subtotal || req.body.totalAmountPKR || req.body.totalAmount)) {
+      subtotal = roundMoney(req.body.subtotal || req.body.totalAmountPKR || req.body.totalAmount);
     }
+    const gstRate = type === 'Local' ? Math.max(0, Number(req.body.gstRate) || 0) : 0;
+    const gstAmount = type === 'Local' ? roundMoney(subtotal * gstRate / 100) : 0;
+    const totalAmount = type === 'Local' ? roundMoney(subtotal + gstAmount) : subtotal;
 
     // Check if linked SalesOrder has shortage and customer advance status
     let initialStatus = 'Issued';
@@ -147,7 +316,7 @@ exports.createSupplierPO = async (req, res) => {
       }
     }
 
-    const po = await SupplierPO.create({
+    const poData = {
       poNumber,
       supplier: supplier ? supplier._id : null,
       supplierName: finalSupplierName,
@@ -159,6 +328,10 @@ exports.createSupplierPO = async (req, res) => {
       salesOrderNumber: linkedOrder ? (linkedOrder.orderNumber || linkedOrder.orderReference) : '',
       poType: type,
       items: formattedItems,
+      subtotal,
+      gstRate,
+      gstAmount,
+      total: totalAmount,
       totalAmount,
       currency: 'PKR',
       status: initialStatus,
@@ -169,9 +342,64 @@ exports.createSupplierPO = async (req, res) => {
       paymentTerms: req.body.paymentTerms || '',
       createdBy: req.user._id,
       createdByName: req.user.fullName
-    });
+    };
 
-    if (linkedOrder) {
+    let po = null;
+    if (type === 'Local') {
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const poId = new mongoose.Types.ObjectId();
+          if (linkedOrder) {
+            linkedOrder = await claimLocalSupplierPOOrder({
+              salesOrderId: linkedOrder._id,
+              supplierPOId: poId,
+              poNumber,
+              session
+            });
+          }
+          po = (await SupplierPO.create([{ _id: poId, ...poData }], { session }))[0];
+          await ensureLocalPayableForSupplierPO({ po, linkedOrder, user: req.user, session });
+
+          if (linkedOrder) {
+            linkedOrder.supplierPO = {
+              poNumber,
+              poType: 'Local',
+              supplierName: finalSupplierName,
+              supplierCountry: finalSupplierCountry,
+              supplierEmail: supplier?.email || '',
+              supplierPhone: supplier?.phone || '',
+              issueDate: new Date(),
+              status: initialStatus,
+              items: formattedItems,
+              subtotal,
+              gstRate,
+              gstAmount,
+              total: totalAmount,
+              totalAmount,
+              currency: 'PKR',
+              notes: notes || remarks || '',
+              issuedBy: req.user._id,
+              issuedByName: req.user.fullName,
+              issuedAt: new Date()
+            };
+            linkedOrder.supplierPoNumber = poNumber;
+            linkedOrder.workflowStatus = 'Local Supplier PO Issued';
+            linkedOrder.lastAction = `Supplier PO ${poNumber} created for ${finalSupplierName}`;
+            linkedOrder.lastActionBy = req.user._id;
+            linkedOrder.lastActionByName = req.user.fullName;
+            linkedOrder.lastActionAt = new Date();
+            await linkedOrder.save({ session });
+          }
+        });
+      } finally {
+        await session.endSession();
+      }
+    } else {
+      po = await SupplierPO.create(poData);
+    }
+
+    if (linkedOrder && type !== 'Local') {
       linkedOrder.supplierPO = {
         poNumber,
         poType: type === 'Global' ? 'International' : 'Local',
@@ -182,6 +410,10 @@ exports.createSupplierPO = async (req, res) => {
         issueDate: new Date(),
         status: initialStatus,
         items: formattedItems,
+        subtotal,
+        gstRate,
+        gstAmount,
+        total: totalAmount,
         totalAmount,
         currency: 'PKR',
         notes: notes || remarks || '',
@@ -225,7 +457,7 @@ exports.createSupplierPO = async (req, res) => {
     return res.status(201).json({ success: true, message: `Purchase Order ${poNumber} issued successfully to ${finalSupplierName}.`, data: po, po });
   } catch (error) {
     console.error('Create Supplier PO Error:', error);
-    return res.status(500).json({ success: false, message: 'Server error issuing purchase order.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error issuing purchase order.' });
   }
 };
 
@@ -233,7 +465,7 @@ exports.createSupplierPO = async (req, res) => {
 exports.updateSupplierPO = async (req, res) => {
   try {
     const { id } = req.params;
-    const { supplierName, items, notes, expectedDeliveryDate, status, remarks } = req.body;
+    const { supplierName, items, notes, expectedDeliveryDate, status, remarks, gstRate } = req.body;
 
     const po = await SupplierPO.findById(id);
     if (!po) {
@@ -269,7 +501,10 @@ exports.updateSupplierPO = async (req, res) => {
     }
 
     const changes = [];
-    if (supplierName && supplierName !== po.supplierName) {
+    if (po.poType === 'Local' && supplierName && supplierName !== po.supplierName) {
+      return res.status(400).json({ success: false, message: 'The supplier is locked after a Local Supplier PO is issued.' });
+    }
+    if (po.poType !== 'Local' && supplierName && supplierName !== po.supplierName) {
       changes.push({ field: 'supplierName', oldValue: po.supplierName, newValue: supplierName });
       po.supplierName = supplierName;
     }
@@ -283,12 +518,12 @@ exports.updateSupplierPO = async (req, res) => {
     }
 
     if (items && items.length > 0) {
-      let totalAmount = 0;
+      let subtotal = 0;
       const formattedItems = items.map(item => {
         const qty = Number(item.quantity) || 1;
         const price = Number(item.unitPrice || item.unitPricePKR) || 0;
         const itemTotal = qty * price;
-        totalAmount += itemTotal;
+        subtotal = roundMoney(subtotal + itemTotal);
         return {
           productName: item.productName || item.description || 'Product Item',
           description: item.description || '',
@@ -298,12 +533,26 @@ exports.updateSupplierPO = async (req, res) => {
         };
       });
       changes.push({ field: 'items', oldValue: po.items.length, newValue: formattedItems.length });
+      const resolvedGstRate = po.poType === 'Local' ? Math.max(0, Number(gstRate !== undefined ? gstRate : po.gstRate) || 0) : 0;
+      const gstAmount = po.poType === 'Local' ? roundMoney(subtotal * resolvedGstRate / 100) : 0;
+      const totalAmount = po.poType === 'Local' ? roundMoney(subtotal + gstAmount) : subtotal;
       changes.push({ field: 'totalAmount', oldValue: po.totalAmount, newValue: totalAmount });
       po.items = formattedItems;
+      po.subtotal = subtotal;
+      po.gstRate = resolvedGstRate;
+      po.gstAmount = gstAmount;
+      po.total = totalAmount;
       po.totalAmount = totalAmount;
+
     }
 
     await po.save();
+    if (po.poType === 'Local' && items && items.length > 0) {
+      await LocalPayable.findOneAndUpdate(
+        { supplierPO: po._id },
+        { amount: po.totalAmount, subtotal: po.subtotal, gstRate: po.gstRate, gstAmount: po.gstAmount }
+      );
+    }
 
     // Log edit audit
     try {
@@ -357,8 +606,10 @@ exports.deleteSupplierPO = async (req, res) => {
 exports.getPurchaserGRNs = async (req, res) => {
   try {
     const { grnType, search } = req.query;
-    const filter = {};
-    if (grnType) filter.grnType = grnType;
+    const filter = { grnType: 'Supplier' };
+    if (grnType && grnType !== 'Supplier') {
+      return res.status(200).json({ success: true, count: 0, data: [], grns: [] });
+    }
     if (search) {
       filter.$or = [
         { grnNumber: { $regex: search, $options: 'i' } },
@@ -375,6 +626,11 @@ exports.getPurchaserGRNs = async (req, res) => {
 };
 
 exports.createPurchaserGRN = async (req, res) => {
+  return res.status(409).json({
+    success: false,
+    message: 'GRNs are generated automatically when Support records Inventory IN. Use the read-only GRN list to view them.'
+  });
+  /* istanbul ignore next -- retained temporarily for backward code reference */
   try {
     const { supplierPoId, supplierPOId, supplierPONumber, poNumber: inputPoNumber, items, remarks } = req.body;
     let targetPoId = supplierPoId || supplierPOId;
@@ -515,10 +771,13 @@ exports.getLocalPayables = async (req, res) => {
       filter.$or = [
         { payableNumber: { $regex: search, $options: 'i' } },
         { supplierName: { $regex: search, $options: 'i' } },
-        { chequeNumber: { $regex: search, $options: 'i' } }
+        { chequeNumber: { $regex: search, $options: 'i' } },
+        { poNumber: { $regex: search, $options: 'i' } },
+        { salesOrderNumber: { $regex: search, $options: 'i' } }
       ];
     }
-    const payables = await LocalPayable.find(filter).populate('supplier supplierPO grn').sort({ createdAt: -1 });
+    const records = await LocalPayable.find(filter).populate('supplier supplierPO grn grns').sort({ createdAt: -1 }).lean();
+    const payables = records.map(payable => ({ ...payable, ...getPayableBalances(payable) }));
     return res.status(200).json({ success: true, count: payables.length, data: payables, payables });
   } catch (error) {
     console.error('Get Local Payables Error:', error);
@@ -528,48 +787,50 @@ exports.getLocalPayables = async (req, res) => {
 
 exports.createLocalPayable = async (req, res) => {
   try {
-    const { supplierId, supplierName, supplierPoId, supplierPONumber, grnId, paymentMethod, amount, amountPKR, paymentDate, chequeNumber, bankName, chequeDate, pdcDate, remarks, salesOrderId } = req.body;
+    const { supplierPoId, supplierPONumber, grnId, paymentMethod, amount, amountPKR, paymentDate, chequeNumber, bankName, chequeDate, pdcDate, remarks, salesOrderId } = req.body;
     const finalAmount = Number(amount !== undefined && amount !== '' ? amount : amountPKR) || 0;
     if (!paymentMethod || finalAmount <= 0) {
       return res.status(400).json({ success: false, message: 'Payment method and valid amount are required.' });
     }
 
     const mongoose = require('mongoose');
-    let supplier = null;
-    if (supplierId && supplierId !== 'NEW' && mongoose.Types.ObjectId.isValid(supplierId)) {
-      supplier = await Supplier.findById(supplierId);
-    }
-    const resolvedName = (supplierName || req.body.supplier || (supplier ? supplier.name : '')).trim();
-    if (!supplier && resolvedName) {
-      supplier = await Supplier.findOne({ name: new RegExp('^' + resolvedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
-      if (!supplier) {
-        supplier = await Supplier.create({
-          name: resolvedName,
-          contactPerson: req.body.supplierContact || '',
-          phone: req.body.supplierPhone || '',
-          supplierType: 'Local'
-        });
-      }
-    }
-    const finalSupplierName = supplier ? supplier.name : (resolvedName || 'Local Supplier');
-    const finalSupplierId = supplier ? supplier._id : null;
-
     let poNumber = '';
     let targetPoId = supplierPoId;
+    let targetPo = null;
     let linkedOrder = null;
     if (targetPoId && mongoose.Types.ObjectId.isValid(targetPoId)) {
-      const po = await SupplierPO.findById(targetPoId);
-      if (po) poNumber = po.poNumber;
+      targetPo = await SupplierPO.findById(targetPoId);
+      if (targetPo) poNumber = targetPo.poNumber;
     }
     if (!poNumber && supplierPONumber) {
-      const po = await SupplierPO.findOne({ poNumber: supplierPONumber.trim() });
-      if (po) {
-        poNumber = po.poNumber;
-        targetPoId = po._id;
+      targetPo = await SupplierPO.findOne({ poNumber: supplierPONumber.trim() });
+      if (targetPo) {
+        poNumber = targetPo.poNumber;
+        targetPoId = targetPo._id;
       }
     }
+    if (!targetPo || targetPo.poType !== 'Local') {
+      return res.status(400).json({ success: false, message: 'Select a valid Local Supplier PO before creating a payable.' });
+    }
+    const finalSupplierName = targetPo.supplierName || 'Local Supplier';
+    const finalSupplierId = targetPo.supplier || null;
     if (salesOrderId) {
       linkedOrder = await SalesOrder.findById(salesOrderId);
+    } else if (targetPo?.salesOrderId) {
+      linkedOrder = await SalesOrder.findById(targetPo.salesOrderId);
+    }
+
+    const existingPayable = await findExistingLocalPayable({
+      supplierPOId: targetPoId,
+      poNumber: poNumber || supplierPONumber,
+      salesOrderId: linkedOrder?._id || salesOrderId
+    });
+    if (existingPayable) {
+      return res.status(409).json({
+        success: false,
+        message: `A Local Payable already exists for ${existingPayable.salesOrderNumber ? `Sales Order ${existingPayable.salesOrderNumber}` : `Supplier PO ${existingPayable.poNumber || supplierPONumber}`}.`,
+        data: existingPayable
+      });
     }
 
     // SERVER-SIDE FINANCIAL CONTROL: Customer Advance Check
@@ -592,6 +853,8 @@ exports.createLocalPayable = async (req, res) => {
     }
 
     const payableNumber = `LP-${Date.now().toString().slice(-6)}`;
+    const finalStatus = isBlocked ? 'Payment Blocked – Awaiting Customer Advance' : (paymentMethod === 'PDC' ? 'Pending' : 'Paid');
+    const totalAmountCents = toCents(finalAmount);
     const payable = await LocalPayable.create({
       payableNumber,
       supplier: finalSupplierId,
@@ -602,13 +865,17 @@ exports.createLocalPayable = async (req, res) => {
       salesOrderNumber: linkedOrder ? (linkedOrder.orderNumber || linkedOrder.orderReference) : '',
       grn: grnId || null,
       paymentMethod,
+      paymentTerms: req.body.paymentTerms || targetPo?.paymentTerms || '',
       amount: finalAmount,
+      totalAmountCents,
+      paidAmountCents: finalStatus === 'Paid' ? totalAmountCents : 0,
+      outstandingAmountCents: finalStatus === 'Paid' ? 0 : totalAmountCents,
       paymentDate: paymentDate || Date.now(),
       chequeNumber: chequeNumber || '',
       bankName: bankName || '',
       chequeDate: chequeDate || null,
       pdcDate: pdcDate || null,
-      status: isBlocked ? 'Payment Blocked – Awaiting Customer Advance' : (paymentMethod === 'PDC' ? 'Pending' : 'Paid'),
+      status: finalStatus,
       isBlockedByAdvance: isBlocked,
       remarks: isBlocked ? `[BLOCKED] ${blockReason} | ${remarks || ''}` : (remarks || ''),
       createdBy: req.user._id,
@@ -646,6 +913,109 @@ exports.createLocalPayable = async (req, res) => {
   } catch (error) {
     console.error('Create Local Payable Error:', error);
     return res.status(500).json({ success: false, message: 'Server error creating local payable.' });
+  }
+};
+
+exports.recordLocalPayablePayment = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const paymentId = String(req.body.paymentId || '').trim();
+    const amountCents = Number(req.body.amountCents ?? req.body.amount);
+    const method = String(req.body.method || '').trim();
+    const reference = String(req.body.reference || '').trim();
+    const note = String(req.body.note || '').trim();
+    const paymentDate = req.body.date ? new Date(req.body.date) : new Date();
+
+    if (!paymentId) return res.status(400).json({ success: false, message: 'paymentId is required.' });
+    if (!Number.isSafeInteger(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ success: false, message: 'Payment amount must be a positive integer number of cents.' });
+    }
+    if (!method || !reference) {
+      return res.status(400).json({ success: false, message: 'Payment method and reference are required.' });
+    }
+    if (Number.isNaN(paymentDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'Payment date is invalid.' });
+    }
+
+    let savedPayable = null;
+    await session.withTransaction(async () => {
+      const payable = await LocalPayable.findById(req.params.id).session(session);
+      if (!payable) {
+        const error = new Error('Local Payable not found.');
+        error.statusCode = 404;
+        throw error;
+      }
+      if ((payable.payments || []).some(payment => payment.paymentId === paymentId)) {
+        const error = new Error('This paymentId has already been recorded for the payable.');
+        error.statusCode = 409;
+        throw error;
+      }
+      if (payable.isBlockedByAdvance || payable.status === 'Payment Blocked – Awaiting Customer Advance') {
+        const error = new Error('This payable is blocked until the required customer advance is received.');
+        error.statusCode = 409;
+        throw error;
+      }
+
+      const balances = getPayableBalances(payable);
+      if (amountCents > balances.outstandingAmountCents) {
+        const error = new Error(`Payment exceeds the outstanding amount of ${(balances.outstandingAmountCents / 100).toFixed(2)}.`);
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const paidAmountCents = balances.paidAmountCents + amountCents;
+      const outstandingAmountCents = balances.totalAmountCents - paidAmountCents;
+      const previousStatus = payable.status;
+      payable.totalAmountCents = balances.totalAmountCents;
+      payable.paidAmountCents = paidAmountCents;
+      payable.outstandingAmountCents = outstandingAmountCents;
+      payable.status = outstandingAmountCents === 0 ? 'Paid' : 'Partially Paid';
+      payable.paymentMethod = method;
+      payable.paymentDate = paymentDate;
+      payable.payments.push({
+        paymentId,
+        amountCents,
+        date: paymentDate,
+        method,
+        reference,
+        note,
+        recordedBy: req.user._id,
+        recordedByName: req.user.fullName || '',
+        recordedAt: new Date()
+      });
+      await payable.save({ session });
+
+      const EditAuditLog = require('../models/EditAuditLog');
+      await EditAuditLog.create([{
+        documentType: 'LocalPayable',
+        documentId: String(payable._id),
+        documentNumber: payable.payableNumber,
+        editedByUserId: req.user._id,
+        editedByName: req.user.fullName || req.user.name || req.user.email || 'User',
+        editedByRole: req.user.role || '',
+        editedByDepartment: req.user.department || '',
+        permissionType: 'DIRECT_EDIT',
+        changes: [
+          { field: 'paidAmountCents', oldValue: balances.paidAmountCents, newValue: paidAmountCents },
+          { field: 'outstandingAmountCents', oldValue: balances.outstandingAmountCents, newValue: outstandingAmountCents },
+          { field: 'status', oldValue: previousStatus, newValue: payable.status }
+        ],
+        reason: `Supplier payment ${paymentId} recorded with reference ${reference}.`
+      }], { session });
+      savedPayable = payable;
+    });
+
+    const responsePayable = { ...savedPayable.toObject(), ...getPayableBalances(savedPayable) };
+    return res.status(200).json({
+      success: true,
+      message: `Payment ${(amountCents / 100).toFixed(2)} recorded successfully.`,
+      data: responsePayable
+    });
+  } catch (error) {
+    console.error('Record Local Payable Payment Error:', error);
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error recording payable payment.' });
+  } finally {
+    await session.endSession();
   }
 };
 
@@ -850,59 +1220,72 @@ exports.performInventoryCheck = async (req, res) => {
     }
 
     const InventoryItem = require('../models/InventoryItem');
-    const [products, inventoryItems] = await Promise.all([
-      ProductFile.find().lean(),
-      InventoryItem.find().lean()
-    ]);
+    const inventoryItems = await InventoryItem.find().lean();
     let totalOrdered = 0;
     let totalAvailable = 0;
     let totalStockValue = 0;
     let shortageFound = false;
 
-    const itemAnalysis = (order.items || []).map(item => {
-      const targetName = (item.description || item.productName || '').trim().toLowerCase();
-      const targetCode = (item.productCode || item.sku || '').trim().toLowerCase();
+    const orderItems = order.items && order.items.length
+      ? order.items
+      : (order.productSummary ? [{ description: order.productSummary, quantity: 1, quantityAssumed: true }] : []);
 
-      // Check InventoryItem first
-      const invMatch = inventoryItems.find(inv =>
-        (inv.name || '').trim().toLowerCase() === targetName ||
-        (inv.sku && inv.sku.trim().toLowerCase() === targetCode)
-      );
+    const receivedInventoryByOrderItem = new Map();
+    (order.inventoryReceipts || []).forEach(receipt => {
+      (receipt.items || []).forEach(item => {
+        if (item.orderItemId && item.inventoryItem) {
+          receivedInventoryByOrderItem.set(String(item.orderItemId), String(item.inventoryItem));
+        }
+      });
+    });
 
-      // Check ProductFile next
-      const prodMatch = products.find(p =>
-        (p.productName || p.name || '').trim().toLowerCase() === targetName ||
-        (p.productCode || p.sku || '').trim().toLowerCase() === targetCode
-      );
+    const itemAnalysis = orderItems.map(item => {
+      const inventoryMatches = getInventoryMatches(item, inventoryItems);
+      const receivedInventoryId = receivedInventoryByOrderItem.get(String(item._id));
+      const invMatch = receivedInventoryId
+        ? inventoryItems.find(inventoryItem => String(inventoryItem._id) === receivedInventoryId)
+        : (inventoryMatches.length === 1 ? inventoryMatches[0] : null);
 
       const reqQty = Number(item.quantity) || 1;
       let availQty = 0;
       if (invMatch) {
         availQty = Math.max(0, (Number(invMatch.quantityOnHand) || 0) - (Number(invMatch.reservedQuantity) || 0));
-      } else if (prodMatch) {
-        availQty = Number(prodMatch.quantity) || Number(prodMatch.availableStock) || 0;
       }
 
-      const unitPrice = Number(item.unitPrice) || Number(invMatch?.unitPrice) || Number(prodMatch?.unitPrice) || 0;
+      const unitPrice = Number(item.unitPrice) || Number(invMatch?.unitPrice) || 0;
       const itemTotalPrice = Number(item.total) || (reqQty * unitPrice);
-      const itemStatus = availQty >= reqQty ? 'In Stock' : 'Shortage';
-      if (itemStatus === 'Shortage') shortageFound = true;
+      const shortageQuantity = Math.max(0, reqQty - availQty);
+      const itemStatus = !invMatch
+        ? 'Not in inventory'
+        : (shortageQuantity > 0 ? `Partly available (shortage ${shortageQuantity})` : 'Available');
+      if (itemStatus !== 'Available') shortageFound = true;
 
       totalOrdered += reqQty;
       totalAvailable += Math.min(availQty, reqQty);
       totalStockValue += Math.min(availQty, reqQty) * unitPrice;
 
       return {
-        productId: invMatch?._id || prodMatch?._id || '',
+        productId: invMatch?._id || '',
         productName: item.description || item.productName || 'Product Item',
         requiredQuantity: reqQty,
+        quantityAssumed: item.quantityAssumed === true,
         availableQuantity: availQty,
-        shortageQuantity: Math.max(0, reqQty - availQty),
+        shortageQuantity,
         unitPrice,
         totalPrice: itemTotalPrice,
-        status: itemStatus
+        status: itemStatus,
+        matchedInventoryItem: invMatch ? {
+          _id: invMatch._id,
+          name: invMatch.name || '',
+          sku: invMatch.sku || '',
+          category: invMatch.category || '',
+          location: invMatch.location || ''
+        } : null,
+        matchNote: !receivedInventoryId && inventoryMatches.length > 1 ? 'Multiple exact inventory matches found; resolve the duplicate before dispatch.' : ''
       };
     });
+
+    if (itemAnalysis.length === 0) shortageFound = true;
 
     order.inventoryCheckStatus = shortageFound ? 'Shortage' : 'In Stock';
     order.inventoryAnalysis = itemAnalysis.map(it => ({
@@ -913,7 +1296,29 @@ exports.performInventoryCheck = async (req, res) => {
       shortageQty: it.shortageQuantity,
       status: it.status
     }));
-    order.lastAction = `Inventory Check Completed — ${shortageFound ? 'Shortage Detected' : 'All Goods Present in Stock'}`;
+    const moveToSupport = Boolean(req.body?.moveToSupport || req.body?.isFullyInStock);
+    if (moveToSupport && !shortageFound) {
+      const totalQty = orderItems.reduce((sum, item) => sum + (Number(item.quantity) || 1), 0);
+      order.workflowStatus = 'Goods Received in Office';
+      order.status = 'Goods Received in Office';
+      order.departmentResponsible = 'Support';
+      order.currentDepartment = 'Support';
+      order.previousDepartment = 'Local Purchaser';
+      order.previousStatus = 'Pending Local Procurement';
+      order.goodsReceivedInOffice = {
+        received: true,
+        receivedQuantity: totalQty,
+        orderedQuantity: totalQty,
+        receivedAt: new Date(),
+        receivedBy: req.user._id,
+        receivedByName: req.user.fullName,
+        remarks: 'Existing warehouse stock verified by Local Purchaser and routed to Support.'
+      };
+      order.inventoryFulfilledFromExistingStock = true;
+    }
+    order.lastAction = moveToSupport && !shortageFound
+      ? 'Inventory Available — Moved to Support'
+      : `Inventory Check Completed — ${shortageFound ? 'Shortage Detected' : 'All Goods Present in Stock'}`;
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
     order.lastActionAt = new Date();
@@ -922,9 +1327,11 @@ exports.performInventoryCheck = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: shortageFound
-        ? 'Inventory check completed. Stock shortage detected — Local Supplier PO required.'
-        : 'Inventory check completed. All goods are present and available in warehouse inventory!',
+      message: moveToSupport && !shortageFound
+        ? 'Inventory is available. The order was moved to Support.'
+        : shortageFound
+          ? 'Inventory check completed. Stock shortage detected — Local Supplier PO required.'
+          : 'Inventory check completed. All goods are present and available in warehouse inventory!',
       data: {
         order,
         itemAnalysis,
@@ -944,20 +1351,25 @@ exports.performInventoryCheck = async (req, res) => {
 exports.completeProcurementAndSendToSupport = async (req, res) => {
   try {
     const { id } = req.params;
-    const order = await SalesOrder.findById(id);
+    let order = await SalesOrder.findById(id);
     if (!order) {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
 
-    const { supplierName, poNumber, paymentTerms, remarks, items, totalAmountPKR } = req.body;
-    const finalSupplierName = (supplierName || '').trim();
-    const finalPoNumber = (poNumber || '').trim();
-    if (!finalSupplierName || !finalPoNumber) {
+    const { supplierId, paymentTerms, remarks, items, totalAmountPKR, gstRate } = req.body;
+    if (!supplierId || !mongoose.Types.ObjectId.isValid(supplierId)) {
       return res.status(400).json({
         success: false,
-        message: 'Supplier name and Local PO number are required before completing procurement.'
+        message: 'Select a valid Local supplier before completing procurement.'
       });
     }
+
+    const supplier = await Supplier.findById(supplierId);
+    if (!supplier || supplier.supplierType !== 'Local') {
+      return res.status(400).json({ success: false, message: 'The selected Local supplier was not found.' });
+    }
+    const finalSupplierName = supplier.name;
+    const finalPoNumber = `LPO-${Date.now().toString().slice(-6)}`;
 
     const existingPO = await SupplierPO.findOne({ poNumber: finalPoNumber });
     if (existingPO) {
@@ -971,8 +1383,8 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
     const poItems = ((Array.isArray(items) && items.length > 0) ? items : (order.items || [])).map(item => {
       const quantity = Number(item.quantity) || 1;
       const unitPrice = Number(item.unitPricePKR ?? item.unitPrice) || 0;
-      const totalAmount = Number(item.totalPricePKR ?? item.total) || (quantity * unitPrice);
-      calculatedTotal += totalAmount;
+      const totalAmount = roundMoney(quantity * unitPrice);
+      calculatedTotal = roundMoney(calculatedTotal + totalAmount);
       return {
         productName: item.productName || item.description || 'Product Item',
         description: item.description || '',
@@ -981,17 +1393,40 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
         totalAmount
       };
     });
-    const poTotal = Number(totalAmountPKR ?? req.body.totalAmount) || calculatedTotal || Number(order.netAmount || order.totalAmount) || 0;
+    const poSubtotal = roundMoney(Number(req.body.subtotal ?? totalAmountPKR ?? req.body.totalAmount) || calculatedTotal || Number(order.netAmount || order.totalAmount) || 0);
+    const resolvedGstRate = Math.max(0, Number(gstRate) || 0);
+    const gstAmount = roundMoney(poSubtotal * resolvedGstRate / 100);
+    const poTotal = roundMoney(poSubtotal + gstAmount);
     const issuedAt = new Date();
 
-    await SupplierPO.create({
+    const session = await mongoose.startSession();
+    let supplierPO = null;
+    try {
+      await session.withTransaction(async () => {
+        const supplierPOId = new mongoose.Types.ObjectId();
+        order = await claimLocalSupplierPOOrder({
+          salesOrderId: order._id,
+          supplierPOId,
+          poNumber: finalPoNumber,
+          session
+        });
+        supplierPO = (await SupplierPO.create([{
+      _id: supplierPOId,
       poNumber: finalPoNumber,
+      supplier: supplier._id,
       supplierName: finalSupplierName,
-      supplierCountry: 'Pakistan',
+      supplierCountry: supplier.country || 'Pakistan',
+      supplierContact: supplier.contactPerson || supplier.phone || '',
+      supplierEmail: supplier.email || '',
+      supplierPhone: supplier.phone || '',
       poType: 'Local',
       poDate: issuedAt,
       paymentTerms: paymentTerms || '',
       items: poItems,
+      subtotal: poSubtotal,
+      gstRate: resolvedGstRate,
+      gstAmount,
+      total: poTotal,
       totalAmount: poTotal,
       salesOrderId: order._id,
       salesOrderNumber: order.orderNumber || order.orderReference || '',
@@ -1000,13 +1435,15 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       notes: remarks || '',
       createdBy: req.user._id,
       createdByName: req.user.fullName
-    });
+    }], { session }))[0];
 
     order.supplierPO = {
       poNumber: finalPoNumber,
       poType: 'Local',
       supplierName: finalSupplierName,
-      supplierCountry: 'Pakistan',
+      supplierCountry: supplier.country || 'Pakistan',
+      supplierEmail: supplier.email || '',
+      supplierPhone: supplier.phone || '',
       issueDate: issuedAt,
       status: 'Issued',
       items: poItems.map(item => ({
@@ -1015,6 +1452,10 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
         unitPrice: item.unitPrice,
         total: item.totalAmount
       })),
+      subtotal: poSubtotal,
+      gstRate: resolvedGstRate,
+      gstAmount,
+      total: poTotal,
       totalAmount: poTotal,
       currency: 'PKR',
       notes: remarks || '',
@@ -1022,6 +1463,8 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       issuedByName: req.user.fullName,
       issuedAt
     };
+    order.supplierPoId = supplierPO._id;
+    order.supplierPoNumber = finalPoNumber;
 
     const totalQty = (order.items || []).reduce((s, i) => s + (Number(i.quantity) || 1), 0);
 
@@ -1057,7 +1500,13 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       notes: `Local Supplier PO ${finalPoNumber} was issued to ${finalSupplierName}. Goods for Sales Order ${order.orderNumber || order.orderReference} were brought to the office and moved to Support for Inventory IN and Delivery Note (DN) creation.`
     });
 
-    await order.save();
+    await order.save({ session });
+
+    await ensureLocalPayableForSupplierPO({ po: supplierPO, linkedOrder: order, user: req.user, session });
+      });
+    } finally {
+      await session.endSession();
+    }
 
     await notifyRoleHelper(['support', 'operations', 'admin', 'ceo'], {
       type: 'order',
@@ -1074,14 +1523,14 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
     });
   } catch (error) {
     console.error('Complete Procurement Error:', error);
-    return res.status(500).json({ success: false, message: 'Server error completing procurement and moving to support.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error completing procurement and moving to support.' });
   }
 };
 
 exports.globalProcurementSendToLogistics = async (req, res) => {
   try {
     const { id } = req.params;
-    const { supplierName, supplierCountry, portOfLoading, portOfDischarge, estimatedArrival, paymentTerms, items, remarks } = req.body;
+    const { supplierName, supplierCountry, paymentTerms, items, remarks } = req.body;
 
     const order = await SalesOrder.findById(id);
     if (!order) {
@@ -1131,8 +1580,6 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
         salesOrderId: order._id,
         salesOrderNumber: order.orderNumber || order.orderReference,
         notes: remarks || '',
-        portOfLoading: portOfLoading || '',
-        portOfDischarge: portOfDischarge || 'Karachi Port',
         paymentTerms: paymentTerms || '',
         createdBy: req.user._id,
         createdByName: req.user.fullName
@@ -1165,13 +1612,56 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
   }
 };
 
+const handoffGlobalOrderToLogistics = async (order, user) => {
+  const previousStatus = order.workflowStatus;
+  const effectivePoNumber = order.supplierPO?.poNumber || order.supplierPoNumber || `GPO-${Date.now().toString().slice(-6)}`;
+
+  order.previousStatus = previousStatus;
+  order.previousDepartment = 'Global Purchaser';
+  order.workflowStatus = 'In Logistics';
+  order.status = 'In Logistics';
+  order.departmentResponsible = 'Logistics';
+  order.currentDepartment = 'Logistics';
+  order.currentStatus = 'GLOBAL_PO_ISSUED_IN_LOGISTICS';
+  order.lastAction = 'Ready to Pick Up confirmed; order sent to Logistics';
+  order.lastActionBy = user._id;
+  order.lastActionByName = user.fullName;
+  order.lastActionAt = new Date();
+
+  await SupplierPO.updateMany(
+    { salesOrderId: order._id },
+    { $set: { status: 'In Logistics' } }
+  );
+  order.workflowHistory.push({
+    user: user._id,
+    userName: user.fullName,
+    department: 'Global Purchaser',
+    action: 'Ready to Pick Up - Sent to Logistics',
+    previousStatus,
+    newStatus: 'In Logistics',
+    timestamp: new Date(),
+    notes: `Global Supplier PO #${effectivePoNumber} handed to Logistics. Logistics will confirm Picked Up and enter shipment details.`
+  });
+  await order.save();
+
+  await notifyRoleHelper(['logistics', 'admin', 'ceo'], {
+    type: 'order',
+    title: 'Blue File Ready for Logistics Pick Up',
+    message: `Global Supplier PO #${effectivePoNumber} for Sales Order ${order.orderNumber || order.orderReference} is ready for Logistics.`,
+    link: '/logistics/shipments',
+    sender: user._id
+  });
+
+  return null;
+};
+
 /**
  * @desc Record the next ordered Global Purchasing checkpoint for a Blue file
  * @route POST /api/purchaser/orders/:id/global-checkpoint
  */
 exports.updateGlobalProcurementCheckpoint = async (req, res) => {
   try {
-    const checkpoints = ['In Manufacturing', 'Ready to Pick Up', 'Picked Up'];
+    const checkpoints = ['In Manufacturing', 'Ready to Pick Up'];
     const checkpoint = req.body.checkpoint;
     if (!checkpoints.includes(checkpoint)) {
       return res.status(400).json({ success: false, message: 'A valid Global Purchasing checkpoint is required.' });
@@ -1185,7 +1675,7 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Global Purchasing checkpoints apply only to Blue file orders.' });
     }
     if (order.currentDepartment !== 'Global Purchaser' || order.workflowStatus === 'In Logistics') {
-      return res.status(400).json({ success: false, message: 'This order is no longer in the Global Purchasing stage.' });
+      return res.status(409).json({ success: false, message: 'This order has already been sent to Logistics.' });
     }
     if (!order.supplierPO || !order.supplierPO.poNumber) {
       return res.status(400).json({ success: false, message: 'Create the Global Supplier PO before updating procurement checkpoints.' });
@@ -1195,6 +1685,16 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
     const currentIndex = checkpoints.indexOf(currentStatus);
     const requestedIndex = checkpoints.indexOf(checkpoint);
 
+    if (checkpoint === 'Ready to Pick Up') {
+      const existingShipment = await Shipment.findOne({ salesOrder: order._id }).select('shipmentId').lean();
+      if (existingShipment) {
+        return res.status(409).json({
+          success: false,
+          message: `Shipment ${existingShipment.shipmentId} already exists for this Sales Order.`
+        });
+      }
+    }
+
     if (requestedIndex <= currentIndex) {
       return res.status(200).json({ success: true, message: `${checkpoint} is already complete.`, data: order });
     }
@@ -1203,11 +1703,13 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
     }
 
     order.supplierPO.status = checkpoint;
-    order.workflowStatus = 'Pending Global Procurement';
-    order.status = 'Pending Global Procurement';
-    order.departmentResponsible = 'Global Purchaser';
-    order.currentDepartment = 'Global Purchaser';
-    order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
+    if (checkpoint !== 'Ready to Pick Up') {
+      order.workflowStatus = 'Pending Global Procurement';
+      order.status = 'Pending Global Procurement';
+      order.departmentResponsible = 'Global Purchaser';
+      order.currentDepartment = 'Global Purchaser';
+      order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
+    }
     order.lastAction = `Global procurement checkpoint completed: ${checkpoint}`;
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
@@ -1223,12 +1725,20 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
       notes: `Global Supplier PO #${order.supplierPO.poNumber}: ${checkpoint}.`
     });
 
-    await order.save();
+    if (checkpoint === 'Ready to Pick Up') {
+      await handoffGlobalOrderToLogistics(order, req.user);
+    } else {
+      await SupplierPO.updateMany(
+        { salesOrderId: order._id },
+        { $set: { status: checkpoint } }
+      );
+      await order.save();
+    }
 
     return res.status(200).json({
       success: true,
-      message: checkpoint === 'Picked Up'
-        ? 'Picked Up recorded. The order is ready for Logistics handoff.'
+      message: checkpoint === 'Ready to Pick Up'
+        ? 'Ready to Pick Up recorded. The order has been sent to Logistics.'
         : `${checkpoint} recorded. The order remains with Global Purchasing.`,
       data: order
     });
@@ -1245,33 +1755,14 @@ exports.updateGlobalProcurementCheckpoint = async (req, res) => {
 exports.sendGlobalOrderToLogistics = async (req, res) => {
   try {
     const { id } = req.params;
-    const {
-      carrier,
-      flightNumber,
-      trackingNumber,
-      shippingMethod,
-      portOfLoading,
-      portOfDischarge,
-      departureLocation,
-      destinationLocation,
-      etd,
-      eta,
-      supplierName,
-      supplierCountry,
-      supplierPoNumber,
-      notes,
-      remarks
-    } = req.body;
-
     let order = null;
+
     if (mongoose.Types.ObjectId.isValid(id)) {
       order = await SalesOrder.findById(id);
       if (!order) {
         const po = await SupplierPO.findById(id);
-        if (po) {
-          if (po.salesOrderId) order = await SalesOrder.findById(po.salesOrderId);
-          else if (po.salesOrderNumber) order = await SalesOrder.findOne({ orderNumber: po.salesOrderNumber });
-        }
+        if (po?.salesOrderId) order = await SalesOrder.findById(po.salesOrderId);
+        else if (po?.salesOrderNumber) order = await SalesOrder.findOne({ orderNumber: po.salesOrderNumber });
       }
     }
     if (!order && req.body.salesOrderId && mongoose.Types.ObjectId.isValid(req.body.salesOrderId)) {
@@ -1283,128 +1774,31 @@ exports.sendGlobalOrderToLogistics = async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'Associated Sales Order not found for moving to Logistics.' });
     }
+
     const alreadySentToLogistics =
       ['Logistics', 'Support', 'Accounts', 'Completed'].includes(order.currentDepartment) ||
-      ['In Logistics', 'Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'].includes(order.workflowStatus) ||
-      ['In Transit', 'In Logistics', 'Shipped', 'Partially Received', 'Fully Received', 'Completed'].includes(order.supplierPO?.status);
+      ['In Logistics', 'Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'].includes(order.workflowStatus);
     if (alreadySentToLogistics) {
       return res.status(409).json({
         success: false,
         message: 'This order has already been sent to Logistics.'
       });
     }
-    if (order.supplierPO?.status !== 'Picked Up') {
-      return res.status(400).json({ success: false, message: 'Complete the Picked Up checkpoint before moving this order to Logistics.' });
-    }
-
-    const effectivePoNumber = supplierPoNumber || order.supplierPO?.poNumber || order.supplierPoNumber || `GPO-${Date.now().toString().slice(-6)}`;
-    const effectiveSupplier = supplierName || order.supplierPO?.supplierName || 'Overseas Supplier';
-    const effectiveCountry = supplierCountry || order.supplierPO?.supplierCountry || 'China';
-
-    // Update order status & department
-    order.workflowStatus = 'In Logistics';
-    order.status = 'In Logistics';
-    order.departmentResponsible = 'Logistics';
-    order.currentDepartment = 'Logistics';
-    order.currentStatus = 'GLOBAL_PO_ISSUED_IN_LOGISTICS';
-    order.previousDepartment = 'Global Purchaser';
-    order.previousStatus = order.workflowStatus;
-    order.lastAction = `Order moved to Logistics (Carrier: ${carrier || 'Overseas Carrier'}, Track: ${trackingNumber || 'Pending'})`;
-    order.lastActionBy = req.user._id;
-    order.lastActionByName = req.user.fullName;
-    order.lastActionAt = new Date();
-
-    if (order.supplierPO) {
-      order.supplierPO.status = 'In Transit';
-      order.supplierPO.portOfLoading = portOfLoading || order.supplierPO.portOfLoading;
-      order.supplierPO.portOfDischarge = portOfDischarge || order.supplierPO.portOfDischarge;
-      order.supplierPO.carrier = carrier || '';
-      order.supplierPO.trackingNumber = trackingNumber || '';
-    }
-
-    // Also update SupplierPO document in database if exists
-    await SupplierPO.updateMany(
-      { salesOrderId: order._id },
-      {
-        $set: {
-          status: 'In Transit',
-          portOfLoading: portOfLoading || '',
-          portOfDischarge: portOfDischarge || 'Karachi Port',
-          carrier: carrier || '',
-          trackingNumber: trackingNumber || '',
-          flightNumber: flightNumber || ''
-        }
-      }
-    );
-
-    // Create or update Shipment in Logistics
-    let shipment = await Shipment.findOne({ salesOrder: order._id });
-    if (!shipment) {
-      shipment = new Shipment({
-        salesOrder: order._id,
-        salesOrderNumber: order.orderNumber || order.orderReference,
-        salesPerson: order.salesPerson || req.user._id,
-        salePerson: order.salePerson || req.user.fullName,
-        clientName: order.clientName,
-        clientEmail: order.clientEmail || '',
-        clientPhone: order.clientPhone || '',
-        supplierName: effectiveSupplier,
-        supplierCountry: effectiveCountry,
-        supplierPoNumber: effectivePoNumber,
-        supplierPoDate: order.supplierPO?.issueDate || new Date(),
-        fileType: 'Blue',
-        status: 'In Transit',
-        description: order.productSummary || 'Imported Goods Scope',
-        items: order.items || [],
-        carrier: carrier || '',
-        flightNumber: flightNumber || '',
-        trackingNumber: trackingNumber || '',
-        shippingMethod: shippingMethod || 'Air Freight',
-        departureLocation: portOfLoading || departureLocation || '',
-        destinationLocation: portOfDischarge || destinationLocation || 'Karachi Port',
-        etd: etd ? new Date(etd) : null,
-        eta: eta ? new Date(eta) : null,
-        notes: notes || remarks || '',
-        createdBy: req.user._id
+    const existingShipment = await Shipment.findOne({ salesOrder: order._id }).select('shipmentId').lean();
+    if (existingShipment) {
+      return res.status(409).json({
+        success: false,
+        message: `Shipment ${existingShipment.shipmentId} already exists for this Sales Order.`
       });
-    } else {
-      shipment.carrier = carrier || shipment.carrier;
-      shipment.flightNumber = flightNumber || shipment.flightNumber;
-      shipment.trackingNumber = trackingNumber || shipment.trackingNumber;
-      shipment.shippingMethod = shippingMethod || shipment.shippingMethod;
-      shipment.departureLocation = portOfLoading || departureLocation || shipment.departureLocation;
-      shipment.destinationLocation = portOfDischarge || destinationLocation || shipment.destinationLocation;
-      if (etd) shipment.etd = new Date(etd);
-      if (eta) shipment.eta = new Date(eta);
-      if (notes || remarks) shipment.notes = notes || remarks;
-      shipment.status = 'In Transit';
+    }
+    if (!['Ready to Pick Up', 'Picked Up'].includes(order.supplierPO?.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Complete the Ready to Pick Up checkpoint before moving this order to Logistics.'
+      });
     }
 
-    await shipment.save();
-    order.shipmentId = shipment._id;
-    order.shipmentNumber = shipment.shipmentId;
-
-    order.workflowHistory.push({
-      user: req.user._id,
-      userName: req.user.fullName,
-      department: 'Global Purchaser',
-      action: 'Moved to Logistics with Flight & Tracking Details',
-      previousStatus: 'Pending Global Procurement',
-      newStatus: 'In Logistics',
-      timestamp: new Date(),
-      notes: `Order moved to Logistics. Carrier: ${carrier || '—'}, Tracking: ${trackingNumber || '—'}, Flight/Vessel: ${flightNumber || '—'}.`
-    });
-
-    await order.save();
-
-    await notifyRoleHelper(['logistics', 'admin', 'ceo'], {
-      type: 'order',
-      title: 'New Blue File Shipment in Logistics',
-      message: `Global Supplier PO #${effectivePoNumber} for Sales Order ${order.orderNumber || order.orderReference} moved to Logistics with tracking details.`,
-      link: '/logistics/shipments',
-      sender: req.user._id
-    });
-
+    const shipment = await handoffGlobalOrderToLogistics(order, req.user);
     return res.status(200).json({
       success: true,
       message: `Sales Order ${order.orderNumber || order.orderReference} and Supplier PO successfully moved to Logistics Department!`,

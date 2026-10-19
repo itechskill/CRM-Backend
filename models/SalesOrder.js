@@ -95,12 +95,18 @@ const SalesOrderSchema = new mongoose.Schema(
         }
       ],
       totalAmount: { type: Number, default: 0 },
+      subtotal: { type: Number, default: 0 },
+      gstRate: { type: Number, default: 0 },
+      gstAmount: { type: Number, default: 0 },
+      total: { type: Number, default: 0 },
       currency: { type: String, default: 'PKR' },
       notes: { type: String, default: '' },
       issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
       issuedByName: { type: String, default: '' },
       issuedAt: { type: Date, default: null }
     },
+    supplierPoId: { type: mongoose.Schema.Types.ObjectId, ref: 'SupplierPO', default: null },
+    supplierPoNumber: { type: String, default: '' },
     goodsReceivedInOffice: {
       received: { type: Boolean, default: false },
       receivedAt: { type: Date, default: null },
@@ -110,6 +116,42 @@ const SalesOrderSchema = new mongoose.Schema(
       orderedQuantity: { type: Number, default: 0 },
       remarks: { type: String, default: '' }
     },
+    inventoryReceived: { type: Boolean, default: false },
+    inventoryFulfilledFromExistingStock: { type: Boolean, default: false },
+    inventoryGrnNumbers: [{ type: String, trim: true }],
+    inventoryReceipts: [
+      {
+        receiptId: { type: String, default: '' },
+        grnNumber: { type: String, default: '' },
+        receivedAt: { type: Date, default: Date.now },
+        receivedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+        receivedByName: { type: String, default: '' },
+        referenceType: { type: String, default: '' },
+        referenceNumber: { type: String, default: '' },
+        referenceDate: { type: Date, default: null },
+        supplierName: { type: String, default: '' },
+        carrier: { type: String, default: '' },
+        containerNo: { type: String, default: '' },
+        portOfLoading: { type: String, default: '' },
+        portOfDischarge: { type: String, default: '' },
+        remarks: { type: String, default: '' },
+        items: [
+          {
+            orderItemId: { type: String, default: '' },
+            productName: { type: String, default: '' },
+            sku: { type: String, default: '' },
+            orderedQty: { type: Number, default: 0 },
+            receivedQty: { type: Number, default: 0 },
+            inventoryItem: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
+            inventoryName: { type: String, default: '' },
+            inventorySku: { type: String, default: '' },
+            inventoryCategory: { type: String, default: '' },
+            inventoryLocation: { type: String, default: '' },
+            createdNew: { type: Boolean, default: false }
+          }
+        ]
+      }
+    ],
     blNumber: { type: String, default: '' },
     blInput: {
       blNumber: { type: String, default: '' },

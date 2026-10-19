@@ -40,19 +40,41 @@ const localPayableSchema = new mongoose.Schema(
       ref: 'PurchaserGRN',
       default: null
     },
+    grns: [{ type: mongoose.Schema.Types.ObjectId, ref: 'PurchaserGRN' }],
     paymentMethod: {
       type: String,
-      enum: ['Cash', 'Cheque', 'PDC'],
-      required: true
+      enum: ['', 'Cash', 'Cheque', 'PDC', 'Bank Transfer'],
+      default: ''
+    },
+    paymentTerms: {
+      type: String,
+      default: ''
     },
     amount: {
       type: Number,
       required: true,
       min: 0
     },
+    totalAmountCents: { type: Number, min: 0, default: undefined },
+    paidAmountCents: { type: Number, min: 0, default: undefined },
+    outstandingAmountCents: { type: Number, min: 0, default: undefined },
+    payments: [{
+      paymentId: { type: String, trim: true, default: '' },
+      amountCents: { type: Number, min: 1 },
+      date: { type: Date, default: Date.now },
+      method: { type: String, trim: true, default: '' },
+      reference: { type: String, trim: true, default: '' },
+      note: { type: String, default: '' },
+      recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      recordedByName: { type: String, default: '' },
+      recordedAt: { type: Date, default: Date.now }
+    }],
+    subtotal: { type: Number, default: 0, min: 0 },
+    gstRate: { type: Number, default: 0, min: 0 },
+    gstAmount: { type: Number, default: 0, min: 0 },
     paymentDate: {
       type: Date,
-      default: Date.now
+      default: null
     },
     // Cheque & PDC specific fields
     chequeNumber: {
@@ -73,7 +95,7 @@ const localPayableSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['Pending', 'Payment Blocked – Awaiting Customer Advance', 'Advance Partially Received', 'Payment Eligible', 'Paid', 'Cleared', 'Cancelled'],
+      enum: ['Pending', 'Partially Paid', 'Payment Blocked – Awaiting Customer Advance', 'Advance Partially Received', 'Payment Eligible', 'Paid', 'Cleared', 'Cancelled'],
       default: 'Paid'
     },
     isBlockedByAdvance: {
