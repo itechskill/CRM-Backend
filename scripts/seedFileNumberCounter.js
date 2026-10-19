@@ -1,5 +1,7 @@
+
 const mongoose = require('mongoose');
 require('dotenv').config();
+
 const Counter = require('../models/Counter');
 const { getCounterKey } = require('../utils/counterKey');
 
@@ -12,23 +14,51 @@ const run = async () => {
   if (!Number.isInteger(nextNumber) || nextNumber < 1) {
     throw new Error('Next file number must be a positive integer.');
   }
+
   if (!process.env.MONGODB_URI) {
     throw new Error('MONGODB_URI is not configured.');
   }
 
-  await mongoose.connect(process.env.MONGODB_URI);
+  // Explicitly connect to the Fortline CRM database.
+  await mongoose.connect(process.env.MONGODB_URI, {
+    dbName: 'fortlinecrm'
+  });
+
+  if (mongoose.connection.name !== 'fortlinecrm') {
+    throw new Error('STOP: Connected to the wrong database.');
+  }
+
   const counterKey = getCounterKey('file-number');
+
+  // Production must use the plain, unprefixed counter key.
+  if (counterKey !== 'file-number') {
+    throw new Error(
+      `STOP: Unexpected counter namespace. Expected file-number.`
+    );
+  }
+
   const existing = await Counter.findById(counterKey);
+
   if (existing && !force) {
-    throw new Error('The file-number counter already exists. Re-run with --force only after confirming the intended reset value.');
+    throw new Error(
+      'The file-number counter already exists. No changes made.'
+    );
   }
 
   await Counter.findOneAndUpdate(
     { _id: counterKey },
     { $set: { sequence: nextNumber - 1 } },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true
+    }
   );
-  console.log(`File-number counter initialized for ${counterKey}. The next assigned number will be ${nextNumber}.`);
+
+  console.log(
+    `File-number counter initialized for ${counterKey}. ` +
+    `The next assigned number will be ${nextNumber}.`
+  );
 };
 
 run()
@@ -37,7 +67,10 @@ run()
     process.exit(0);
   })
   .catch(async (error) => {
-    console.error(`File-number counter was not changed: ${error.message}`);
+    console.error(
+      `File-number counter was not changed: ${error.message}`
+    );
+
     await mongoose.disconnect().catch(() => {});
     process.exit(1);
   });
