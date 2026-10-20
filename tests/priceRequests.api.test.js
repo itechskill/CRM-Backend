@@ -34,6 +34,7 @@ process.env.MONGODB_URI = useDatabase(sourceMongoUri, tempDbName);
 const connectDB = require('../config/db');
 const User = require('../models/User');
 const PriceRequest = require('../models/PriceRequest');
+const Counter = require('../models/Counter');
 const app = require('../server');
 
 const createdIds = [];
@@ -83,6 +84,7 @@ const createDemoRequest = async (suffix, requestedFrom = users.purchaser) => {
       requestedFrom: requestedFrom._id,
       category: 'Networking',
       brand: 'Cisco',
+      leadSource: 'WhatsApp',
       requirement: `DEMO ${suffix} ${runId}`,
       quantity: 2,
       reference: `DEMO-${runId}`
@@ -98,6 +100,8 @@ before(async () => {
   assert.equal(mongoose.connection.name, tempDbName, 'Refusing to run outside the generated temporary database.');
   assert.ok(mongoose.connection.name.startsWith(TEMP_DB_PREFIX), 'Temporary database prefix is required.');
   assert.notEqual(mongoose.connection.name, 'test', 'The shared test database must never be used.');
+
+  await Counter.create({ _id: `${process.env.COUNTER_NAMESPACE}:file-number`, sequence: 1000 });
 
   const password = `DEMO-${runId}-password`;
   const [sales, purchaser, salesManager, finance] = await User.create([
@@ -146,6 +150,71 @@ test('create then price requires the assigned user and stores integer cents', as
   assert.equal(priced.data.data.status, 'Priced');
   assert.equal(priced.data.data.unitPriceCents, 123456);
   assert.equal(priced.data.data.currency, 'USD');
+});
+
+test('create validates and stores the lead source', async () => {
+  const basePayload = {
+    requestedFrom: users.purchaser._id,
+    category: 'Networking',
+    brand: 'Cisco',
+    requirement: `DEMO lead source ${runId}`,
+    quantity: 1
+  };
+
+  const missing = await request(users.sales, '/api/price-requests', {
+    method: 'POST',
+    body: JSON.stringify(basePayload)
+  });
+  assert.equal(missing.response.status, 400);
+  assert.equal(missing.data.message, 'Select a valid lead source.');
+
+  const invalid = await request(users.sales, '/api/price-requests', {
+    method: 'POST',
+    body: JSON.stringify({ ...basePayload, leadSource: 'Website' })
+  });
+  assert.equal(invalid.response.status, 400);
+  assert.equal(invalid.data.message, 'Select a valid lead source.');
+
+  const created = await request(users.sales, '/api/price-requests', {
+    method: 'POST',
+    body: JSON.stringify({ ...basePayload, leadSource: 'Other', leadSourceNote: 'Trade show referral' })
+  });
+  assert.equal(created.response.status, 201, JSON.stringify(created.data));
+  assert.equal(created.data.data.leadSource, 'Other');
+  assert.equal(created.data.data.leadSourceNote, 'Trade show referral');
+  createdIds.push(created.data.data._id);
+});
+
+test('new quotations require and snapshot a valid issuing company', async () => {
+  const quotePayload = {
+    clientName: `DEMO quotation client ${runId}`,
+    fileType: 'Green',
+    productSummary: 'Temporary test product',
+    items: [{ description: 'Temporary test product', quantity: 1, unitPrice: 100, total: 100 }],
+    totalAmount: 100,
+    netAmount: 100
+  };
+
+  const missing = await request(users.sales, '/api/sales-employee/quotations', {
+    method: 'POST',
+    body: JSON.stringify(quotePayload)
+  });
+  assert.equal(missing.response.status, 400);
+  assert.equal(missing.data.message, 'Select a valid issuing company.');
+
+  const invalid = await request(users.sales, '/api/sales-employee/quotations', {
+    method: 'POST',
+    body: JSON.stringify({ ...quotePayload, issuingCompanyCode: 'NOT_A_COMPANY' })
+  });
+  assert.equal(invalid.response.status, 400);
+
+  const created = await request(users.sales, '/api/sales-employee/quotations', {
+    method: 'POST',
+    body: JSON.stringify({ ...quotePayload, issuingCompanyCode: 'FORTLINE_ENTERPRISES' })
+  });
+  assert.equal(created.response.status, 201, JSON.stringify(created.data));
+  assert.equal(created.data.data.issuingCompany.code, 'FORTLINE_ENTERPRISES');
+  assert.equal(created.data.data.issuingCompany.legalName, 'Fortline Enterprises');
 });
 
 test('decline requires a reason', async () => {

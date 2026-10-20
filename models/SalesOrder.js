@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const companySnapshotDefinition = require('./schemas/companySnapshot');
 
 const SalesOrderSchema = new mongoose.Schema(
   {
@@ -29,6 +30,7 @@ const SalesOrderSchema = new mongoose.Schema(
     orderDate: { type: Date, default: Date.now },
     deliveryDate: { type: Date, default: null },
     notes: { type: String, default: '' },
+    issuingCompany: companySnapshotDefinition(),
     // Stock workflow
     stockStatus: {
       type: String,
@@ -101,6 +103,7 @@ const SalesOrderSchema = new mongoose.Schema(
       total: { type: Number, default: 0 },
       currency: { type: String, default: 'PKR' },
       notes: { type: String, default: '' },
+      issuingCompany: companySnapshotDefinition(),
       issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
       issuedByName: { type: String, default: '' },
       issuedAt: { type: Date, default: null }
