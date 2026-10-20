@@ -11,6 +11,7 @@ const Invoice = require('../models/Invoice');
 const Shipment = require('../models/Shipment');
 const logAudit = require('../utils/auditLogger');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
+const { resolvePOCompany } = require('../config/companies');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -242,6 +243,14 @@ exports.createSupplierPO = async (req, res) => {
     const { supplierId, supplierName, supplierCountry, supplierContact, poType, subType, items, notes, remarks, expectedDeliveryDate, salesOrderId } = req.body;
 
     const type = poType || subType || (req.user.purchaserSubDept === 'Global' ? 'Global' : 'Local');
+    let linkedOrder = salesOrderId && mongoose.Types.ObjectId.isValid(salesOrderId)
+      ? await SalesOrder.findById(salesOrderId)
+      : null;
+    const issuingCompany = resolvePOCompany({
+      poType: type,
+      requestedCompanyCode: req.body.issuingCompanyCode,
+      order: linkedOrder
+    });
     const prefix = type === 'Global' ? 'GPO' : 'LPO';
     const poNumber = type === 'Local'
       ? `${prefix}-${Date.now().toString().slice(-6)}`
@@ -249,7 +258,6 @@ exports.createSupplierPO = async (req, res) => {
 
     // Resolve or auto-create supplier
     let supplier = null;
-    const mongoose = require('mongoose');
     if (supplierId && supplierId !== 'NEW' && mongoose.Types.ObjectId.isValid(supplierId)) {
       supplier = await Supplier.findById(supplierId);
     }
@@ -304,9 +312,7 @@ exports.createSupplierPO = async (req, res) => {
 
     // Check if linked SalesOrder has shortage and customer advance status
     let initialStatus = 'Issued';
-    let linkedOrder = null;
-    if (salesOrderId) {
-      linkedOrder = await SalesOrder.findById(salesOrderId);
+    if (linkedOrder) {
       if (linkedOrder && (linkedOrder.advanceRequired || linkedOrder.advanceRequiredAmount > 0)) {
         const rec = linkedOrder.advanceReceived ? (linkedOrder.netAmount || 1) : (linkedOrder.advanceReceivedAmount || 0);
         const reqAdv = linkedOrder.advanceRequiredAmount || 1;
@@ -336,6 +342,7 @@ exports.createSupplierPO = async (req, res) => {
       currency: 'PKR',
       status: initialStatus,
       notes: notes || remarks || '',
+      issuingCompany,
       expectedDeliveryDate: expectedDeliveryDate || null,
       portOfLoading: req.body.portOfLoading || '',
       portOfDischarge: req.body.portOfDischarge || 'Karachi Port',
@@ -379,6 +386,7 @@ exports.createSupplierPO = async (req, res) => {
               totalAmount,
               currency: 'PKR',
               notes: notes || remarks || '',
+              issuingCompany,
               issuedBy: req.user._id,
               issuedByName: req.user.fullName,
               issuedAt: new Date()
@@ -417,6 +425,7 @@ exports.createSupplierPO = async (req, res) => {
         totalAmount,
         currency: 'PKR',
         notes: notes || remarks || '',
+        issuingCompany,
         issuedBy: req.user._id,
         issuedByName: req.user.fullName,
         issuedAt: new Date()
@@ -1356,6 +1365,11 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
 
+    const issuingCompany = resolvePOCompany({
+      poType: 'Local',
+      requestedCompanyCode: req.body.issuingCompanyCode,
+      order
+    });
     const { supplierId, paymentTerms, remarks, items, totalAmountPKR, gstRate } = req.body;
     if (!supplierId || !mongoose.Types.ObjectId.isValid(supplierId)) {
       return res.status(400).json({
@@ -1433,6 +1447,7 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       currency: 'PKR',
       status: 'Issued',
       notes: remarks || '',
+      issuingCompany,
       createdBy: req.user._id,
       createdByName: req.user.fullName
     }], { session }))[0];
@@ -1459,6 +1474,7 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       totalAmount: poTotal,
       currency: 'PKR',
       notes: remarks || '',
+      issuingCompany,
       issuedBy: req.user._id,
       issuedByName: req.user.fullName,
       issuedAt
@@ -1536,6 +1552,11 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
+    const issuingCompany = resolvePOCompany({
+      poType: 'Global',
+      requestedCompanyCode: req.body.issuingCompanyCode,
+      order
+    });
 
     const poNum = `GPO-${Date.now().toString().slice(-6)}`;
     order.supplierPO = {
@@ -1549,6 +1570,7 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       totalAmount: order.totalAmount || order.netAmount || 0,
       currency: 'PKR',
       notes: remarks || `Global Supplier PO issued with ${paymentTerms || 'LC'} terms`,
+      issuingCompany,
       issuedBy: req.user._id,
       issuedByName: req.user.fullName,
       issuedAt: new Date()
@@ -1580,6 +1602,7 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
         salesOrderId: order._id,
         salesOrderNumber: order.orderNumber || order.orderReference,
         notes: remarks || '',
+        issuingCompany,
         paymentTerms: paymentTerms || '',
         createdBy: req.user._id,
         createdByName: req.user.fullName
@@ -1608,7 +1631,7 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
     });
   } catch (error) {
     console.error('Global Procurement Send To Logistics Error:', error);
-    return res.status(500).json({ success: false, message: 'Server error creating global PO.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error creating global PO.' });
   }
 };
 

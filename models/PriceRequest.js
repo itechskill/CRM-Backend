@@ -9,6 +9,7 @@ const PRICE_REQUEST_CATEGORIES = [
   'Other'
 ];
 const PRICE_REQUEST_CURRENCIES = ['PKR', 'USD', 'EUR', 'AED', 'GBP'];
+const PRICE_REQUEST_LEAD_SOURCES = ['WhatsApp', 'Email', 'Phone call', 'Other'];
 
 const priceRequestEventSchema = new mongoose.Schema(
   {
@@ -34,6 +35,8 @@ const priceRequestSchema = new mongoose.Schema(
     brand: { type: String, required: true, trim: true, maxlength: 80 },
     category: { type: String, enum: PRICE_REQUEST_CATEGORIES, required: true, index: true },
     isBulk: { type: Boolean, default: false },
+    leadSource: { type: String, enum: PRICE_REQUEST_LEAD_SOURCES, required: true },
+    leadSourceNote: { type: String, trim: true, maxlength: 200, default: '' },
     customerName: { type: String, trim: true, maxlength: 160, default: '' },
     reference: { type: String, trim: true, maxlength: 160, default: '' },
     partNumber: { type: String, trim: true, maxlength: 160, default: '' },
@@ -70,3 +73,4 @@ module.exports = PriceRequest;
 module.exports.PRICE_REQUEST_STATUSES = PRICE_REQUEST_STATUSES;
 module.exports.PRICE_REQUEST_CATEGORIES = PRICE_REQUEST_CATEGORIES;
 module.exports.PRICE_REQUEST_CURRENCIES = PRICE_REQUEST_CURRENCIES;
+module.exports.PRICE_REQUEST_LEAD_SOURCES = PRICE_REQUEST_LEAD_SOURCES;

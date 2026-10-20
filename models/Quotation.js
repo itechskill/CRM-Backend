@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const companySnapshotDefinition = require('./schemas/companySnapshot');
 
 const QuotationSchema = new mongoose.Schema(
   {
@@ -35,6 +36,7 @@ const QuotationSchema = new mongoose.Schema(
     validUntil: { type: Date, default: null },
     validityDate: { type: Date, default: null },
     notes: { type: String, default: '' },
+    issuingCompany: companySnapshotDefinition(),
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', default: null },
     dealId: { type: mongoose.Schema.Types.ObjectId, ref: 'Deal', default: null },
     customerPOId: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomerPO', default: null },

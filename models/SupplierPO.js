@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const companySnapshotDefinition = require('./schemas/companySnapshot');
 
 const poItemSchema = new mongoose.Schema({
   productName: { type: String, required: true, trim: true },
@@ -100,6 +101,7 @@ const supplierPOSchema = new mongoose.Schema(
       type: String,
       default: ''
     },
+    issuingCompany: companySnapshotDefinition(),
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',

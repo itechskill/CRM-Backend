@@ -28,6 +28,7 @@ const { getCounterKey } = require('../utils/counterKey');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
 const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const { getSalesManagerScope } = require('../utils/salesManagerScope');
+const { DOCUMENT_TYPES, getCompanySnapshot, inheritCompanySnapshot, resolvePOCompany } = require('../config/companies');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -1433,6 +1434,7 @@ const convertProductFileToSalesOrder = async (req, res) => {
       creationDate: new Date(),
       orderDate: new Date(),
       notes: notes || file.notes || '',
+      issuingCompany: inheritCompanySnapshot(quoteRef) || undefined,
       quotationId: file.quotationId || (quoteRef ? quoteRef._id : null),
       customerPOId: customerPO._id,
       customerPONumber: customerPO.poNumber || file.customerPONumber || '',
@@ -1576,6 +1578,7 @@ const convertQuotationToSalesOrder = async (req, res) => {
       creationDate: new Date(),
       orderDate: new Date(),
       notes: notes || quotation.notes || '',
+      issuingCompany: inheritCompanySnapshot(quotation) || undefined,
       quotationId: quotation._id,
       leadId: quotation.leadId || null,
       customerPOId: customerPO._id,
@@ -1719,10 +1722,12 @@ const createMyQuotation = async (req, res) => {
       validUntil,
       creationDate,
       notes,
-      leadId
+      leadId,
+      issuingCompanyCode
     } = req.body;
 
     if (!clientName) return res.status(400).json({ success: false, message: 'Customer/Client name is required.' });
+    const issuingCompany = getCompanySnapshot(issuingCompanyCode, DOCUMENT_TYPES.QUOTATION);
     const assignedFileNumber = await allocateFileNumber(fileType);
 
     const quotation = await Quotation.create({
@@ -1745,6 +1750,7 @@ const createMyQuotation = async (req, res) => {
       validUntil: validUntil || null,
       creationDate: creationDate ? new Date(creationDate) : new Date(),
       notes: notes || '',
+      issuingCompany,
       leadId: leadId || null,
       createdBy: req.user._id
     });
@@ -1772,6 +1778,10 @@ const updateMyQuotation = async (req, res) => {
   try {
     const quotation = await Quotation.findById(req.params.id);
     if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
+
+    if (req.body.issuingCompanyCode !== undefined) {
+      quotation.issuingCompany = getCompanySnapshot(req.body.issuingCompanyCode, DOCUMENT_TYPES.QUOTATION);
+    }
 
     const allowedFields = [
       'orderReference',
@@ -1831,7 +1841,7 @@ const updateMyQuotation = async (req, res) => {
     return res.status(200).json({ success: true, message: 'Quotation updated successfully.', data: quotation });
   } catch (error) {
     console.error('[Update Quotation Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error updating quotation.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error updating quotation.' });
   }
 };
 
@@ -2055,7 +2065,8 @@ const createMyOrder = async (req, res) => {
       creationDate: creationDate ? new Date(creationDate) : new Date(),
       orderDate: creationDate ? new Date(creationDate) : new Date(),
       notes: notes || '',
-      quotationId: quotationId && mongoose.Types.ObjectId.isValid(quotationId) ? quotationId : null,
+      issuingCompany: inheritCompanySnapshot(linkedQuotation) || undefined,
+      quotationId: linkedQuotationId || null,
       customerPOId: customerPO._id,
       customerPONumber: customerPO.poNumber || customerPONumber || '',
       productFileId: productFileId && mongoose.Types.ObjectId.isValid(productFileId) ? productFileId : null,
@@ -5039,7 +5050,43 @@ const issueSupplierPO = async (req, res) => {
 
     const type = poType || (order.fileType === 'Blue' ? 'International' : 'Local');
     const isBlue = type === 'International' || order.fileType === 'Blue';
+    const issuingCompany = resolvePOCompany({
+      poType: isBlue ? 'Global' : 'Local',
+      requestedCompanyCode: req.body.issuingCompanyCode,
+      order
+    });
     const poNum = req.body.poNumber || `${isBlue ? 'IPO' : 'LPO'}-${Date.now().toString().slice(-6)}`;
+    const poItems = (items && items.length > 0 ? items : (order.items || [])).map(item => {
+      const quantity = Number(item.quantity) || 1;
+      const unitPrice = Number(item.unitPrice) || 0;
+      return {
+        productName: item.productName || item.description || 'Product Item',
+        description: item.description || '',
+        quantity,
+        unitPrice,
+        totalAmount: Number(item.totalAmount ?? item.total) || quantity * unitPrice
+      };
+    });
+    const poTotal = Number(totalAmount) || order.netAmount || order.totalAmount || 0;
+
+    const supplierPODocument = await SupplierPO.create({
+      poNumber: poNum,
+      supplierName: supplierName || (isBlue ? 'International Supplier' : 'Local Supplier'),
+      supplierCountry: supplierCountry || (isBlue ? 'China' : 'Pakistan'),
+      supplierEmail: supplierEmail || '',
+      supplierPhone: supplierPhone || '',
+      poType: isBlue ? 'Global' : 'Local',
+      items: poItems,
+      totalAmount: poTotal,
+      total: poTotal,
+      salesOrderId: order._id,
+      salesOrderNumber: order.orderNumber || order.orderReference || '',
+      status: 'Issued',
+      notes: notes || '',
+      issuingCompany,
+      createdBy: req.user._id,
+      createdByName: req.user.fullName
+    });
 
     order.fileType = isBlue ? 'Blue' : 'Green';
     order.supplierPO = {
@@ -5051,14 +5098,22 @@ const issueSupplierPO = async (req, res) => {
       supplierPhone: supplierPhone || '',
       issueDate: new Date(),
       status: 'Issued',
-      items: items && items.length > 0 ? items : (order.items || []),
-      totalAmount: Number(totalAmount) || order.netAmount || order.totalAmount || 0,
+      items: poItems.map(item => ({
+        description: item.description || item.productName,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        total: item.totalAmount
+      })),
+      totalAmount: poTotal,
       currency: 'PKR',
       notes: notes || '',
+      issuingCompany,
       issuedBy: req.user._id,
       issuedByName: req.user.fullName,
       issuedAt: new Date()
     };
+    order.supplierPoId = supplierPODocument._id;
+    order.supplierPoNumber = poNum;
 
     if (isBlue) {
       order.workflowStatus = 'International Supplier PO Issued';
@@ -5113,7 +5168,7 @@ const issueSupplierPO = async (req, res) => {
     });
   } catch (err) {
     console.error('[Issue Supplier PO Error]:', err);
-    return res.status(500).json({ success: false, message: 'Server error issuing supplier PO.' });
+    return res.status(err.statusCode || 500).json({ success: false, message: err.statusCode ? err.message : 'Server error issuing supplier PO.' });
   }
 };
 

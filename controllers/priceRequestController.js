@@ -9,7 +9,8 @@ const { createNotificationHelper } = require('./notificationController');
 
 const {
   PRICE_REQUEST_CATEGORIES,
-  PRICE_REQUEST_CURRENCIES
+  PRICE_REQUEST_CURRENCIES,
+  PRICE_REQUEST_LEAD_SOURCES
 } = PriceRequest;
 const { ROUTING_RULE_TYPES, ROUTING_PRIORITIES } = PriceRequestRoutingRule;
 
@@ -140,6 +141,8 @@ const createPriceRequest = async (req, res) => {
       brand,
       category,
       isBulk,
+      leadSource,
+      leadSourceNote,
       customerName,
       reference,
       partNumber,
@@ -156,6 +159,13 @@ const createPriceRequest = async (req, res) => {
     }
     if (!PRICE_REQUEST_CATEGORIES.includes(category)) {
       return res.status(400).json({ success: false, message: 'Select a valid category.' });
+    }
+    if (!PRICE_REQUEST_LEAD_SOURCES.includes(leadSource)) {
+      return res.status(400).json({ success: false, message: 'Select a valid lead source.' });
+    }
+    const normalizedLeadSourceNote = String(leadSourceNote || '').trim();
+    if (normalizedLeadSourceNote.length > 200) {
+      return res.status(400).json({ success: false, message: 'Lead source note cannot exceed 200 characters.' });
     }
     const parsedQuantity = Number(quantity || 1);
     if (!Number.isInteger(parsedQuantity) || parsedQuantity < 1) {
@@ -176,6 +186,8 @@ const createPriceRequest = async (req, res) => {
       brand: String(brand).trim(),
       category,
       isBulk: Boolean(isBulk),
+      leadSource,
+      leadSourceNote: leadSource === 'Other' ? normalizedLeadSourceNote : '',
       customerName: String(customerName || '').trim(),
       reference: String(reference || '').trim(),
       partNumber: String(partNumber || '').trim(),
