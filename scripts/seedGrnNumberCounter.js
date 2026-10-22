@@ -51,9 +51,9 @@ const run = async () => {
     );
   }
 
-  await Counter.findOneAndUpdate(
+  const counter = await Counter.findOneAndUpdate(
     { _id: counterKey },
-    { $set: { sequence: nextNumber - 1 } },
+    { $max: { sequence: nextNumber - 1 } },
     {
       upsert: true,
       new: true,
@@ -63,7 +63,8 @@ const run = async () => {
 
   console.log(
     `GRN counter initialized for ${counterKey}. ` +
-    `The next assigned number will be GRN-${String(nextNumber).padStart(6, '0')}.`
+    `The next assigned number will be GRN-${String(counter.sequence + 1).padStart(6, '0')}.` +
+    (counter.sequence > nextNumber - 1 ? ' The existing counter was higher and was not lowered.' : '')
   );
 };
 

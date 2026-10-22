@@ -5,11 +5,14 @@ const mongoose = require('mongoose');
 require('dotenv').config();
 
 const TEMP_DB_PREFIX = 'fortline_tmp_co_';
-const tempDbName = `${TEMP_DB_PREFIX}${randomBytes(8).toString('hex')}`;
+const runId = randomBytes(8).toString('hex');
+const tempDbName = `${TEMP_DB_PREFIX}${runId}`;
+process.env.COUNTER_NAMESPACE = `companies-${runId}`;
 const sourceMongoUri = process.env.MONGODB_URI;
 
 assert.ok(sourceMongoUri, 'MONGODB_URI is required to run company tests.');
 assert.notEqual(tempDbName, 'test');
+assert.notEqual(tempDbName, 'fortline_dev');
 
 const useDatabase = (uri, databaseName) => {
   const queryAt = uri.indexOf('?');
@@ -30,11 +33,15 @@ const {
 } = require('../config/companies');
 const Quotation = require('../models/Quotation');
 const SalesOrder = require('../models/SalesOrder');
+const Counter = require('../models/Counter');
+const { getCounterKey } = require('../utils/counterKey');
 
 before(async () => {
   await mongoose.connect(useDatabase(sourceMongoUri, tempDbName), { serverSelectionTimeoutMS: 10000 });
   assert.equal(mongoose.connection.name, tempDbName);
   assert.notEqual(mongoose.connection.name, 'test');
+  assert.notEqual(mongoose.connection.name, 'fortline_dev');
+  await Counter.create({ _id: getCounterKey('sales-order-number'), sequence: 1 });
 });
 
 after(async () => {

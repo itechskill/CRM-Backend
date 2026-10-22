@@ -392,11 +392,30 @@ exports.createSupplierPO = async (req, res) => {
               issuedAt: new Date()
             };
             linkedOrder.supplierPoNumber = poNumber;
+            const previousWorkflowStatus = linkedOrder.workflowStatus || 'Pending Local Procurement';
             linkedOrder.workflowStatus = 'Local Supplier PO Issued';
-            linkedOrder.lastAction = `Supplier PO ${poNumber} created for ${finalSupplierName}`;
+            linkedOrder.status = 'Local Supplier PO Issued';
+            linkedOrder.previousDepartment = linkedOrder.currentDepartment || 'Local Purchaser';
+            linkedOrder.previousStatus = previousWorkflowStatus;
+            linkedOrder.currentDepartment = 'Support';
+            linkedOrder.departmentResponsible = 'Support';
+            linkedOrder.currentStatus = 'AWAITING_GOODS_IN_SUPPORT';
+            linkedOrder.goodsReceivedInOffice.received = false;
+            linkedOrder.inventoryReceived = false;
+            linkedOrder.lastAction = `Supplier PO ${poNumber} created for ${finalSupplierName} - awaiting goods in Support`;
             linkedOrder.lastActionBy = req.user._id;
             linkedOrder.lastActionByName = req.user.fullName;
             linkedOrder.lastActionAt = new Date();
+            linkedOrder.workflowHistory.push({
+              user: req.user._id,
+              userName: req.user.fullName,
+              department: 'Local Purchaser',
+              action: 'Local Supplier PO Issued',
+              previousStatus: previousWorkflowStatus,
+              newStatus: 'Local Supplier PO Issued',
+              timestamp: new Date(),
+              notes: `Local Supplier PO ${poNumber} issued. Order routed to Support awaiting Receive Goods / Inventory IN.`
+            });
             await linkedOrder.save({ session });
           }
         });
@@ -1334,6 +1353,22 @@ exports.performInventoryCheck = async (req, res) => {
 
     await order.save();
 
+    if (moveToSupport && shortageFound) {
+      return res.status(409).json({
+        success: false,
+        message: 'Cannot send this order to Support as In Stock: a stock shortage was detected. Issue a Local Supplier PO for the shortage first.',
+        data: {
+          order,
+          itemAnalysis,
+          status: 'Shortage',
+          totalOrdered,
+          totalAvailable,
+          totalStockValue,
+          orderTotalAmount: Number(order.netAmount || order.totalAmount || 0)
+        }
+      });
+    }
+
     return res.status(200).json({
       success: true,
       message: moveToSupport && !shortageFound
@@ -1363,6 +1398,19 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
     let order = await SalesOrder.findById(id);
     if (!order) {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+
+    if (order.inventoryFulfilledFromExistingStock === true) {
+      return res.status(409).json({
+        success: false,
+        message: 'This order was already fulfilled from existing stock and cannot be procured through a Local PO.'
+      });
+    }
+    if (order.currentDepartment === 'Support' || order.departmentResponsible === 'Support') {
+      return res.status(409).json({
+        success: false,
+        message: 'This order is already with Support and cannot be procured again.'
+      });
     }
 
     const issuingCompany = resolvePOCompany({
@@ -1482,24 +1530,22 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
     order.supplierPoId = supplierPO._id;
     order.supplierPoNumber = finalPoNumber;
 
-    const totalQty = (order.items || []).reduce((s, i) => s + (Number(i.quantity) || 1), 0);
-
     order.inventoryCheckStatus = 'Procurement Completed';
-    order.workflowStatus = 'Goods Received in Office';
-    order.status = 'Goods Received in Office';
+    order.workflowStatus = 'Local Supplier PO Issued';
+    order.status = 'Local Supplier PO Issued';
     order.departmentResponsible = 'Support';
     order.currentDepartment = 'Support';
-    order.currentStatus = 'GOODS_IN_STOCK_ROUTED_TO_SUPPORT';
+    order.currentStatus = 'AWAITING_GOODS_IN_SUPPORT';
     order.previousDepartment = 'Local Purchaser';
     order.previousStatus = 'Pending Local Procurement';
     order.goodsReceivedInOffice = {
-      received: true,
-      receivedQuantity: totalQty,
-      orderedQuantity: totalQty,
-      receivingDate: new Date(),
-      remarks: 'Goods brought to the office and handed to Support for Inventory IN and Delivery Note.'
+      received: false,
+      receivedQuantity: 0,
+      orderedQuantity: (order.items || []).reduce((s, i) => s + (Number(i.quantity) || 1), 0),
+      remarks: 'Local Supplier PO issued. Support must record Receive Goods / Inventory IN.'
     };
-    order.lastAction = `Local Supplier PO ${finalPoNumber} Issued - Moved to Support for Inventory IN and Delivery Note`;
+    order.inventoryReceived = false;
+    order.lastAction = `Local Supplier PO ${finalPoNumber} Issued - Moved to Support Awaiting Goods`;
     order.lastActionBy = req.user._id;
     order.lastActionByName = req.user.fullName;
     order.lastActionAt = new Date();
@@ -1511,9 +1557,9 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       department: 'Local Purchaser',
       action: 'Local Supplier PO Issued and Moved to Support',
       previousStatus: 'Pending Local Procurement',
-      newStatus: 'Goods Received in Office',
+      newStatus: 'Local Supplier PO Issued',
       timestamp: new Date(),
-      notes: `Local Supplier PO ${finalPoNumber} was issued to ${finalSupplierName}. Goods for Sales Order ${order.orderNumber || order.orderReference} were brought to the office and moved to Support for Inventory IN and Delivery Note (DN) creation.`
+      notes: `Local Supplier PO ${finalPoNumber} was issued to ${finalSupplierName}. Sales Order ${order.orderNumber || order.orderReference} moved to Support awaiting Receive Goods / Inventory IN.`
     });
 
     await order.save({ session });
@@ -1526,15 +1572,15 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
 
     await notifyRoleHelper(['support', 'operations', 'admin', 'ceo'], {
       type: 'order',
-      title: 'New Order Ready for Delivery Note in Support',
-      message: `Green File Order ${order.orderNumber || order.orderReference} with Local Supplier PO ${finalPoNumber} arrived at the office and is ready for Support Inventory IN and Delivery Note creation.`,
+      title: 'Local PO Issued - Goods Awaiting Receipt',
+      message: `Green File Order ${order.orderNumber || order.orderReference} with Local Supplier PO ${finalPoNumber} is awaiting Receive Goods / Inventory IN in Support.`,
       link: '/support/orders',
       sender: req.user._id
     });
 
     return res.status(200).json({
       success: true,
-      message: `Local Supplier PO ${finalPoNumber} saved and Sales Order ${order.orderNumber || order.orderReference} successfully moved to Support for Inventory IN and Delivery Note creation!`,
+      message: `Local Supplier PO ${finalPoNumber} saved. Sales Order ${order.orderNumber || order.orderReference} moved to Support awaiting goods receipt.`,
       data: order
     });
   } catch (error) {
@@ -1785,14 +1831,10 @@ exports.sendGlobalOrderToLogistics = async (req, res) => {
       if (!order) {
         const po = await SupplierPO.findById(id);
         if (po?.salesOrderId) order = await SalesOrder.findById(po.salesOrderId);
-        else if (po?.salesOrderNumber) order = await SalesOrder.findOne({ orderNumber: po.salesOrderNumber });
       }
     }
     if (!order && req.body.salesOrderId && mongoose.Types.ObjectId.isValid(req.body.salesOrderId)) {
       order = await SalesOrder.findById(req.body.salesOrderId);
-    }
-    if (!order && req.body.salesOrderNumber) {
-      order = await SalesOrder.findOne({ orderNumber: req.body.salesOrderNumber });
     }
     if (!order) {
       return res.status(404).json({ success: false, message: 'Associated Sales Order not found for moving to Logistics.' });

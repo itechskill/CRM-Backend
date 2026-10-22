@@ -25,6 +25,7 @@ const PurchaserGRN = require('../models/PurchaserGRN');
 const LocalPayable = require('../models/LocalPayable');
 const Counter = require('../models/Counter');
 const { getCounterKey } = require('../utils/counterKey');
+const { allocateGrnNumber, withGrnDuplicateRecovery } = require('../utils/grnNumber');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
 const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const { getSalesManagerScope } = require('../utils/salesManagerScope');
@@ -251,21 +252,6 @@ const getDeliveryStockRequirements = async (order, { session = null, excludeDeli
 const formatStockShortageMessage = (shortages) => {
   const details = shortages.map(item => `${item.item} (required ${item.required}, available ${item.available})`).join('; ');
   return `Add inventory first. Insufficient stock: ${details}.`;
-};
-
-const allocateGrnNumber = async (session) => {
-  const counterKey = getCounterKey('grn-number');
-  const counter = await Counter.findOneAndUpdate(
-    { _id: counterKey, sequence: { $lt: 999999 } },
-    { $inc: { sequence: 1 } },
-    { new: true, session }
-  );
-  if (!counter) {
-    const exists = await Counter.exists({ _id: counterKey }).session(session || null);
-    if (!exists) throw createHttpError(503, 'The GRN counter has not been initialized. Run the approved one-time seed before receiving inventory.');
-    throw createHttpError(409, 'The GRN sequence has reached GRN-999999. No further GRNs can be allocated.');
-  }
-  return `GRN-${String(counter.sequence).padStart(6, '0')}`;
 };
 
 const allocateFileNumber = async (fileType) => {
@@ -2462,7 +2448,10 @@ const updateMyOrder = async (req, res) => {
     return res.status(200).json({ success: true, message: 'Order updated successfully.', data: order });
   } catch (error) {
     console.error('[Update Order Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error updating order.' });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.statusCode ? error.message : 'Server error updating order.'
+    });
   }
 };
 
@@ -3414,9 +3403,7 @@ const deleteMyOrder = async (req, res) => {
     }
 
     const orderRef = order.orderReference || order.orderNumber;
-    const linkedDN = await DeliveryNote.findOne({
-      $or: [{ salesOrderId: req.params.id }, { salesOrderNumber: orderRef }]
-    });
+    const linkedDN = await DeliveryNote.findOne({ salesOrder: order._id });
     if (linkedDN) {
       return res.status(400).json({
         success: false,
@@ -3424,9 +3411,7 @@ const deleteMyOrder = async (req, res) => {
       });
     }
 
-    const linkedInv = await Invoice.findOne({
-      $or: [{ salesOrderId: req.params.id }, { salesOrderNumber: orderRef }]
-    });
+    const linkedInv = await Invoice.findOne({ salesOrderId: order._id });
     if (linkedInv) {
       return res.status(400).json({
         success: false,
@@ -4643,7 +4628,7 @@ const recordGoodsReceivedInOffice = async (req, res) => {
   const session = await mongoose.startSession();
   let savedOrder = null;
   try {
-    await session.withTransaction(async () => {
+    await withGrnDuplicateRecovery(session, async () => {
       const order = await SalesOrder.findById(req.params.id).session(session);
       if (!order) throw createHttpError(404, 'Sales order not found.');
       if (order.isOverdueBlocked) {
@@ -5328,7 +5313,7 @@ const addInventoryStock = async (req, res) => {
     }
     let savedItem = null;
     let grnNumber = '';
-    await session.withTransaction(async () => {
+    await withGrnDuplicateRecovery(session, async () => {
       const existingItem = await InventoryItem.findById(req.params.id).session(session);
       if (!existingItem) throw createHttpError(404, 'Inventory item not found.');
 
