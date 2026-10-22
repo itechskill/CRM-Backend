@@ -26,6 +26,7 @@ const LocalPayable = require('../models/LocalPayable');
 const Counter = require('../models/Counter');
 const { getCounterKey } = require('../utils/counterKey');
 const { allocateGrnNumber, withGrnDuplicateRecovery } = require('../utils/grnNumber');
+const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
 const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const { getSalesManagerScope } = require('../utils/salesManagerScope');
@@ -5040,7 +5041,9 @@ const issueSupplierPO = async (req, res) => {
       requestedCompanyCode: req.body.issuingCompanyCode,
       order
     });
-    const poNum = req.body.poNumber || `${isBlue ? 'IPO' : 'LPO'}-${Date.now().toString().slice(-6)}`;
+    const poNum = isBlue
+      ? await allocateGlobalPoNumber()
+      : (req.body.poNumber || `LPO-${Date.now().toString().slice(-6)}`);
     const poItems = (items && items.length > 0 ? items : (order.items || [])).map(item => {
       const quantity = Number(item.quantity) || 1;
       const unitPrice = Number(item.unitPrice) || 0;
@@ -5052,7 +5055,17 @@ const issueSupplierPO = async (req, res) => {
         totalAmount: Number(item.totalAmount ?? item.total) || quantity * unitPrice
       };
     });
-    const poTotal = Number(totalAmount) || order.netAmount || order.totalAmount || 0;
+    const itemSubtotal = poItems.reduce((sum, item) => sum + Number(item.totalAmount || 0), 0);
+    const subtotal = isBlue
+      ? (itemSubtotal || Number(totalAmount) || order.netAmount || order.totalAmount || 0)
+      : (Number(totalAmount) || order.netAmount || order.totalAmount || 0);
+    const requestedVatRate = Number(req.body.vatRate || 0);
+    if (isBlue && (!Number.isFinite(requestedVatRate) || requestedVatRate < 0 || requestedVatRate > 100)) {
+      return res.status(400).json({ success: false, message: 'VAT percentage must be between 0 and 100.' });
+    }
+    const vatRate = isBlue ? requestedVatRate : 0;
+    const vatAmount = Math.round((subtotal * vatRate / 100 + Number.EPSILON) * 100) / 100;
+    const poTotal = Math.round((subtotal + vatAmount + Number.EPSILON) * 100) / 100;
 
     const supplierPODocument = await SupplierPO.create({
       poNumber: poNum,
@@ -5062,6 +5075,9 @@ const issueSupplierPO = async (req, res) => {
       supplierPhone: supplierPhone || '',
       poType: isBlue ? 'Global' : 'Local',
       items: poItems,
+      subtotal,
+      vatRate,
+      vatAmount,
       totalAmount: poTotal,
       total: poTotal,
       salesOrderId: order._id,
@@ -5089,6 +5105,10 @@ const issueSupplierPO = async (req, res) => {
         unitPrice: item.unitPrice,
         total: item.totalAmount
       })),
+      subtotal,
+      vatRate,
+      vatAmount,
+      total: poTotal,
       totalAmount: poTotal,
       currency: 'PKR',
       notes: notes || '',

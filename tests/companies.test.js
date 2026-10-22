@@ -26,6 +26,7 @@ const useDatabase = (uri, databaseName) => {
 };
 
 const {
+  COMPANIES,
   DOCUMENT_TYPES,
   getCompanySnapshot,
   inheritCompanySnapshot,
@@ -57,6 +58,16 @@ after(async () => {
 });
 
 test('shared company validation enforces allowed document types', () => {
+  const codesFor = type => COMPANIES.filter(company => company.allowedDocumentTypes.includes(type)).map(company => company.code).sort();
+  assert.deepEqual(codesFor(DOCUMENT_TYPES.QUOTATION), [
+    'FORTLINE_ENTERPRISES', 'FORTLINE_PRIVATE_LIMITED', 'HIGH_CLOUD_TRADING_LLC', 'WWTS'
+  ].sort());
+  assert.deepEqual(codesFor(DOCUMENT_TYPES.LOCAL_PO), [
+    'FORTLINE_ENTERPRISES', 'FORTLINE_PRIVATE_LIMITED', 'WWTS'
+  ].sort());
+  assert.deepEqual(codesFor(DOCUMENT_TYPES.GLOBAL_PO), [
+    'FORTLINE_ENTERPRISES', 'FORTLINE_PRIVATE_LIMITED', 'HIGH_CLOUD_TRADING_LLC', 'WWTS'
+  ].sort());
   assert.equal(
     getCompanySnapshot('FORTLINE_ENTERPRISES', DOCUMENT_TYPES.QUOTATION).legalName,
     'Fortline Enterprises'
@@ -69,9 +80,13 @@ test('shared company validation enforces allowed document types', () => {
     resolvePOCompany({ poType: 'Global', requestedCompanyCode: 'WWTS' }).code,
     'WWTS'
   );
-  assert.throws(
-    () => resolvePOCompany({ poType: 'Global', requestedCompanyCode: 'FORTLINE_ENTERPRISES' }),
-    /not allowed/
+  assert.equal(
+    resolvePOCompany({ poType: 'Global', requestedCompanyCode: 'FORTLINE_ENTERPRISES' }).code,
+    'FORTLINE_ENTERPRISES'
+  );
+  assert.equal(
+    resolvePOCompany({ poType: 'Local', requestedCompanyCode: 'WWTS' }).code,
+    'WWTS'
   );
   assert.throws(
     () => resolvePOCompany({ poType: 'Local', requestedCompanyCode: 'HIGH_CLOUD_TRADING_LLC' }),
@@ -110,21 +125,21 @@ test('quotation snapshot is inherited by its sales order and valid PO type', asy
   );
 });
 
-test('an inherited company that is invalid for a PO type requires an explicit replacement', () => {
-  const localOnlyOrder = {
-    issuingCompany: getCompanySnapshot('FORTLINE_ENTERPRISES', DOCUMENT_TYPES.QUOTATION)
+test('an inherited company that is invalid for Local PO requires an explicit replacement', () => {
+  const globalOnlyOrder = {
+    issuingCompany: getCompanySnapshot('HIGH_CLOUD_TRADING_LLC', DOCUMENT_TYPES.QUOTATION)
   };
 
   assert.throws(
-    () => resolvePOCompany({ poType: 'Global', order: localOnlyOrder }),
+    () => resolvePOCompany({ poType: 'Local', order: globalOnlyOrder }),
     /Select an allowed issuing company/
   );
   assert.equal(
     resolvePOCompany({
-      poType: 'Global',
-      order: localOnlyOrder,
-      requestedCompanyCode: 'HIGH_CLOUD_TRADING_LLC'
+      poType: 'Local',
+      order: globalOnlyOrder,
+      requestedCompanyCode: 'WWTS'
     }).code,
-    'HIGH_CLOUD_TRADING_LLC'
+    'WWTS'
   );
 });

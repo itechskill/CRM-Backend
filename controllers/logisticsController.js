@@ -255,7 +255,6 @@ const createShipment = async (req, res) => {
       salesOrderId,
       supplierName,
       supplierCountry,
-      supplierPoNumber,
       carrier,
       flightNumber,
       trackingNumber,
@@ -280,6 +279,10 @@ const createShipment = async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
+    const orderSupplierPoNumber = order.supplierPO?.poNumber || order.supplierPoNumber || '';
+    if (!orderSupplierPoNumber) {
+      return res.status(409).json({ success: false, message: 'Initialize shipment is unavailable until the order has an issued Global PO number.' });
+    }
 
     // Check if shipment already exists
     const existing = await Shipment.findOne({ salesOrder: order._id });
@@ -301,7 +304,7 @@ const createShipment = async (req, res) => {
       clientPhone: order.clientPhone || '',
       supplierName: supplierName || order.supplierPO?.supplierName || '',
       supplierCountry: supplierCountry || order.supplierPO?.supplierCountry || '',
-      supplierPoNumber: supplierPoNumber || order.supplierPO?.poNumber || '',
+      supplierPoNumber: orderSupplierPoNumber,
       supplierPoDate: order.supplierPO?.issueDate || new Date(),
       fileType: 'Blue',
       status: 'PO Issued',
@@ -381,6 +384,12 @@ const updateShipmentTracking = async (req, res) => {
     const shipment = await Shipment.findById(req.params.id);
     if (!shipment) {
       return res.status(404).json({ success: false, message: 'Shipment not found.' });
+    }
+    if (shipment.receivedInOffice || shipment.status === 'Received in Office') {
+      return res.status(409).json({
+        success: false,
+        message: 'Tracking fields are locked because this shipment has been Received in Office.'
+      });
     }
 
     const {

@@ -100,6 +100,8 @@ const SalesOrderSchema = new mongoose.Schema(
       subtotal: { type: Number, default: 0 },
       gstRate: { type: Number, default: 0 },
       gstAmount: { type: Number, default: 0 },
+      vatRate: { type: Number, default: 0 },
+      vatAmount: { type: Number, default: 0 },
       total: { type: Number, default: 0 },
       currency: { type: String, default: 'PKR' },
       notes: { type: String, default: '' },
