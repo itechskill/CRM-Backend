@@ -272,37 +272,24 @@ const SalesOrderSchema = new mongoose.Schema(
 );
 
 SalesOrderSchema.pre('save', async function (next) {
-  if (!this.orderNumber && !this.orderReference) {
-    let maxNum = 1724;
-    const allOrders = await mongoose.model('SalesOrder').find({
-      orderReference: { $regex: /^S\d+$/i }
-    }).select('orderReference').lean();
-    
-    allOrders.forEach(o => {
-      const match = o.orderReference && o.orderReference.match(/\d+$/);
-      if (match) {
-        const n = parseInt(match[0], 10);
-        if (n > maxNum) maxNum = n;
-      }
+  if (this.isNew) {
+    const { allocateSalesOrderNumber } = require('../utils/salesOrderNumber');
+    const allocatedNumber = await allocateSalesOrderNumber(this.$session());
+    this.orderNumber = allocatedNumber;
+    this.orderReference = allocatedNumber;
+  } else if (this.isModified('orderNumber') || this.isModified('orderReference')) {
+    const candidate = String(this.orderNumber || this.orderReference || '').trim();
+    const duplicate = candidate && await mongoose.model('SalesOrder').exists({
+      _id: { $ne: this._id },
+      $or: [{ orderNumber: candidate }, { orderReference: candidate }]
     });
-    
-    let unique = false;
-    while (!unique) {
-      maxNum++;
-      const nextRef = 'S0' + String(maxNum);
-      const exists = await mongoose.model('SalesOrder').exists({ 
-        $or: [{ orderReference: nextRef }, { orderNumber: nextRef }] 
-      });
-      if (!exists) {
-        this.orderReference = nextRef;
-        this.orderNumber = nextRef;
-        unique = true;
-      }
+    if (duplicate) {
+      const error = new Error(`Sales Order number ${candidate} already exists.`);
+      error.statusCode = 409;
+      throw error;
     }
-  } else if (!this.orderNumber && this.orderReference) {
-    this.orderNumber = this.orderReference;
-  } else if (!this.orderReference && this.orderNumber) {
-    this.orderReference = this.orderNumber;
+    this.orderNumber = candidate;
+    this.orderReference = candidate;
   }
   
   if (!this.creationDate) {
