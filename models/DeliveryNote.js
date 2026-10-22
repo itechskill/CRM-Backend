@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { allocateDeliveryNoteNumber } = require('../utils/deliveryNoteNumber');
 
 const DeliveryNoteSchema = new mongoose.Schema(
   {
@@ -61,22 +62,9 @@ const DeliveryNoteSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-DeliveryNoteSchema.pre('save', async function (next) {
+DeliveryNoteSchema.pre('save', async function () {
   if (!this.deliveryNumber) {
-    const allNotes = await mongoose.model('DeliveryNote').find({
-      deliveryNumber: { $regex: /^WH\/OUT\/\d+$/i }
-    }).select('deliveryNumber').lean();
-
-    let maxNum = 371;
-    allNotes.forEach(d => {
-      const match = d.deliveryNumber && d.deliveryNumber.match(/\d+$/);
-      if (match) {
-        const n = parseInt(match[0], 10);
-        if (n > maxNum) maxNum = n;
-      }
-    });
-
-    const num = 'WH/OUT/' + String(maxNum + 1).padStart(5, '0');
+    const num = await allocateDeliveryNoteNumber(this.$session());
     this.deliveryNumber = num;
     this.deliveryNoteNumber = num;
   }
@@ -87,7 +75,6 @@ DeliveryNoteSchema.pre('save', async function (next) {
     const baseDate = this.scheduledDate || new Date();
     this.deadline = new Date(baseDate.getTime() + 2 * 24 * 60 * 60 * 1000);
   }
-  next();
 });
 
 module.exports = mongoose.model('DeliveryNote', DeliveryNoteSchema);

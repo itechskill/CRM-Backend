@@ -12,9 +12,19 @@ const Shipment = require('../models/Shipment');
 const logAudit = require('../utils/auditLogger');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
 const { resolvePOCompany } = require('../config/companies');
+const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+const normalizeVatRate = value => {
+  const rate = Number(value || 0);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+    const error = new Error('VAT percentage must be between 0 and 100.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return rate;
+};
 const toCents = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100);
 const getPayableBalances = (payable) => {
   const source = payable?._doc || payable;
@@ -251,10 +261,9 @@ exports.createSupplierPO = async (req, res) => {
       requestedCompanyCode: req.body.issuingCompanyCode,
       order: linkedOrder
     });
-    const prefix = type === 'Global' ? 'GPO' : 'LPO';
     const poNumber = type === 'Local'
-      ? `${prefix}-${Date.now().toString().slice(-6)}`
-      : (req.body.poNumber || `${prefix}-${Date.now().toString().slice(-6)}`);
+      ? `LPO-${Date.now().toString().slice(-6)}`
+      : await allocateGlobalPoNumber();
 
     // Resolve or auto-create supplier
     let supplier = null;
@@ -308,7 +317,9 @@ exports.createSupplierPO = async (req, res) => {
     }
     const gstRate = type === 'Local' ? Math.max(0, Number(req.body.gstRate) || 0) : 0;
     const gstAmount = type === 'Local' ? roundMoney(subtotal * gstRate / 100) : 0;
-    const totalAmount = type === 'Local' ? roundMoney(subtotal + gstAmount) : subtotal;
+    const vatRate = type === 'Global' ? normalizeVatRate(req.body.vatRate) : 0;
+    const vatAmount = type === 'Global' ? roundMoney(subtotal * vatRate / 100) : 0;
+    const totalAmount = roundMoney(subtotal + gstAmount + vatAmount);
 
     // Check if linked SalesOrder has shortage and customer advance status
     let initialStatus = 'Issued';
@@ -337,6 +348,8 @@ exports.createSupplierPO = async (req, res) => {
       subtotal,
       gstRate,
       gstAmount,
+      vatRate,
+      vatAmount,
       total: totalAmount,
       totalAmount,
       currency: 'PKR',
@@ -440,6 +453,8 @@ exports.createSupplierPO = async (req, res) => {
         subtotal,
         gstRate,
         gstAmount,
+        vatRate,
+        vatAmount,
         total: totalAmount,
         totalAmount,
         currency: 'PKR',
@@ -493,7 +508,7 @@ exports.createSupplierPO = async (req, res) => {
 exports.updateSupplierPO = async (req, res) => {
   try {
     const { id } = req.params;
-    const { supplierName, items, notes, expectedDeliveryDate, status, remarks, gstRate } = req.body;
+    const { supplierName, items, notes, expectedDeliveryDate, status, remarks, gstRate, vatRate } = req.body;
 
     const po = await SupplierPO.findById(id);
     if (!po) {
@@ -563,18 +578,45 @@ exports.updateSupplierPO = async (req, res) => {
       changes.push({ field: 'items', oldValue: po.items.length, newValue: formattedItems.length });
       const resolvedGstRate = po.poType === 'Local' ? Math.max(0, Number(gstRate !== undefined ? gstRate : po.gstRate) || 0) : 0;
       const gstAmount = po.poType === 'Local' ? roundMoney(subtotal * resolvedGstRate / 100) : 0;
-      const totalAmount = po.poType === 'Local' ? roundMoney(subtotal + gstAmount) : subtotal;
+      const resolvedVatRate = po.poType === 'Global' ? normalizeVatRate(vatRate !== undefined ? vatRate : po.vatRate) : 0;
+      const vatAmount = po.poType === 'Global' ? roundMoney(subtotal * resolvedVatRate / 100) : 0;
+      const totalAmount = roundMoney(subtotal + gstAmount + vatAmount);
       changes.push({ field: 'totalAmount', oldValue: po.totalAmount, newValue: totalAmount });
       po.items = formattedItems;
       po.subtotal = subtotal;
       po.gstRate = resolvedGstRate;
       po.gstAmount = gstAmount;
+      po.vatRate = resolvedVatRate;
+      po.vatAmount = vatAmount;
       po.total = totalAmount;
       po.totalAmount = totalAmount;
 
     }
 
     await po.save();
+    if (po.salesOrderId) {
+      await SalesOrder.updateOne(
+        { _id: po.salesOrderId, supplierPoId: po._id },
+        {
+          $set: {
+            'supplierPO.items': po.items.map(item => ({
+              description: item.description || item.productName,
+              quantity: item.quantity,
+              unitPrice: item.unitPrice,
+              total: item.totalAmount
+            })),
+            'supplierPO.subtotal': po.subtotal,
+            'supplierPO.gstRate': po.gstRate,
+            'supplierPO.gstAmount': po.gstAmount,
+            'supplierPO.vatRate': po.vatRate,
+            'supplierPO.vatAmount': po.vatAmount,
+            'supplierPO.total': po.total,
+            'supplierPO.totalAmount': po.totalAmount,
+            'supplierPO.notes': po.notes
+          }
+        }
+      );
+    }
     if (po.poType === 'Local' && items && items.length > 0) {
       await LocalPayable.findOneAndUpdate(
         { supplierPO: po._id },
@@ -1604,7 +1646,22 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       order
     });
 
-    const poNum = `GPO-${Date.now().toString().slice(-6)}`;
+    const poNum = await allocateGlobalPoNumber();
+    let subtotal = 0;
+    const poItems = ((items && items.length > 0) ? items : (order.items || [])).map(item => {
+      const quantity = Number(item.quantity || item.requiredQty || item.quantityOrdered) || 1;
+      const unitPrice = Number(item.unitPrice || item.unitPricePKR) || 0;
+      const totalAmount = roundMoney(Number(item.totalPricePKR ?? item.totalAmount ?? item.total) || (quantity * unitPrice));
+      subtotal = roundMoney(subtotal + totalAmount);
+      return {
+        productName: item.productName || item.description || 'Product Item',
+        description: item.description || '', quantity, unitPrice, totalAmount
+      };
+    });
+    if (subtotal === 0) subtotal = roundMoney(order.netAmount || order.totalAmount || 0);
+    const vatRate = normalizeVatRate(req.body.vatRate);
+    const vatAmount = roundMoney(subtotal * vatRate / 100);
+    const totalAmount = roundMoney(subtotal + vatAmount);
     order.supplierPO = {
       poNumber: poNum,
       poType: 'International',
@@ -1612,8 +1669,15 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       supplierCountry: supplierCountry || 'China',
       issueDate: new Date(),
       status: 'Issued',
-      items: items && items.length > 0 ? items : (order.items || []),
-      totalAmount: order.totalAmount || order.netAmount || 0,
+      items: poItems.map(item => ({
+        description: item.description || item.productName, quantity: item.quantity,
+        unitPrice: item.unitPrice, total: item.totalAmount
+      })),
+      subtotal,
+      vatRate,
+      vatAmount,
+      total: totalAmount,
+      totalAmount,
       currency: 'PKR',
       notes: remarks || `Global Supplier PO issued with ${paymentTerms || 'LC'} terms`,
       issuingCompany,
@@ -1641,8 +1705,12 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
         supplierName: supplierName || 'Global Vendor',
         supplierCountry: supplierCountry || 'China',
         poType: 'Global',
-        items: items && items.length > 0 ? items : (order.items || []),
-        totalAmount: order.totalAmount || order.netAmount || 0,
+        items: poItems,
+        subtotal,
+        vatRate,
+        vatAmount,
+        total: totalAmount,
+        totalAmount,
         currency: 'PKR',
         status: 'Issued',
         salesOrderId: order._id,
@@ -1683,7 +1751,12 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
 
 const handoffGlobalOrderToLogistics = async (order, user) => {
   const previousStatus = order.workflowStatus;
-  const effectivePoNumber = order.supplierPO?.poNumber || order.supplierPoNumber || `GPO-${Date.now().toString().slice(-6)}`;
+  const effectivePoNumber = order.supplierPO?.poNumber || order.supplierPoNumber || '';
+  if (!effectivePoNumber) {
+    const error = new Error('A server-assigned Global PO number is required before Logistics handoff.');
+    error.statusCode = 409;
+    throw error;
+  }
 
   order.previousStatus = previousStatus;
   order.previousDepartment = 'Global Purchaser';
