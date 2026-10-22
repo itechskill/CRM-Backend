@@ -8,6 +8,7 @@ const SalesOrderSchema = new mongoose.Schema(
     salePerson: { type: String, trim: true, default: '' },
     fileNo: { type: String, trim: true, default: '' },
     fileType: { type: String, enum: ['Blue', 'Green', 'Yellow', ''], default: '' },
+    suggestedFileType: { type: String, enum: ['Blue', 'Green', ''], default: '' },
     productSummary: { type: String, trim: true, default: '' },
     orderNumber: { type: String, trim: true, default: '' },
     clientName: { type: String, required: [true, 'Client name is required'], trim: true },

@@ -255,9 +255,7 @@ const formatStockShortageMessage = (shortages) => {
   return `Add inventory first. Insufficient stock: ${details}.`;
 };
 
-const allocateFileNumber = async (fileType) => {
-  const normalizedType = fileType === 'Blue' ? 'Blue' : (fileType === 'Green' ? 'Green' : '');
-  if (!normalizedType) throw createHttpError(400, 'Select Green or Blue before creating the record.');
+const allocateFileNumber = async () => {
   const counterKey = getCounterKey('file-number');
   const counter = await Counter.findOneAndUpdate(
     { _id: counterKey },
@@ -267,29 +265,39 @@ const allocateFileNumber = async (fileType) => {
   if (!counter) {
     throw createHttpError(503, 'The file-number counter has not been initialized. Run the approved one-time seed before creating files.');
   }
-  return `${counter.sequence} ${normalizedType}`;
+  return String(counter.sequence);
 };
 
 const withFileColour = (fileNumber, fileType) => {
-  const match = String(fileNumber || '').trim().match(/^(\d+)(?:\s+(?:Green|Blue))?$/i);
-  return match ? `${match[1]} ${fileType}` : String(fileNumber || '').trim();
+  const raw = String(fileNumber || '').trim();
+  if (!raw) return raw;
+  const core = raw.replace(/\s+(?:Green|Blue)$/i, '').trim();
+  return `${core} ${fileType}`;
 };
 
-const updateLinkedFileColour = async (order, fileType) => {
+const updateLinkedFileColour = async (order, fileType, session) => {
   const linkedRecords = [
-    [Quotation, order.quotationId, 'fileNo'],
-    [CustomerPO, order.customerPOId, 'fileNumber'],
-    [ProductFile, order.productFileId, 'fileNumber']
+    [Quotation, order.quotationId, 'fileNo', 'Quotation'],
+    [CustomerPO, order.customerPOId, 'fileNumber', 'Customer PO'],
+    [ProductFile, order.productFileId, 'fileNumber', 'Product File']
   ];
+  const warnings = [];
 
-  for (const [Model, recordId, numberField] of linkedRecords) {
-    if (!recordId) continue;
-    const record = await Model.findById(recordId);
-    if (!record) continue;
+  for (const [Model, recordId, numberField, label] of linkedRecords) {
+    if (!recordId) {
+      warnings.push(`${label} link is missing.`);
+      continue;
+    }
+    const record = await Model.findById(recordId).session(session || null);
+    if (!record) {
+      warnings.push(`${label} link points to a record that no longer exists.`);
+      continue;
+    }
     record[numberField] = withFileColour(record[numberField], fileType);
     record.fileType = fileType;
-    await record.save();
+    await record.save({ session });
   }
+  return warnings;
 };
 
 const createHttpError = (statusCode, message) => {
@@ -1271,7 +1279,7 @@ const convertCustomerPOToProductFile = async (req, res) => {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
 
-    const { fileType, products, notes } = req.body;
+    const { products, notes } = req.body;
 
     let quoteItems = [];
     let quotationNumber = po.quotationNumber || '';
@@ -1291,8 +1299,8 @@ const convertCustomerPOToProductFile = async (req, res) => {
       }
     }
 
-    const resolvedFileType = po.fileType || linkedQuotation?.fileType || fileType;
-    const resolvedFileNumber = po.fileNumber || linkedQuotation?.fileNo || await allocateFileNumber(resolvedFileType);
+    const resolvedFileType = po.fileType || linkedQuotation?.fileType || '';
+    const resolvedFileNumber = po.fileNumber || linkedQuotation?.fileNo || await allocateFileNumber();
 
     const file = await ProductFile.create({
       fileNumber: resolvedFileNumber,
@@ -1354,7 +1362,7 @@ const convertProductFileToSalesOrder = async (req, res) => {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
 
-    const { orderReference, clientAddress, clientEmail, clientPhone, items, totalAmount, discount, tax, netAmount, deliveryDate, notes, stockStatus } = req.body;
+    const { orderReference, clientAddress, clientEmail, clientPhone, items, totalAmount, discount, tax, netAmount, deliveryDate, notes, stockStatus, suggestedFileType } = req.body;
 
     // Check overdue balance of customer
     const overdueInfo = await calculateCustomerOverdue(file.customerName);
@@ -1390,6 +1398,7 @@ const convertProductFileToSalesOrder = async (req, res) => {
       salePerson: req.user.fullName,
       fileNo: file.fileNumber || '',
       fileType: file.fileType || '',
+      suggestedFileType: ['Green', 'Blue'].includes(suggestedFileType) ? suggestedFileType : '',
       productSummary: orderItems.map(i => i.description).filter(Boolean).join(', ') || 'Standard Order Items',
       clientEmail: clientEmail || (quoteRef ? quoteRef.clientEmail : '') || '',
       clientPhone: clientPhone || (quoteRef ? quoteRef.clientPhone : '') || '',
@@ -1515,7 +1524,7 @@ const convertQuotationToSalesOrder = async (req, res) => {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
 
-    const { deliveryDate, notes, stockStatus } = req.body;
+    const { deliveryDate, notes, stockStatus, suggestedFileType } = req.body;
 
     // Check overdue balance of customer using finalized invoices only
     const overdueInfo = await calculateCustomerOverdue(quotation.clientName);
@@ -1529,6 +1538,7 @@ const convertQuotationToSalesOrder = async (req, res) => {
       salePerson: quotation.salePerson || req.user.fullName,
       fileNo: quotation.fileNo || '',
       fileType: quotation.fileType || '',
+      suggestedFileType: ['Green', 'Blue'].includes(suggestedFileType) ? suggestedFileType : '',
       productSummary: quotation.productSummary || '',
       clientEmail: quotation.clientEmail || '',
       clientPhone: quotation.clientPhone || '',
@@ -1694,7 +1704,6 @@ const createMyQuotation = async (req, res) => {
     const {
       orderReference,
       clientName,
-      fileType,
       productSummary,
       clientEmail,
       clientPhone,
@@ -1715,14 +1724,14 @@ const createMyQuotation = async (req, res) => {
 
     if (!clientName) return res.status(400).json({ success: false, message: 'Customer/Client name is required.' });
     const issuingCompany = getCompanySnapshot(issuingCompanyCode, DOCUMENT_TYPES.QUOTATION);
-    const assignedFileNumber = await allocateFileNumber(fileType);
+    const assignedFileNumber = await allocateFileNumber();
 
     const quotation = await Quotation.create({
       orderReference: orderReference?.trim() || '',
       clientName: clientName.trim(),
       salePerson: req.user.fullName || '',
       fileNo: assignedFileNumber,
-      fileType,
+      fileType: '',
       productSummary: productSummary?.trim() || '',
       clientEmail: clientEmail?.trim() || '',
       clientPhone: clientPhone?.trim() || '',
@@ -1969,6 +1978,7 @@ const createMyOrder = async (req, res) => {
       clientAddress,
       salePerson,
       fileType,
+      suggestedFileType,
       productSummary,
       clientEmail,
       clientPhone,
@@ -2006,8 +2016,8 @@ const createMyOrder = async (req, res) => {
       ? quotationId
       : (linkedProductFile?.quotationId || customerPO.quotationId || null);
     const linkedQuotation = linkedQuotationId ? await Quotation.findById(linkedQuotationId) : null;
-    const resolvedFileType = linkedProductFile?.fileType || linkedQuotation?.fileType || customerPO.fileType || fileType;
-    const resolvedFileNumber = linkedProductFile?.fileNumber || linkedQuotation?.fileNo || customerPO.fileNumber || await allocateFileNumber(resolvedFileType);
+    const resolvedFileType = linkedProductFile?.fileType || linkedQuotation?.fileType || customerPO.fileType || '';
+    const resolvedFileNumber = linkedProductFile?.fileNumber || linkedQuotation?.fileNo || customerPO.fileNumber || await allocateFileNumber();
 
     // Check customer overdue balance
     const overdueInfo = await calculateCustomerOverdue(clientName);
@@ -2021,6 +2031,7 @@ const createMyOrder = async (req, res) => {
       salePerson: salePerson?.trim() || req.user.fullName || '',
       fileNo: resolvedFileNumber,
       fileType: resolvedFileType,
+      suggestedFileType: ['Green', 'Blue'].includes(suggestedFileType) ? suggestedFileType : (['Green', 'Blue'].includes(fileType) ? fileType : ''),
       productSummary: productSummary?.trim() || '',
       clientEmail: clientEmail?.trim() || '',
       clientPhone: clientPhone?.trim() || '',
@@ -2176,109 +2187,87 @@ const financeReviewSalesOrder = async (req, res) => {
         data: order
       });
     } else if (action === 'approve' || action === 'clear') {
-      // Flowchart: Overdue? NO / All Clear -> File Type? -> Green vs Blue
-      order.isOverdueBlocked = false;
-      order.overdueBlockReason = '';
-      order.requiresFinanceApproval = false;
-      order.financeApprovedBy = req.user._id;
-      order.financeApprovedByName = req.user.fullName;
-      order.financeApprovedAt = new Date();
-
-      // Resolve file type: must be 'Green' or 'Blue'
-      const resolvedFileType = fileTypeChoice === 'Blue' || fileTypeChoice === 'Green'
-        ? fileTypeChoice
-        : (order.fileType === 'Blue' ? 'Blue' : 'Green');
-      order.fileType = resolvedFileType;
-      order.fileNo = withFileColour(order.fileNo, resolvedFileType);
-
-      const isBlue = resolvedFileType === 'Blue';
-
-      if (isBlue) {
-        // BLUE FILE FLOW: Routes to Global Purchaser Portal!
-        order.workflowStatus = 'Pending Global Procurement';
-        order.status = 'Pending Global Procurement';
-        order.departmentResponsible = 'Global Purchaser';
-        order.currentDepartment = 'Global Purchaser';
-        order.currentStatus = 'BLUE_FILE_GLOBAL_PURCHASER';
-        order.previousDepartment = 'Finance';
-        order.previousStatus = 'Pending Finance Overdue Check';
-        order.lastAction = 'Finance Approved — Blue File (Routed to Global Purchaser)';
-        order.lastActionBy = req.user._id;
-        order.lastActionByName = req.user.fullName;
-        order.lastActionAt = new Date();
-
-        order.workflowHistory.push({
-          user: req.user._id,
-          userName: req.user.fullName,
-          department: 'Finance',
-          action: 'Finance Approved — Blue File (Routed to Global Purchaser)',
-          previousStatus: 'Pending Finance Overdue Check',
-          newStatus: 'Pending Global Procurement',
-          timestamp: new Date(),
-          notes: `Finance verified overdue clear. Blue File order ${order.orderNumber || order.orderReference} routed to Global Purchaser for International PO creation.`
-        });
-
-        // Notify Global Purchaser
-        await notifyRoleHelper(['purchaser', 'admin', 'ceo'], {
-          type: 'order',
-          title: 'New Blue File Order for Global Purchaser',
-          message: `Blue File Sales Order ${order.orderNumber || order.orderReference} is ready for Global Procurement & Supplier PO creation.`,
-          link: '/purchaser/supplier_pos',
-          sender: req.user._id
-        });
-      } else {
-        // GREEN FILE FLOW: Routes to Local Purchaser Portal for Inventory Check!
-        order.workflowStatus = 'Pending Local Procurement';
-        order.status = 'Pending Local Procurement';
-        order.departmentResponsible = 'Local Purchaser';
-        order.currentDepartment = 'Local Purchaser';
-        order.currentStatus = 'GREEN_FILE_LOCAL_PURCHASER';
-        order.previousDepartment = 'Finance';
-        order.previousStatus = 'Pending Finance Overdue Check';
-        order.lastAction = 'Finance Approved — Green File (Routed to Local Purchaser)';
-        order.lastActionBy = req.user._id;
-        order.lastActionByName = req.user.fullName;
-        order.lastActionAt = new Date();
-        order.inventoryCheckStatus = 'Not Checked';
-
-        order.workflowHistory.push({
-          user: req.user._id,
-          userName: req.user.fullName,
-          department: 'Finance',
-          action: 'Finance Approved — Green File (Routed to Local Purchaser)',
-          previousStatus: 'Pending Finance Overdue Check',
-          newStatus: 'Pending Local Procurement',
-          timestamp: new Date(),
-          notes: `Finance verified overdue clear. Green File order ${order.orderNumber || order.orderReference} routed to Local Purchaser for Inventory Check.`
-        });
-
-        // Notify Local Purchaser
-        await notifyRoleHelper(['purchaser', 'admin', 'ceo'], {
-          type: 'order',
-          title: 'New Green File Order for Local Purchaser',
-          message: `Green File Sales Order ${order.orderNumber || order.orderReference} is ready for Local Procurement Inventory Check.`,
-          link: '/purchaser/dashboard',
-          sender: req.user._id
+      if (!['Green', 'Blue'].includes(fileTypeChoice)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Finance must explicitly select Green or Blue before approving the Sales Order.'
         });
       }
 
-      await order.save();
-      await updateLinkedFileColour(order, resolvedFileType);
+      const resolvedFileType = fileTypeChoice;
+      const isBlue = resolvedFileType === 'Blue';
+      const session = await mongoose.startSession();
+      let approvedOrder;
+      let linkWarnings = [];
+      try {
+        await session.withTransaction(async () => {
+          const transactionalOrder = await SalesOrder.findById(req.params.id).session(session);
+          if (!transactionalOrder) throw createHttpError(404, 'Sales order not found.');
+
+          transactionalOrder.isOverdueBlocked = false;
+          transactionalOrder.overdueBlockReason = '';
+          transactionalOrder.requiresFinanceApproval = false;
+          transactionalOrder.financeApprovedBy = req.user._id;
+          transactionalOrder.financeApprovedByName = req.user.fullName;
+          transactionalOrder.financeApprovedAt = new Date();
+          transactionalOrder.fileType = resolvedFileType;
+          transactionalOrder.fileNo = withFileColour(transactionalOrder.fileNo, resolvedFileType);
+          transactionalOrder.workflowStatus = isBlue ? 'Pending Global Procurement' : 'Pending Local Procurement';
+          transactionalOrder.status = transactionalOrder.workflowStatus;
+          transactionalOrder.departmentResponsible = isBlue ? 'Global Purchaser' : 'Local Purchaser';
+          transactionalOrder.currentDepartment = transactionalOrder.departmentResponsible;
+          transactionalOrder.currentStatus = isBlue ? 'BLUE_FILE_GLOBAL_PURCHASER' : 'GREEN_FILE_LOCAL_PURCHASER';
+          transactionalOrder.previousDepartment = 'Finance';
+          transactionalOrder.previousStatus = 'Pending Finance Overdue Check';
+          transactionalOrder.lastAction = `Finance Approved — ${resolvedFileType} File (Routed to ${transactionalOrder.departmentResponsible})`;
+          transactionalOrder.lastActionBy = req.user._id;
+          transactionalOrder.lastActionByName = req.user.fullName;
+          transactionalOrder.lastActionAt = new Date();
+          if (!isBlue) transactionalOrder.inventoryCheckStatus = 'Not Checked';
+
+          transactionalOrder.workflowHistory.push({
+            user: req.user._id,
+            userName: req.user.fullName,
+            department: 'Finance',
+            action: transactionalOrder.lastAction,
+            previousStatus: 'Pending Finance Overdue Check',
+            newStatus: transactionalOrder.workflowStatus,
+            timestamp: new Date(),
+            notes: `Finance explicitly approved ${resolvedFileType} File order ${transactionalOrder.orderNumber || transactionalOrder.orderReference} and routed it to ${transactionalOrder.departmentResponsible}.`
+          });
+
+          await transactionalOrder.save({ session });
+          linkWarnings = await updateLinkedFileColour(transactionalOrder, resolvedFileType, session);
+          approvedOrder = transactionalOrder;
+        });
+      } finally {
+        await session.endSession();
+      }
+
+      const finalizedOrder = approvedOrder;
+
+      await notifyRoleHelper(['purchaser', 'admin', 'ceo'], {
+        type: 'order',
+        title: `New ${resolvedFileType} File Order for ${isBlue ? 'Global' : 'Local'} Purchaser`,
+        message: `${resolvedFileType} File Sales Order ${finalizedOrder.orderNumber || finalizedOrder.orderReference} is ready for ${isBlue ? 'Global Procurement & Supplier PO creation' : 'Local Procurement Inventory Check'}.`,
+        link: isBlue ? '/purchaser/supplier_pos' : '/purchaser/dashboard',
+        sender: req.user._id
+      });
 
       await logSalesActivity({
-        type: `Finance Approved (${resolvedFileType} File)`,
-        description: `Sales Order ${order.orderNumber || order.orderReference} verified All Clear by Finance (${req.user.fullName}) - ${resolvedFileType} File routed to ${isBlue ? 'Global Purchaser' : 'Local Purchaser'}`,
+        type: 'Sales Order Updated',
+        description: `Sales Order ${finalizedOrder.orderNumber || finalizedOrder.orderReference} verified All Clear by Finance (${req.user.fullName}) - ${resolvedFileType} File routed to ${isBlue ? 'Global Purchaser' : 'Local Purchaser'}`,
         relatedModel: 'SalesOrder',
-        relatedId: order._id,
+        relatedId: finalizedOrder._id,
         performedBy: req.user._id
       });
 
-      if (order.salesPerson || order.createdBy) {
+      if (finalizedOrder.salesPerson || finalizedOrder.createdBy) {
         await createNotificationHelper({
-          recipient: order.salesPerson || order.createdBy,
+          recipient: finalizedOrder.salesPerson || finalizedOrder.createdBy,
           sender: req.user._id,
           title: `Sales Order Approved: ${resolvedFileType} File`,
-          message: `Finance approved Sales Order ${order.orderNumber || order.orderReference} (${resolvedFileType} File). Routed to ${isBlue ? 'Global Purchaser' : 'Local Purchaser'} for Supplier PO creation.`,
+          message: `Finance approved Sales Order ${finalizedOrder.orderNumber || finalizedOrder.orderReference} (${resolvedFileType} File). Routed to ${isBlue ? 'Global Purchaser' : 'Local Purchaser'} for Supplier PO creation.`,
           type: 'finance',
           link: '/employee/sales/orders'
         });
@@ -2286,8 +2275,9 @@ const financeReviewSalesOrder = async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        message: `Sales Order approved as ${resolvedFileType} File! Routed to ${isBlue ? 'Global Purchaser Portal' : 'Local Purchaser Portal'}.`,
-        data: order
+        message: `Sales Order approved as ${resolvedFileType} File! Routed to ${isBlue ? 'Global Purchaser Portal' : 'Local Purchaser Portal'}.${linkWarnings.length ? ` Linked-record warnings: ${linkWarnings.join(' ')}` : ''}`,
+        data: finalizedOrder,
+        linkWarnings
       });
     } else if (action === 'reject') {
       order.workflowStatus = 'Finance Rejected';
@@ -2376,7 +2366,7 @@ const financeReviewSalesOrder = async (req, res) => {
     });
   } catch (error) {
     console.error('[Finance Review Order Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error reviewing sales order.' });
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error reviewing sales order.' });
   }
 };
 
@@ -2394,7 +2384,7 @@ const updateMyOrder = async (req, res) => {
 
     const changes = {};
     const allowedFields = [
-      'orderReference', 'orderNumber', 'clientName', 'clientAddress', 'salePerson', 'fileType',
+      'orderReference', 'orderNumber', 'clientName', 'clientAddress', 'salePerson', 'suggestedFileType',
       'productSummary', 'clientEmail', 'clientPhone', 'items', 'totalAmount', 'discount',
       'tax', 'netAmount', 'status', 'deliveryDate', 'creationDate', 'notes',
       'stockStatus', 'deliveryStatus', 'invoiceStatus', 'invoiceNumber',
@@ -3688,7 +3678,7 @@ const getMyProductFiles = async (req, res) => {
 
 const createMyProductFile = async (req, res) => {
   try {
-    const { fileType, customerName, quotationId, quotationNumber, customerPOId, customerPONumber, salesOrderId, salesOrderNumber, products, notes } = req.body;
+    const { customerName, quotationId, quotationNumber, customerPOId, customerPONumber, salesOrderId, salesOrderNumber, products, notes } = req.body;
     if (!customerName) return res.status(400).json({ success: false, message: 'Customer name is required.' });
 
     const safeQuotationId = quotationId && mongoose.Types.ObjectId.isValid(quotationId) ? quotationId : null;
@@ -3701,8 +3691,8 @@ const createMyProductFile = async (req, res) => {
     }
     const linkedQuotationId = safeQuotationId || customerPO.quotationId || null;
     const linkedQuotation = linkedQuotationId ? await Quotation.findById(linkedQuotationId) : null;
-    const resolvedFileType = customerPO.fileType || linkedQuotation?.fileType || fileType;
-    const resolvedFileNumber = customerPO.fileNumber || linkedQuotation?.fileNo || await allocateFileNumber(resolvedFileType);
+    const resolvedFileType = customerPO.fileType || linkedQuotation?.fileType || '';
+    const resolvedFileNumber = customerPO.fileNumber || linkedQuotation?.fileNo || await allocateFileNumber();
 
     const pf = await ProductFile.create({
       fileNumber: resolvedFileNumber,
@@ -3752,7 +3742,7 @@ const updateMyProductFile = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied. You can only edit your own product files.' });
     }
 
-    const allowedFields = ['fileType', 'customerName', 'quotationNumber', 'customerPONumber', 'salesOrderNumber', 'products', 'notes', 'status'];
+    const allowedFields = ['customerName', 'quotationNumber', 'customerPONumber', 'salesOrderNumber', 'products', 'notes', 'status'];
     allowedFields.forEach(field => { if (req.body[field] !== undefined) pf[field] = req.body[field]; });
 
     if (req.body.quotationId !== undefined) {
@@ -5022,6 +5012,9 @@ const issueSupplierPO = async (req, res) => {
     if (order.isOverdueBlocked) {
       return res.status(400).json({ success: false, message: 'Cannot issue Supplier PO: Order is on Finance HOLD.' });
     }
+    if (!['Green', 'Blue'].includes(order.fileType)) {
+      return res.status(409).json({ success: false, message: 'Finance must assign Green or Blue before a Supplier PO can be issued.' });
+    }
 
     const {
       poType,
@@ -6033,7 +6026,7 @@ const getOrderDocumentPackage = async (req, res) => {
       declarationType: order.goodsDeclarationDetails?.declarationType || 'Commercial Import & Customs Clearance',
       consignee: order.clientName,
       consignor: order.supplierPO?.supplierName || 'Fortline Approved Global Vendor',
-      fileType: order.fileType || 'Green',
+      fileType: order.fileType || '',
       totalValuePKR: order.netAmount || order.totalAmount || 0
     };
 

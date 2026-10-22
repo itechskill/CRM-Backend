@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const ProductFileSchema = new mongoose.Schema(
   {
     fileNumber: { type: String, trim: true, default: '' },
-    fileType: { type: String, enum: ['Blue', 'Green', 'Yellow'], default: 'Blue' },
+    fileType: { type: String, enum: ['Blue', 'Green', 'Yellow', ''], default: '' },
     customerName: { type: String, required: [true, 'Customer name is required'], trim: true },
     quotationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quotation', default: null },
     quotationNumber: { type: String, trim: true, default: '' },
