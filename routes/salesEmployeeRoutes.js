@@ -83,6 +83,7 @@ const {
 // All Departmental Roles, Admin & CEO access departmental CRM endpoints
 const salesEmployeeGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'logistics', 'purchaser', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
 const supportInventoryGuard = [protect, authorize('support', 'admin', 'ceo')];
+const financeReviewGuard = [protect, authorize('finance', 'admin', 'ceo')];
 
 // Dashboard stats
 router.get('/stats', salesEmployeeGuard, getMySalesStats);
@@ -131,7 +132,7 @@ router.get('/orders/:id/receiving-preview', supportInventoryGuard, getGoodsRecei
 router.post('/orders', salesEmployeeGuard, createMyOrder);
 router.post('/orders/:id/send-to-support', salesEmployeeGuard, sendOrderToSupport);
 router.post('/orders/:id/send-to-finance', salesEmployeeGuard, sendSalesOrderToFinance);
-router.post('/orders/:id/finance-review', salesEmployeeGuard, financeReviewSalesOrder);
+router.post('/orders/:id/finance-review', financeReviewGuard, financeReviewSalesOrder);
 router.post('/orders/:id/goods-received', supportInventoryGuard, recordGoodsReceivedInOffice);
 router.post('/orders/:id/bl-input', supportInventoryGuard, recordBLInput);
 router.post('/orders/:id/issue-supplier-po', salesEmployeeGuard, issueSupplierPO);

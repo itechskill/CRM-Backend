@@ -1202,6 +1202,7 @@ exports.getPurchaserDashboardStats = async (req, res) => {
       LocalPayable.find(),
       ProductFile.find(),
       SalesOrder.countDocuments({
+        fileType: subDept === 'Global' ? 'Blue' : 'Green',
         $or: [
           { departmentResponsible: subDept === 'Global' ? 'Global Purchaser' : 'Local Purchaser' },
           { currentDepartment: subDept === 'Global' ? 'Global Purchaser' : 'Local Purchaser' },
@@ -1265,6 +1266,7 @@ exports.getPendingPurchaserOrders = async (req, res) => {
         };
 
     const orders = await SalesOrder.find({
+      fileType: subDept === 'Global' ? 'Blue' : 'Green',
       $or: [
         { departmentResponsible: deptRole },
         { currentDepartment: deptRole },

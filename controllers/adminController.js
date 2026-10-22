@@ -1592,7 +1592,7 @@ const getOrgDepartmentStats = async (req, res) => {
     const globalPurchaserUsers = users.filter(u => ((u.role === 'purchaser' && u.purchaserSubDept === 'Global') || (u.department && u.department.toLowerCase().includes('global'))));
 
     // --- LOCAL PURCHASER STATS ---
-    const localSupplierPOs = (supplierPOs || []).filter(p => p.supplierType === 'Local' || p.poType === 'Local' || !p.fileType || p.fileType !== 'Blue');
+    const localSupplierPOs = (supplierPOs || []).filter(p => p.supplierType === 'Local' || p.poType === 'Local' || p.fileType === 'Green');
     const totalLocalSpend = (localPayables || []).reduce((sum, p) => sum + (p.totalAmount || p.amount || 0), 0);
     const paidLocalPayables = (localPayables || []).filter(p => p.status === 'Paid').length;
     const pendingLocalPayables = (localPayables || []).filter(p => p.status !== 'Paid').length;
