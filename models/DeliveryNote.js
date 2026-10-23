@@ -28,9 +28,18 @@ const DeliveryNoteSchema = new mongoose.Schema(
         quantity: { type: Number, default: 1 },
         unit: { type: String, default: 'Units' },
         availability: { type: String, default: 'Available' },
-        totalOrderedQty: { type: Number, default: 0 }
+        totalOrderedQty: { type: Number, default: 0 },
+        orderItemId: { type: String, default: '' },
+        orderItemIndex: { type: Number, default: 0 },
+        inventoryItem: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
+        unitPrice: { type: Number, default: 0 },
+        lineTotal: { type: Number, default: 0 }
       }
     ],
+    subtotal: { type: Number, default: 0 },
+    discount: { type: Number, default: 0 },
+    tax: { type: Number, default: 0 },
+    grandTotal: { type: Number, default: 0 },
     status: {
       type: String,
       enum: ['Draft', 'Created', 'Waiting', 'Ready', 'Confirmed', 'Done', 'Cancelled', 'Returned', 'Pending', 'Dispatched', 'In Transit', 'Partially Delivered', 'Fully Delivered', 'Delivered'],
@@ -51,6 +60,7 @@ const DeliveryNoteSchema = new mongoose.Schema(
     signedDeliveryNoteUploadedByName: { type: String, default: '' },
     isPartial: { type: Boolean, default: false },
     isStockDeducted: { type: Boolean, default: false },
+    stockDeductionClaimedAt: { type: Date, default: null },
     invoiced: { type: Boolean, default: false },
     invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
     invoiceNumber: { type: String, default: '' },
@@ -67,6 +77,33 @@ DeliveryNoteSchema.pre('save', async function () {
     const num = await allocateDeliveryNoteNumber(this.$session());
     this.deliveryNumber = num;
     this.deliveryNoteNumber = num;
+  }
+  if (this.salesOrder && (this.isNew || this.isModified('items'))) {
+    // Prices are commercial Sales Order data. Never trust Delivery Note callers
+    // to create or update their own unit prices or totals.
+    const SalesOrder = require('./SalesOrder');
+    const order = await SalesOrder.findById(this.salesOrder).session(this.$session() || null);
+    if (order) {
+      this.items.forEach((deliveryItem, deliveryIndex) => {
+        const sourceItem = order.items.find(item =>
+          deliveryItem.orderItemId && String(item._id) === String(deliveryItem.orderItemId)
+        ) || order.items[Number(deliveryItem.orderItemIndex)] || order.items[deliveryIndex];
+        const unitPrice = Number(sourceItem?.unitPrice) || 0;
+        deliveryItem.unitPrice = unitPrice;
+        deliveryItem.lineTotal = (Number(deliveryItem.quantity) || Number(deliveryItem.demand) || 0) * unitPrice;
+      });
+
+      const subtotal = this.items.reduce((sum, item) => sum + (Number(item.lineTotal) || 0), 0);
+      const orderSubtotal = (order.items || []).reduce(
+        (sum, item) => sum + (Number(item.total) || ((Number(item.quantity) || 1) * (Number(item.unitPrice) || 0))),
+        0
+      );
+      const priceRatio = orderSubtotal > 0 ? Math.min(1, subtotal / orderSubtotal) : 1;
+      this.subtotal = subtotal;
+      this.discount = Math.round((Number(order.discount) || 0) * priceRatio * 100) / 100;
+      this.tax = Math.round((Number(order.tax) || 0) * priceRatio * 100) / 100;
+      this.grandTotal = Math.round((subtotal - this.discount + this.tax) * 100) / 100;
+    }
   }
   if (!this.sourceDocument && this.salesOrderNumber) {
     this.sourceDocument = this.salesOrderNumber;

@@ -18,6 +18,8 @@ const SalesOrderSchema = new mongoose.Schema(
     items: [
       {
         description: { type: String, default: '' },
+        sku: { type: String, default: '' },
+        productCode: { type: String, default: '' },
         quantity: { type: Number, default: 1 },
         unitPrice: { type: Number, default: 0 },
         total: { type: Number, default: 0 }
@@ -244,6 +246,30 @@ const SalesOrderSchema = new mongoose.Schema(
         availableQty: { type: Number, default: 0 },
         shortageQty: { type: Number, default: 0 },
         status: { type: String, default: 'Pending' }
+      }
+    ],
+    inventoryReservations: [
+      {
+        orderItemId: { type: String, default: '' },
+        itemIndex: { type: Number, default: 0 },
+        inventoryItem: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', required: true },
+        inventoryName: { type: String, default: '' },
+        quantity: { type: Number, default: 0, min: 0 },
+        remainingQuantity: { type: Number, default: 0, min: 0 },
+        deliveredQuantity: { type: Number, default: 0, min: 0 },
+        releasedQuantity: { type: Number, default: 0, min: 0 },
+        status: {
+          type: String,
+          enum: ['Reserved', 'Partially Fulfilled', 'Fulfilled', 'Released'],
+          default: 'Reserved'
+        },
+        reservedAt: { type: Date, default: Date.now },
+        reservedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+        reservedByName: { type: String, default: '' },
+        releasedAt: { type: Date, default: null },
+        releasedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+        releasedByName: { type: String, default: '' },
+        releaseReason: { type: String, default: '' }
       }
     ],
     workflowHistory: [
