@@ -47,6 +47,8 @@ const {
   releaseOrderReservations,
   releaseDeliveryNoteReservations
 } = require('../utils/inventoryReservations');
+const { appendExpenseLines } = require('../utils/purchaseExpenses');
+const { ensureCategoryAvailable } = require('./purchaseExpenseController');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -5371,6 +5373,23 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         createdBy: req.user._id,
         createdByName: req.user.fullName
       }], { session });
+
+      const submittedExpenses = Array.isArray(req.body.expenses) ? req.body.expenses : [];
+      if (submittedExpenses.length && !supplierPO) {
+        throw createHttpError(409, 'Expenses cannot be recorded because this order is not linked to a Supplier PO.');
+      }
+      if (submittedExpenses.length) {
+        for (const expense of submittedExpenses) {
+          expense.category = await ensureCategoryAvailable(expense.category, req.user, session);
+        }
+        await appendExpenseLines({
+          po: supplierPO,
+          inputs: submittedExpenses,
+          user: req.user,
+          grn: createdGrns[0],
+          session
+        });
+      }
 
       if (order.fileType === 'Green' && supplierPO) {
         const payable = await LocalPayable.findOne({
