@@ -24,6 +24,15 @@ const JobApplication = require('../models/JobApplication');
 const AuditLog = require('../models/AuditLog');
 const { createNotificationHelper } = require('./notificationController');
 const logAudit = require('../utils/auditLogger');
+const { ownerScope } = require('../utils/salesOwnership');
+
+const ownersScope = (userIds) => ({
+  $or: [
+    { owner: { $in: userIds } },
+    { owner: { $exists: false }, createdBy: { $in: userIds } },
+    { owner: null, createdBy: { $in: userIds } }
+  ]
+});
 
 /**
  * @desc    Get all registration requests (Admin only)
@@ -1116,6 +1125,28 @@ const updateUserDepartment = async (req, res) => {
   }
 };
 
+const updateUserSalesPermissions = async (req, res) => {
+  try {
+    if (typeof req.body.canForwardQuotations !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'canForwardQuotations must be true or false.' });
+    }
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    user.canForwardQuotations = req.body.canForwardQuotations;
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message: `Quotation forwarding permission ${user.canForwardQuotations ? 'enabled' : 'disabled'} for ${user.fullName}.`,
+      data: user.toJSON()
+    });
+  } catch (error) {
+    console.error('[Update User Sales Permissions Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating Sales permissions.' });
+  }
+};
+
 /**
  * @desc    Get Centralized Employee/User Directory (Admin & CEO)
  * @route   GET /api/admin/directory
@@ -1233,9 +1264,7 @@ const getOrgUsers = async (req, res) => {
 
     // Batch aggregate user performance data
     const [salesOrders, deliveryNotes, invoices, tasks] = await Promise.all([
-      SalesOrder.find({
-        $or: [{ createdBy: { $in: userIds } }, { salesPerson: { $in: userIds } }]
-      }).select('createdBy salesPerson status deliveryStatus invoiceStatus paymentStatus netAmount totalAmount createdAt').lean(),
+      SalesOrder.find(ownersScope(userIds)).select('owner createdBy salesPerson status deliveryStatus invoiceStatus paymentStatus netAmount totalAmount createdAt').lean(),
       DeliveryNote.find({ createdBy: { $in: userIds } }).select('createdBy status createdAt').lean(),
       Invoice.find({
         $or: [{ createdBy: { $in: userIds } }, { finalizedBy: { $in: userIds } }, { salesPerson: { $in: userIds } }]
@@ -1259,10 +1288,7 @@ const getOrgUsers = async (req, res) => {
       let revenue = 0;
 
       if (isSales) {
-        const myOrders = salesOrders.filter(o => 
-          (o.createdBy && o.createdBy.toString() === uidStr) || 
-          (o.salesPerson && o.salesPerson.toString() === uidStr)
-        );
+        const myOrders = salesOrders.filter(o => (o.owner || o.createdBy)?.toString() === uidStr);
         totalItems = myOrders.length;
         completedItems = myOrders.filter(o => ['Delivered', 'Done', 'Invoiced', 'Paid'].includes(o.deliveryStatus) || o.paymentStatus === 'Paid' || o.invoiceStatus === 'Invoiced').length;
         revenue = myOrders.reduce((sum, o) => sum + (o.netAmount || o.totalAmount || 0), 0);
@@ -1345,10 +1371,10 @@ const getOrgUserPerformance = async (req, res) => {
       allProjects,
       allPayments
     ] = await Promise.all([
-      SalesOrder.find({ $or: [{ createdBy: userId }, { salesPerson: userId }] }).sort({ createdAt: -1 }).lean(),
-      Lead.find({ $or: [{ createdBy: userId }, { assignedTo: userId }] }).sort({ createdAt: -1 }).lean(),
-      Deal.find({ $or: [{ createdBy: userId }, { assignedTo: userId }] }).sort({ createdAt: -1 }).lean(),
-      Quotation.find({ createdBy: userId }).sort({ createdAt: -1 }).lean(),
+      SalesOrder.find(ownerScope(userId)).sort({ createdAt: -1 }).lean(),
+      Lead.find(ownerScope(userId)).sort({ createdAt: -1 }).lean(),
+      Deal.find(ownerScope(userId)).sort({ createdAt: -1 }).lean(),
+      Quotation.find(ownerScope(userId)).sort({ createdAt: -1 }).lean(),
       Task.find({ $or: [{ assignedTo: userId }, { createdBy: userId }] }).sort({ createdAt: -1 }).lean(),
       Leave.find({ user: userId }).sort({ createdAt: -1 }).lean(),
       Attendance.find({ user: userId }).sort({ date: -1 }).lean(),
@@ -1880,10 +1906,7 @@ const getOrgMonthlyPerformance = async (req, res) => {
       let revenue = 0;
 
       if (isSales) {
-        const uOrders = curOrders.filter(o => 
-          (o.createdBy && o.createdBy.toString() === uidStr) || 
-          (o.salesPerson && o.salesPerson.toString() === uidStr)
-        );
+        const uOrders = curOrders.filter(o => (o.owner || o.createdBy)?.toString() === uidStr);
         items = uOrders.length;
         completed = uOrders.filter(o => ['Delivered', 'Done', 'Invoiced', 'Paid'].includes(o.deliveryStatus) || o.paymentStatus === 'Paid').length;
         revenue = uOrders.reduce((s, o) => s + (o.netAmount || o.totalAmount || 0), 0);
@@ -1954,6 +1977,7 @@ module.exports = {
   updateUserRole,
   updateUserStatus,
   updateUserDepartment,
+  updateUserSalesPermissions,
   deleteUser,
   createCeoAccount,
   getExecutiveSummary,

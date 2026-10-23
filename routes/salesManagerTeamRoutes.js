@@ -39,6 +39,15 @@ const Task = require('../models/Task');
 const User = require('../models/User');
 const logAudit = require('../utils/auditLogger');
 const { getSalesManagerScope, inferBranchOrCity } = require('../utils/salesManagerScope');
+const { ownerScope } = require('../utils/salesOwnership');
+
+const ownersScope = (memberIds) => ({
+  $or: [
+    { owner: { $in: memberIds } },
+    { owner: { $exists: false }, createdBy: { $in: memberIds } },
+    { owner: null, createdBy: { $in: memberIds } }
+  ]
+});
 
 // ── GET SALES MANAGER DASHBOARD STATS (Aggregated Real MongoDB Data) ───────────
 router.get('/dashboard-stats', managerGuard, async (req, res) => {
@@ -70,22 +79,11 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
       userQuery._id = { $in: managedMemberObjectIds };
 
       const memberIds = scope.memberIds;
-      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
-
-      leadQuery = { $or: [{ assignedTo: { $in: memberIds } }, { createdBy: { $in: memberIds } }] };
-      dealQuery = { $or: [{ assignedTo: { $in: memberIds } }, { createdBy: { $in: memberIds } }] };
-
-      const salesDocOr = [
-        { createdBy: { $in: memberIds } },
-        { salesPerson: { $in: memberIds } }
-      ];
-      if (nameRegexes.length > 0) {
-        salesDocOr.push({ salePerson: { $in: nameRegexes } });
-      }
-
-      quoQuery = { $or: salesDocOr };
-      orderQuery = { $or: salesDocOr };
-      invQuery = { $or: salesDocOr };
+      leadQuery = ownersScope(memberIds);
+      dealQuery = ownersScope(memberIds);
+      quoQuery = ownersScope(memberIds);
+      orderQuery = ownersScope(memberIds);
+      invQuery = { $or: [{ createdBy: { $in: memberIds } }, { salesPerson: { $in: memberIds } }] };
       targetQuery = { employee: { $in: memberIds } };
       actQuery = { performedBy: { $in: memberIds } };
       taskQuery = {
@@ -614,6 +612,7 @@ router.post('/assign-lead', managerGuard, async (req, res) => {
       lead = await Lead.findById(leadId);
       if (!lead) return res.status(404).json({ success: false, message: 'Lead not found.' });
       lead.assignedTo = employeeId;
+      lead.owner = employeeId;
       await lead.save();
     } else {
       if (!name) return res.status(400).json({ success: false, message: 'Lead name is required.' });
@@ -627,6 +626,7 @@ router.post('/assign-lead', managerGuard, async (req, res) => {
         source: source || 'Assigned by Manager',
         notes: notes || '',
         assignedTo: employeeId,
+        owner: employeeId,
         createdBy: req.user._id
       });
     }
@@ -855,27 +855,18 @@ router.get('/invoices', managerGuard, async (req, res) => {
     const conditions = [];
 
     if (!scope.isGlobal) {
-      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
-      const teamScopeConditions = [
-        { createdBy: { $in: scope.memberIds } },
-        { salesPerson: { $in: scope.memberIds } }
-      ];
-      if (nameRegexes.length > 0) {
-        teamScopeConditions.push({ salePerson: { $in: nameRegexes } });
-      }
-
       if (employeeId && employeeId !== 'all') {
         const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
         if (!isMember) {
           return res.status(200).json({ success: true, count: 0, data: [] });
         }
-        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+        conditions.push(ownerScope(employeeId));
       } else {
-        conditions.push({ $or: teamScopeConditions });
+        conditions.push(ownersScope(scope.memberIds));
       }
     } else {
       if (employeeId && employeeId !== 'all') {
-        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+        conditions.push(ownerScope(employeeId));
       }
     }
 
@@ -1158,27 +1149,18 @@ router.get('/all-orders', managerGuard, async (req, res) => {
     const conditions = [];
 
     if (!scope.isGlobal) {
-      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
-      const teamScopeConditions = [
-        { createdBy: { $in: scope.memberIds } },
-        { salesPerson: { $in: scope.memberIds } }
-      ];
-      if (nameRegexes.length > 0) {
-        teamScopeConditions.push({ salePerson: { $in: nameRegexes } });
-      }
-
       if (employeeId && employeeId !== 'all') {
         const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
         if (!isMember) {
           return res.status(200).json({ success: true, count: 0, data: [] });
         }
-        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+        conditions.push(ownerScope(employeeId));
       } else {
-        conditions.push({ $or: teamScopeConditions });
+        conditions.push(ownersScope(scope.memberIds));
       }
     } else {
       if (employeeId && employeeId !== 'all') {
-        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+        conditions.push(ownerScope(employeeId));
       }
     }
 
@@ -1231,15 +1213,13 @@ router.get('/all-customer-pos', managerGuard, async (req, res) => {
       if (employeeId && employeeId !== 'all') {
         const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
         if (!isMember) return res.status(200).json({ success: true, count: 0, data: [] });
-        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+        conditions.push(ownerScope(employeeId));
       } else {
-        conditions.push({
-          $or: [{ createdBy: { $in: scope.memberIds } }, { salesPerson: { $in: scope.memberIds } }]
-        });
+        conditions.push(ownersScope(scope.memberIds));
       }
     } else {
       if (employeeId && employeeId !== 'all') {
-        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
+        conditions.push(ownerScope(employeeId));
       }
     }
 
@@ -1272,12 +1252,12 @@ router.get('/all-product-files', managerGuard, async (req, res) => {
       if (employeeId && employeeId !== 'all') {
         const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
         if (!isMember) return res.status(200).json({ success: true, count: 0, data: [] });
-        conditions.push({ createdBy: employeeId });
+        conditions.push(ownerScope(employeeId));
       } else {
-        conditions.push({ createdBy: { $in: scope.memberIds } });
+        conditions.push(ownersScope(scope.memberIds));
       }
     } else {
-      if (employeeId && employeeId !== 'all') conditions.push({ createdBy: employeeId });
+      if (employeeId && employeeId !== 'all') conditions.push(ownerScope(employeeId));
     }
 
     if (fileType && fileType !== 'all') conditions.push({ fileType });

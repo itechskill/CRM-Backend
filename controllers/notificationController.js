@@ -4,18 +4,20 @@ const User = require('../models/User');
 /**
  * Helper to create a single or multiple notifications
  */
-const createNotificationHelper = async ({ recipient, sender, title, message, type = 'system', link = '' }) => {
+const createNotificationHelper = async ({ recipient, sender, title, message, type = 'system', link = '', data = null, session = null }) => {
   try {
     if (!recipient) return null;
-    return await Notification.create({
+    const [notification] = await Notification.create([{
       recipient,
       sender: sender || null,
       title,
       message,
       type,
       link,
+      data,
       isRead: false
-    });
+    }], session ? { session } : undefined);
+    return notification;
   } catch (err) {
     console.error('[Create Notification Helper Error]:', err);
     return null;
