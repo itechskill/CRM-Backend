@@ -29,6 +29,15 @@ const {
   createOrUpdatePurchaserInventory,
   deletePurchaserInventoryItem
 } = require('../controllers/purchaserController');
+const {
+  listExpenseCategories,
+  createExpenseCategory,
+  updateExpenseCategory,
+  getSupplierPOExpenses,
+  addSupplierPOExpense,
+  updateSupplierPOExpense,
+  removeSupplierPOExpense
+} = require('../controllers/purchaseExpenseController');
 
 // All endpoints require authentication
 router.use(protect);
@@ -36,6 +45,8 @@ router.use(protect);
 const purchaserAccess = authorize('purchaser', 'admin', 'ceo');
 const inventoryManagementAccess = authorize('admin', 'ceo');
 const financialChargesAccess = authorize('finance', 'accountant', 'admin', 'ceo');
+const expenseReadAccess = authorize('support', 'finance', 'purchaser', 'admin', 'ceo');
+const expenseWriteAccess = authorize('support', 'finance', 'purchaser', 'admin');
 
 const requirePurchaserSubDept = (requiredSubDept) => (req, res, next) => {
   if (req.user.role === 'admin' || req.user.role === 'ceo') {
@@ -243,8 +254,15 @@ router.get('/suppliers', purchaserAccess, scopePurchaserList('supplier', ['suppl
 router.post('/suppliers', purchaserAccess, scopePurchaserBody(['supplierType', 'type'], 'supplierType'), createSupplier);
 
 // Supplier POs
-router.get('/pos', purchaserAccess, scopePurchaserList('po', ['poType', 'subType', 'type']), getSupplierPOs);
+router.get('/pos', expenseReadAccess, scopePurchaserList('po', ['poType', 'subType', 'type']), getSupplierPOs);
 router.post('/pos', purchaserAccess, scopePurchaserBody(['poType', 'subType', 'type'], 'poType'), createSupplierPO);
+router.get('/expense-categories', expenseReadAccess, listExpenseCategories);
+router.post('/expense-categories', expenseWriteAccess, createExpenseCategory);
+router.patch('/expense-categories/:key', authorize('admin'), updateExpenseCategory);
+router.get('/pos/:id/expenses', expenseReadAccess, getSupplierPOExpenses);
+router.post('/pos/:id/expenses', expenseWriteAccess, addSupplierPOExpense);
+router.patch('/pos/:id/expenses/:expenseId', expenseWriteAccess, updateSupplierPOExpense);
+router.delete('/pos/:id/expenses/:expenseId', expenseWriteAccess, removeSupplierPOExpense);
 router.patch('/pos/:id', purchaserAccess, requireSupplierPOOwnership, updateSupplierPO);
 router.put('/pos/:id', purchaserAccess, requireSupplierPOOwnership, updateSupplierPO);
 router.delete('/pos/:id', purchaserAccess, requireSupplierPOOwnership, deleteSupplierPO);
