@@ -253,6 +253,7 @@ const SalesOrderSchema = new mongoose.Schema(
         orderItemId: { type: String, default: '' },
         itemIndex: { type: Number, default: 0 },
         inventoryItem: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', required: true },
+        deliveryNote: { type: mongoose.Schema.Types.ObjectId, ref: 'DeliveryNote', default: null },
         inventoryName: { type: String, default: '' },
         quantity: { type: Number, default: 0, min: 0 },
         remainingQuantity: { type: Number, default: 0, min: 0 },
