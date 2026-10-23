@@ -23,6 +23,7 @@ const logisticsRoutes = require('./routes/logisticsRoutes');
 const purchaserRoutes = require('./routes/purchaserRoutes');
 const editPermissionRoutes = require('./routes/editPermissionRoutes');
 const priceRequestRoutes = require('./routes/priceRequestRoutes');
+const targetPerformanceRoutes = require('./routes/targetPerformanceRoutes');
 
 // Load environment variables
 dotenv.config();
@@ -108,6 +109,7 @@ app.use('/api/logistics', logisticsRoutes);
 app.use('/api/purchaser', purchaserRoutes);
 app.use('/api/edit-permissions', editPermissionRoutes);
 app.use('/api/price-requests', priceRequestRoutes);
+app.use('/api/target-performance', targetPerformanceRoutes);
 
 // Root Fallback Route
 app.get('/', (req, res) => {

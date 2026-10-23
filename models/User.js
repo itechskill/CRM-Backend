@@ -78,6 +78,15 @@ const userSchema = new mongoose.Schema(
       type: Number,
       default: 0
     },
+    monthlySalesSalaryCents: {
+      type: Number,
+      default: 0,
+      min: 0,
+      validate: {
+        validator: Number.isSafeInteger,
+        message: 'Monthly sales salary must be stored in integer cents'
+      }
+    },
     profileImage: {
       type: String,
       default: ''

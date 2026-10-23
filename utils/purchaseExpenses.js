@@ -127,7 +127,13 @@ const resolveSupplierPO = async (supplierPOOrSalesOrder, session = null) => {
 const totalCostPKR = async (supplierPOOrSalesOrder, options = {}) => {
   const po = await resolveSupplierPO(supplierPOOrSalesOrder, options.session);
   if (!po) return 0;
-  return centsToMoney(summarizeExpenses(po).landedCostPKRCents);
+  const summary = summarizeExpenses(po);
+  const currency = String(po.currency || 'PKR').trim().toUpperCase();
+  const exchangeRateToPKR = currency === 'PKR' ? 1 : Number(po.exchangeRateToPKR);
+  if (!Number.isFinite(exchangeRateToPKR) || exchangeRateToPKR <= 0) return null;
+  return centsToMoney(
+    Math.round(summary.purchaseTotalPKRCents * exchangeRateToPKR) + summary.totalExpensesPKRCents
+  );
 };
 
 const notifyAdminsOfExpense = async ({ po, expense, action, user, oldValues = null, newValues = null, session = null }) => {

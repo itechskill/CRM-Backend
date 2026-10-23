@@ -107,6 +107,7 @@ const SalesOrderSchema = new mongoose.Schema(
       vatAmount: { type: Number, default: 0 },
       total: { type: Number, default: 0 },
       currency: { type: String, default: 'PKR' },
+      exchangeRateToPKR: { type: Number, default: null },
       notes: { type: String, default: '' },
       issuingCompany: companySnapshotDefinition(),
       issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
