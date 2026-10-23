@@ -336,6 +336,46 @@ const createHttpError = (statusCode, message) => {
   return error;
 };
 
+const normalizeQuotationItems = ({ items, productSummary, totalAmount, netAmount }) => {
+  const sourceItems = Array.isArray(items) && items.length
+    ? items
+    : (productSummary ? [{ description: productSummary, quantity: 1, unitPrice: Number(totalAmount || netAmount || 0) }] : []);
+
+  return sourceItems.map(item => {
+    const quantity = Math.max(1, Number(item.quantity) || 1);
+    const unitPrice = Math.max(0, Number(item.unitPrice) || 0);
+    const inventoryItem = item.inventoryItem && mongoose.Types.ObjectId.isValid(item.inventoryItem)
+      ? item.inventoryItem
+      : null;
+    return {
+      inventoryItem,
+      sku: String(item.sku || '').trim(),
+      description: String(item.description || item.productName || '').trim(),
+      quantity,
+      unitPrice,
+      total: Math.round(quantity * unitPrice * 100) / 100
+    };
+  });
+};
+
+const quotationFinancials = ({ items, discount, discountPercentage, taxPercentage }) => {
+  const subtotal = Math.round(items.reduce((sum, item) => sum + (Number(item.total) || 0), 0) * 100) / 100;
+  const discountPct = Math.max(0, Math.min(100, Number(discountPercentage) || 0));
+  const requestedDiscount = Math.max(0, Number(discount) || 0);
+  const discountAmount = Math.min(subtotal, requestedDiscount || Math.round(subtotal * discountPct) / 100);
+  const gstPercentage = Math.max(0, Math.min(100, Number(taxPercentage) || 0));
+  const taxableBase = Math.max(0, subtotal - discountAmount);
+  const tax = Math.round(taxableBase * gstPercentage) / 100;
+  return {
+    totalAmount: subtotal,
+    discount: discountAmount,
+    discountPercentage: discountPct,
+    tax,
+    taxPercentage: gstPercentage,
+    netAmount: Math.round((taxableBase + tax) * 100) / 100
+  };
+};
+
 // ══════════════════════════════════════════════
 // ══════════════════════════════════════════════
 // DASHBOARD STATS & FINANCIALS FOR SALES TEAM MEMBER
@@ -1730,11 +1770,12 @@ const getMyQuotations = async (req, res) => {
 const createMyQuotation = async (req, res) => {
   try {
     const {
-      orderReference,
+      quotationCode,
       clientName,
       productSummary,
       clientEmail,
       clientPhone,
+      clientAddress,
       items,
       totalAmount,
       discount,
@@ -1747,15 +1788,29 @@ const createMyQuotation = async (req, res) => {
       creationDate,
       notes,
       leadId,
-      issuingCompanyCode
+      dealId,
+      issuingCompanyCode,
+      currency,
+      reference,
+      availability,
+      paymentTerms,
+      priceValidity,
+      commercialNote
     } = req.body;
 
     if (!clientName) return res.status(400).json({ success: false, message: 'Customer/Client name is required.' });
     const issuingCompany = getCompanySnapshot(issuingCompanyCode, DOCUMENT_TYPES.QUOTATION);
     const assignedFileNumber = await allocateFileNumber();
+    const normalizedItems = normalizeQuotationItems({ items, productSummary, totalAmount, netAmount });
+    const financials = quotationFinancials({
+      items: normalizedItems,
+      discount,
+      discountPercentage,
+      taxPercentage: taxPercentage === undefined ? 18 : taxPercentage
+    });
 
     const quotation = await Quotation.create({
-      orderReference: orderReference?.trim() || '',
+      quotationCode,
       clientName: clientName.trim(),
       salePerson: req.user.fullName || '',
       fileNo: assignedFileNumber,
@@ -1763,19 +1818,22 @@ const createMyQuotation = async (req, res) => {
       productSummary: productSummary?.trim() || '',
       clientEmail: clientEmail?.trim() || '',
       clientPhone: clientPhone?.trim() || '',
-      items: items || (productSummary ? [{ description: productSummary, quantity: 1, unitPrice: Number(totalAmount || netAmount || 0), total: Number(totalAmount || netAmount || 0) }] : []),
-      totalAmount: Number(totalAmount) || Number(netAmount) || 0,
-      discount: Number(discount) || 0,
-      discountPercentage: Number(discountPercentage) || 0,
-      tax: Number(tax) || 0,
-      taxPercentage: Number(taxPercentage) || 0,
-      netAmount: Number(netAmount) || Number(totalAmount) || 0,
+      clientAddress: clientAddress?.trim() || '',
+      items: normalizedItems,
+      ...financials,
+      currency: String(currency || 'Pakistani Rupee').trim(),
+      reference: String(reference || '').trim(),
+      availability: String(availability || 'Ex-stock (Limited)').trim(),
+      paymentTerms: String(paymentTerms || '100% Advance').trim(),
+      priceValidity: String(priceValidity || '5 calendar days').trim(),
+      commercialNote: String(commercialNote || 'In case the Govt. imposes any additional duties/taxes/any change in Pak Rs. customer has to pay the difference.').trim(),
       status: status || 'Quotation',
       validUntil: validUntil || null,
       creationDate: creationDate ? new Date(creationDate) : new Date(),
       notes: notes || '',
       issuingCompany,
       leadId: leadId || null,
+      dealId: dealId || null,
       owner: req.user._id,
       originalOwner: req.user._id,
       createdBy: req.user._id
@@ -1811,11 +1869,11 @@ const updateMyQuotation = async (req, res) => {
     }
 
     const allowedFields = [
-      'orderReference',
       'clientName',
       'productSummary',
       'clientEmail',
       'clientPhone',
+      'clientAddress',
       'items',
       'totalAmount',
       'discount',
@@ -1826,7 +1884,13 @@ const updateMyQuotation = async (req, res) => {
       'status',
       'validUntil',
       'creationDate',
-      'notes'
+      'notes',
+      'currency',
+      'reference',
+      'availability',
+      'paymentTerms',
+      'priceValidity',
+      'commercialNote'
     ];
 
     const changes = [];
@@ -1839,6 +1903,25 @@ const updateMyQuotation = async (req, res) => {
 
     if (req.body.creationDate) {
       quotation.creationDate = new Date(req.body.creationDate);
+    }
+
+    const financialFields = ['items', 'discount', 'discountPercentage', 'taxPercentage'];
+    if (financialFields.some(field => req.body[field] !== undefined)) {
+      const normalizedItems = normalizeQuotationItems({
+        items: req.body.items !== undefined ? req.body.items : quotation.items,
+        productSummary: quotation.productSummary,
+        totalAmount: quotation.totalAmount,
+        netAmount: quotation.netAmount
+      });
+      const financials = quotationFinancials({
+        items: normalizedItems,
+        discount: req.body.discount !== undefined ? req.body.discount : quotation.discount,
+        discountPercentage: req.body.discountPercentage !== undefined ? req.body.discountPercentage : quotation.discountPercentage,
+        taxPercentage: req.body.taxPercentage !== undefined ? req.body.taxPercentage : quotation.taxPercentage
+      });
+      quotation.items = normalizedItems;
+      Object.assign(quotation, financials);
+      quotation.productSummary = normalizedItems.map(item => item.description).filter(Boolean).join(', ');
     }
 
     await quotation.save();

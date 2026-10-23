@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const companySnapshotDefinition = require('./schemas/companySnapshot');
+const { allocateQuotationNumber } = require('../utils/quotationNumber');
 
 const QuotationSchema = new mongoose.Schema(
   {
@@ -10,12 +11,17 @@ const QuotationSchema = new mongoose.Schema(
     fileType: { type: String, enum: ['Blue', 'Green', 'Yellow', ''], default: '' },
     productSummary: { type: String, trim: true, default: '' },
     quotationNumber: { type: String, trim: true, default: '' },
+    quotationSerial: { type: Number, min: 1, default: undefined },
+    quotationSerialCreator: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: undefined },
+    quotationCode: { type: String, trim: true, uppercase: true, default: '' },
     clientName: { type: String, required: [true, 'Client name is required'], trim: true },
     clientEmail: { type: String, trim: true, lowercase: true, default: '' },
     clientPhone: { type: String, trim: true, default: '' },
     clientAddress: { type: String, trim: true, default: '' },
     items: [
       {
+        inventoryItem: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
+        sku: { type: String, trim: true, default: '' },
         description: { type: String, default: '' },
         quantity: { type: Number, default: 1 },
         unitPrice: { type: Number, default: 0 },
@@ -28,6 +34,16 @@ const QuotationSchema = new mongoose.Schema(
     tax: { type: Number, default: 0 },
     taxPercentage: { type: Number, default: 0 },
     netAmount: { type: Number, default: 0 },
+    currency: { type: String, trim: true, default: 'Pakistani Rupee' },
+    reference: { type: String, trim: true, default: '' },
+    availability: { type: String, trim: true, default: 'Ex-stock (Limited)' },
+    paymentTerms: { type: String, trim: true, default: '100% Advance' },
+    priceValidity: { type: String, trim: true, default: '5 calendar days' },
+    commercialNote: {
+      type: String,
+      trim: true,
+      default: 'In case the Govt. imposes any additional duties/taxes/any change in Pak Rs. customer has to pay the difference.'
+    },
     status: {
       type: String,
       enum: ['Draft', 'Quotation', 'Sent', 'Under Review', 'Accepted', 'Rejected', 'Expired', 'Converted to Sales Order', 'Converted to Customer PO', 'Converted'],
@@ -57,24 +73,31 @@ const QuotationSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+QuotationSchema.index(
+  { quotationSerialCreator: 1, quotationSerial: 1 },
+  {
+    unique: true,
+    name: 'unique_quotation_serial_per_creator',
+    partialFilterExpression: {
+      quotationSerialCreator: { $type: 'objectId' },
+      quotationSerial: { $type: 'number' }
+    }
+  }
+);
+
 QuotationSchema.pre('save', async function (next) {
-  if (!this.orderReference && !this.quotationNumber) {
-    const allQuotes = await mongoose.model('Quotation').find({
-      orderReference: { $regex: /^S\d+$/i }
-    }).select('orderReference').lean();
-    
-    let maxNum = 1724;
-    allQuotes.forEach(q => {
-      const match = q.orderReference && q.orderReference.match(/\d+$/);
-      if (match) {
-        const n = parseInt(match[0], 10);
-        if (n > maxNum) maxNum = n;
-      }
+  if (this.isNew && this.createdBy) {
+    const allocated = await allocateQuotationNumber({
+      creatorId: this.createdBy,
+      code: this.quotationCode,
+      fullName: this.salePerson,
+      session: this.$session()
     });
-    
-    const nextRef = 'S0' + String(maxNum + 1);
-    this.orderReference = nextRef;
-    this.quotationNumber = nextRef;
+    this.quotationSerial = allocated.serial;
+    this.quotationSerialCreator = this.createdBy;
+    this.quotationCode = allocated.code;
+    this.orderReference = allocated.reference;
+    this.quotationNumber = allocated.reference;
   } else if (!this.quotationNumber && this.orderReference) {
     this.quotationNumber = this.orderReference;
   } else if (!this.orderReference && this.quotationNumber) {
