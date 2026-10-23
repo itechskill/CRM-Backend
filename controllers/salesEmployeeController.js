@@ -39,6 +39,13 @@ const {
 } = require('../utils/salesOwnership');
 const { getSalesManagerScope } = require('../utils/salesManagerScope');
 const { DOCUMENT_TYPES, getCompanySnapshot, inheritCompanySnapshot, resolvePOCompany } = require('../config/companies');
+const { normalizeInventoryName, getInventoryMatches } = require('../utils/inventoryMatching');
+const {
+  reservationRemaining,
+  activeReservations,
+  inventoryStatusStage,
+  releaseOrderReservations
+} = require('../utils/inventoryReservations');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -109,25 +116,6 @@ const hasValidSignedDeliveryNoteAttachment = (document, documentName) => Boolean
   getBase64DataSize(document) <= CUSTOMER_PO_ATTACHMENT_MAX_SIZE
 );
 
-const normalizeInventoryName = (value) => {
-  const normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
-  const duplicatedSuffix = normalized.match(/^(.*?)\s*\((.*?)\)$/);
-  if (duplicatedSuffix && duplicatedSuffix[1].trim() === duplicatedSuffix[2].trim()) {
-    return duplicatedSuffix[1].trim();
-  }
-  return normalized;
-};
-
-const getInventoryMatches = (orderItem, inventoryItems) => {
-  const productName = normalizeInventoryName(orderItem?.description || orderItem?.name);
-  const sku = String(orderItem?.sku || '').trim().toLowerCase();
-  return inventoryItems.filter(item => {
-    const nameMatches = productName && normalizeInventoryName(item.name) === productName;
-    const skuMatches = sku && String(item.sku || '').trim().toLowerCase() === sku;
-    return Boolean(nameMatches || skuMatches);
-  });
-};
-
 const hasInventoryContextMismatch = (inventoryItem, fileType) => {
   const context = `${inventoryItem?.category || ''} ${inventoryItem?.location || ''}`.toLowerCase();
   if (fileType === 'Green') return /(import|logistic|international|global)/.test(context);
@@ -164,6 +152,7 @@ const getSupplierPOForOrder = async (order, session) => {
 };
 
 const CONFIRMED_DELIVERY_STATUSES = ['Done', 'Delivered', 'Confirmed', 'Fully Delivered'];
+const releasesReservation = (value) => /cancel|reject|return/i.test(String(value || ''));
 
 const getDeliveryStockRequirements = async (order, { session = null, excludeDeliveryNoteId = null } = {}) => {
   const orderItems = order.items && order.items.length
@@ -180,8 +169,13 @@ const getDeliveryStockRequirements = async (order, { session = null, excludeDeli
   ]);
 
   const deliveredByName = new Map();
+  const deliveredByOrderItem = new Map();
   earlierDeliveryNotes.forEach(note => {
     (note.items || []).forEach(item => {
+      const orderItemKey = String(item.orderItemId || '');
+      if (orderItemKey) {
+        deliveredByOrderItem.set(orderItemKey, (deliveredByOrderItem.get(orderItemKey) || 0) + (Number(item.quantity) || Number(item.demand) || 1));
+      }
       const name = normalizeInventoryName(item.product || item.description);
       if (!name) return;
       deliveredByName.set(name, (deliveredByName.get(name) || 0) + (Number(item.quantity) || Number(item.demand) || 1));
@@ -201,13 +195,20 @@ const getDeliveryStockRequirements = async (order, { session = null, excludeDeli
     const itemName = String(item.description || item.name || order.productSummary || 'Item').trim();
     const orderedQty = Number(item.quantity) || 1;
     const normalizedItemName = normalizeInventoryName(itemName);
-    const deliveredAvailable = deliveredByName.get(normalizedItemName) || 0;
+    const orderItemKey = String(item._id || 'product-summary');
+    const deliveredAvailable = deliveredByOrderItem.has(orderItemKey)
+      ? deliveredByOrderItem.get(orderItemKey)
+      : (deliveredByName.get(normalizedItemName) || 0);
     const deliveredQty = Math.min(orderedQty, deliveredAvailable);
+    if (deliveredByOrderItem.has(orderItemKey)) deliveredByOrderItem.set(orderItemKey, Math.max(0, deliveredAvailable - deliveredQty));
     deliveredByName.set(normalizedItemName, Math.max(0, deliveredAvailable - deliveredQty));
     const requiredQty = Math.max(0, orderedQty - deliveredQty);
-    const receiptInventoryId = receiptInventoryByOrderItem.get(String(item._id || 'product-summary'));
+    const reservation = (order.inventoryReservations || []).find(candidate =>
+      (candidate.orderItemId && String(candidate.orderItemId) === orderItemKey) || Number(candidate.itemIndex) === index
+    );
+    const receiptInventoryId = receiptInventoryByOrderItem.get(orderItemKey);
     const checkedInventoryId = order.inventoryAnalysis?.[index]?.productId;
-    const preferredInventoryId = receiptInventoryId || checkedInventoryId;
+    const preferredInventoryId = reservation?.inventoryItem || receiptInventoryId || checkedInventoryId;
     const exactMatches = getInventoryMatches(item, inventoryItems);
     const inventoryItem = preferredInventoryId
       ? inventoryItems.find(candidate => String(candidate._id) === String(preferredInventoryId))
@@ -220,6 +221,9 @@ const getDeliveryStockRequirements = async (order, { session = null, excludeDeli
       deliveredQty,
       requiredQty,
       inventoryItem,
+      reservation,
+      orderItemId: orderItemKey,
+      itemIndex: index,
       ambiguous: !preferredInventoryId && exactMatches.length > 1
     };
   });
@@ -236,6 +240,13 @@ const getDeliveryStockRequirements = async (order, { session = null, excludeDeli
   requirements.forEach(line => {
     if (line.requiredQty <= 0) return;
     const inventoryItemId = line.inventoryItem ? String(line.inventoryItem._id) : '';
+    if (line.reservation) {
+      line.availableQty = reservationRemaining(line.reservation);
+      if (line.availableQty < line.requiredQty) {
+        shortages.push({ item: line.item, required: line.requiredQty, available: line.availableQty, reason: 'Order reservation is insufficient' });
+      }
+      return;
+    }
     if (inventoryItemId && !availableByInventoryId.has(inventoryItemId)) {
       availableByInventoryId.set(
         inventoryItemId,
@@ -2003,7 +2014,7 @@ const getMyOrders = async (req, res) => {
     // Pending workflow: 'active' filter shows orders pending action by Sales (including rejected ones awaiting salesperson action)
     if (status === 'active' || status === 'pending') {
       conditions.push({
-        workflowStatus: { $nin: ['Sent to Support', 'Delivery Note Created', 'Delivery Note Confirmed', 'Sent to Accounts', 'Draft Invoice Created', 'Sent to Finance', 'Pending Finance Finalization', 'Completed'] }
+        workflowStatus: { $nin: ['Sent to Support', 'DN Created', 'Delivery Note Created', 'Delivery Note Confirmed', 'Sent to Accounts', 'Draft Invoice Created', 'Sent to Finance', 'Pending Finance Finalization', 'Completed'] }
       });
     } else if (status === 'pending_finance') {
       conditions.push({
@@ -2032,7 +2043,7 @@ const getMyOrders = async (req, res) => {
       });
     } else if (status === 'sent_to_support') {
       conditions.push({
-        workflowStatus: { $in: ['Sent to Support', 'Delivery Note Created', 'Delivery Note Confirmed', 'Sent to Accounts', 'Draft Invoice Created', 'Sent to Finance', 'Pending Finance Finalization', 'Completed'] }
+        workflowStatus: { $in: ['Sent to Support', 'DN Created', 'Delivery Note Created', 'Delivery Note Confirmed', 'Sent to Accounts', 'Draft Invoice Created', 'Sent to Finance', 'Pending Finance Finalization', 'Completed'] }
       });
     } else if (status && status !== 'all') {
       conditions.push({ status: status });
@@ -2425,6 +2436,9 @@ const financeReviewSalesOrder = async (req, res) => {
         notes: reason || 'Rejected by Finance due to overdue amount. Returned to Sales Person.'
       });
 
+      if (activeReservations(order).length) {
+        await releaseOrderReservations({ order, user: req.user, reason: reason || 'Order rejected by Finance.' });
+      }
       await order.save();
 
       if (order.salesPerson || order.createdBy) {
@@ -2536,6 +2550,14 @@ const updateMyOrder = async (req, res) => {
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) order[field] = req.body[field];
     });
+
+    if (releasesReservation(req.body.status) || releasesReservation(req.body.workflowStatus)) {
+      await releaseOrderReservations({
+        order,
+        user: req.user,
+        reason: `Order status changed to ${req.body.status || req.body.workflowStatus}.`
+      });
+    }
 
     if (req.body.orderNumber || req.body.orderReference) {
       const val = req.body.orderNumber || req.body.orderReference;
@@ -2712,11 +2734,32 @@ const getAvailableOrdersForDelivery = async (req, res) => {
       goodsReceivedInOffice: { $ne: null },
       'goodsReceivedInOffice.received': true,
       $or: [{ currentDepartment: 'Support' }, { departmentResponsible: 'Support' }],
-      deliveryNoteId: null
+      deliveryStatus: { $nin: ['Delivered', 'Fully Delivered', 'Done'] }
     }];
     const isSupportQueueUser = req.user.role === 'support' || String(req.user.department || '').toLowerCase().includes('support');
     if (!isSupportQueueUser && !isGlobalSalesUser(req.user)) conditions.unshift(ownerScope(req.user._id));
-    const orders = await SalesOrder.find({ $and: conditions }).sort({ createdAt: -1 });
+    const candidates = await SalesOrder.find({ $and: conditions }).sort({ createdAt: -1 });
+    const eligible = await Promise.all(candidates.map(async order => {
+      const activeDeliveryNote = await DeliveryNote.exists({
+        salesOrder: order._id,
+        status: { $nin: ['Done', 'Delivered', 'Confirmed', 'Fully Delivered', 'Cancelled', 'Returned'] }
+      });
+      if (activeDeliveryNote) return null;
+      const stock = await getDeliveryStockRequirements(order);
+      if (!stock.requirements.some(line => line.requiredQty > 0)) return null;
+      const responseOrder = order.toObject();
+      responseOrder.deliveryRemainingItems = stock.requirements
+        .filter(line => line.requiredQty > 0)
+        .map(line => ({
+          _id: line.orderItemId,
+          description: line.item,
+          quantity: line.requiredQty,
+          originalOrderedQuantity: line.orderedQty,
+          unitPrice: Number(order.items?.[line.itemIndex]?.unitPrice) || 0
+        }));
+      return responseOrder;
+    }));
+    const orders = eligible.filter(Boolean);
 
     return res.status(200).json({ success: true, count: orders.length, data: orders });
   } catch (error) {
@@ -2775,8 +2818,8 @@ const createMyDeliveryNote = async (req, res) => {
       starred
     } = req.body;
 
-    const requestedStatus = status || 'Ready';
-    const dnStatus = CONFIRMED_DELIVERY_STATUSES.includes(requestedStatus) ? 'Ready' : requestedStatus;
+    // A newly created DN is never proof of delivery. Only signed confirmation can deliver it.
+    const dnStatus = 'Created';
 
     let resolvedSalesPersonId = null;
     let resolvedSalePerson = req.body.salePerson || '';
@@ -2814,10 +2857,14 @@ const createMyDeliveryNote = async (req, res) => {
         message: 'Delivery Notes can only be created after the Sales Order reaches Support and goods are received in office.'
       });
     }
-    if (parentSo.deliveryNoteId) {
+    const activeDeliveryNote = await DeliveryNote.findOne({
+      salesOrder: parentSo._id,
+      status: { $nin: ['Done', 'Delivered', 'Confirmed', 'Fully Delivered', 'Cancelled', 'Returned'] }
+    });
+    if (activeDeliveryNote) {
       return res.status(400).json({
         success: false,
-        message: `A Delivery Note already exists for Sales Order ${parentSo.orderNumber || parentSo.orderReference}.`
+        message: `Delivery Note ${activeDeliveryNote.deliveryNumber || activeDeliveryNote.deliveryNoteNumber} is still awaiting confirmation for this Sales Order.`
       });
     }
 
@@ -2841,17 +2888,47 @@ const createMyDeliveryNote = async (req, res) => {
     resolvedShipmentId = parentSo.shipmentId || null;
     resolvedShipmentNum = parentSo.shipmentNumber || '';
 
+    const requestedItems = Array.isArray(items) ? items : [];
     dnItems = stock.requirements
       .filter(line => line.requiredQty > 0)
-      .map(line => ({
-        product: line.item || 'Delivered Product',
-        description: line.item || '',
-        demand: line.requiredQty,
-        quantity: line.requiredQty,
-        unit: line.inventoryItem?.unit || 'Units',
-        availability: 'Available',
-        totalOrderedQty: line.orderedQty
-      }));
+      .map(line => {
+        const sourceItem = parentSo.items?.[line.itemIndex] || {};
+        const requested = requestedItems.find((candidate, candidateIndex) =>
+          (candidate.orderItemId && String(candidate.orderItemId) === line.orderItemId) ||
+          candidateIndex === line.itemIndex
+        );
+        const submittedQuantity = Number(requested?.quantity);
+        if (Number.isFinite(submittedQuantity) && (submittedQuantity <= 0 || submittedQuantity > line.requiredQty)) {
+          throw createHttpError(400, `${line.item}: delivery quantity must be between 1 and ${line.requiredQty}.`);
+        }
+        const quantity = Number.isFinite(submittedQuantity) ? submittedQuantity : line.requiredQty;
+        const unitPrice = Number(sourceItem.unitPrice) || 0;
+        return {
+          product: line.item || 'Delivered Product',
+          description: line.item || '',
+          demand: line.requiredQty,
+          quantity,
+          unit: line.inventoryItem?.unit || 'Units',
+          availability: 'Available',
+          totalOrderedQty: line.orderedQty,
+          orderItemId: line.orderItemId,
+          orderItemIndex: line.itemIndex,
+          inventoryItem: line.inventoryItem?._id || null,
+          unitPrice,
+          lineTotal: quantity * unitPrice
+        };
+      });
+
+    if (!dnItems.length) throw createHttpError(409, 'All quantities on this Sales Order have already been delivered.');
+    const remainingQuantity = stock.requirements.reduce((sum, line) => sum + line.requiredQty, 0);
+    const deliveryQuantity = dnItems.reduce((sum, line) => sum + line.quantity, 0);
+    const resolvedIsPartial = deliveryQuantity < remainingQuantity;
+    const subtotal = dnItems.reduce((sum, line) => sum + line.lineTotal, 0);
+    const orderSubtotal = (parentSo.items || []).reduce((sum, line) => sum + (Number(line.total) || ((Number(line.quantity) || 1) * (Number(line.unitPrice) || 0))), 0);
+    const priceRatio = orderSubtotal > 0 ? Math.min(1, subtotal / orderSubtotal) : (remainingQuantity > 0 ? deliveryQuantity / remainingQuantity : 1);
+    const allocatedDiscount = Math.round((Number(parentSo.discount) || 0) * priceRatio * 100) / 100;
+    const allocatedTax = Math.round((Number(parentSo.tax) || 0) * priceRatio * 100) / 100;
+    const grandTotal = Math.round((subtotal - allocatedDiscount + allocatedTax) * 100) / 100;
 
     const deliveryNote = await DeliveryNote.create({
       salesOrder: parentSo._id,
@@ -2871,9 +2948,13 @@ const createMyDeliveryNote = async (req, res) => {
       starred: !!starred,
       deliveryDate: deliveryDate || scheduledDate || new Date(),
       items: dnItems,
+      subtotal,
+      discount: allocatedDiscount,
+      tax: allocatedTax,
+      grandTotal,
       notes: notes || '',
       status: dnStatus,
-      isPartial: !!isPartial,
+      isPartial: resolvedIsPartial,
       invoiced: false,
       fileType: resolvedFileType,
       supplierPoNumber: resolvedSupplierPoNum,
@@ -2887,14 +2968,11 @@ const createMyDeliveryNote = async (req, res) => {
 
     // Auto-update Sales Order delivery status and link Delivery Note (removes SO from Support Pending Queue, hands off to Accounts)
     if (salesOrderId) {
-      const deliveryStatusUpdate = isPartial ? 'Partially Delivered' : 'Fully Delivered';
-      const soStatusUpdate = isPartial ? 'Processing' : 'Delivered';
       await SalesOrder.findByIdAndUpdate(salesOrderId, {
-        deliveryStatus: deliveryStatusUpdate,
-        status: soStatusUpdate,
+        status: 'DN Created',
         deliveryNoteId: deliveryNote._id,
         deliveryNoteNumber: deliveryNote.deliveryNoteNumber || deliveryNote.deliveryNumber,
-        workflowStatus: 'Delivery Note Created',
+        workflowStatus: 'DN Created',
         departmentResponsible: 'Accounts',
         currentDepartment: 'Accounts',
         currentStatus: 'DELIVERY_NOTE_CREATED_IN_ACCOUNTS',
@@ -2924,6 +3002,14 @@ const createMyDeliveryNote = async (req, res) => {
       title: 'Delivery Note Created',
       message: `${req.user.fullName} created delivery note ${deliveryNote.deliveryNoteNumber} — Status: ${dnStatus}.`,
       type: 'sales'
+    });
+
+    await notifyRoleHelper(['accountant', 'accounts', 'admin', 'ceo'], {
+      type: 'invoice',
+      title: 'Delivery Note Created — Order Ready for Accounts',
+      message: `Delivery Note ${deliveryNote.deliveryNoteNumber} for Sales Order ${deliveryNote.salesOrderNumber} was created. Signed delivery confirmation may follow later.`,
+      link: '/accounts/orders-ready',
+      sender: req.user._id
     });
 
     return res.status(201).json({ success: true, message: 'Delivery note created successfully.', data: deliveryNote });
@@ -3538,6 +3624,10 @@ const deleteMyOrder = async (req, res) => {
       });
     }
 
+    if (activeReservations(order).length) {
+      await releaseOrderReservations({ order, user: req.user, reason: 'Sales Order deleted.' });
+      await order.save();
+    }
     await SalesOrder.findByIdAndDelete(req.params.id);
     await logSalesActivity({
       type: 'Sales Order Deleted',
@@ -3555,7 +3645,7 @@ const deleteMyOrder = async (req, res) => {
 
 const updateMyDeliveryNote = async (req, res) => {
   try {
-    const deliveryNote = await DeliveryNote.findById(req.params.id).session(session);
+    const deliveryNote = await DeliveryNote.findById(req.params.id);
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
 
     const changes = {};
@@ -3603,6 +3693,17 @@ const updateMyDeliveryNote = async (req, res) => {
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) deliveryNote[field] = req.body[field];
     });
+    if (releasesReservation(req.body.status) && deliveryNote.salesOrder) {
+      const order = await SalesOrder.findById(deliveryNote.salesOrder);
+      if (order && activeReservations(order).length) {
+        await releaseOrderReservations({ order, user: req.user, reason: `Delivery Note marked ${req.body.status}.` });
+        order.status = req.body.status;
+        order.workflowStatus = req.body.status;
+        order.currentDepartment = 'Support';
+        order.departmentResponsible = 'Support';
+        await order.save();
+      }
+    }
     await deliveryNote.save();
     return res.status(200).json({ success: true, message: 'Delivery note updated.', data: deliveryNote });
   } catch (error) {
@@ -5713,6 +5814,180 @@ const confirmDeliveryNoteWithInventory = async (req, res) => {
   }
 };
 
+const confirmDeliveryNoteWithInventoryR7 = async (req, res) => {
+  const session = await mongoose.startSession();
+  let confirmedDeliveryNote;
+  try {
+    const signedDocument = req.body.signedDeliveryNoteDocument;
+    const signedDocumentName = req.body.signedDeliveryNoteDocumentName;
+    if (!hasValidSignedDeliveryNoteAttachment(signedDocument, signedDocumentName)) {
+      return res.status(400).json({ success: false, message: SIGNED_DN_ATTACHMENT_MESSAGE });
+    }
+
+    await session.withTransaction(async () => {
+      const deliveryNote = await DeliveryNote.findOneAndUpdate(
+        {
+          _id: req.params.id,
+          isStockDeducted: { $ne: true },
+          status: { $nin: ['Done', 'Delivered', 'Confirmed', 'Fully Delivered'] }
+        },
+        { $set: { isStockDeducted: true, stockDeductionClaimedAt: new Date() } },
+        { new: true, session }
+      );
+      if (!deliveryNote) {
+        const exists = await DeliveryNote.exists({ _id: req.params.id }).session(session);
+        throw createHttpError(exists ? 409 : 404, exists ? 'Delivery Note is already confirmed or its stock deduction was already claimed.' : 'Delivery Note not found.');
+      }
+      if (!deliveryNote.salesOrder) throw createHttpError(400, 'A linked Sales Order is required before this Delivery Note can be confirmed.');
+
+      const order = await SalesOrder.findById(deliveryNote.salesOrder).session(session);
+      if (!order) throw createHttpError(404, 'The Sales Order linked to this Delivery Note was not found.');
+
+      const requirements = await getDeliveryStockRequirements(order, { session, excludeDeliveryNoteId: deliveryNote._id });
+      const orderReservations = activeReservations(order);
+      const deductions = (deliveryNote.items || []).map((item, itemIndex) => {
+        const requirement = requirements.requirements.find(line =>
+          (item.orderItemId && line.orderItemId === String(item.orderItemId)) ||
+          Number(item.orderItemIndex) === Number(line.itemIndex) ||
+          normalizeInventoryName(line.item) === normalizeInventoryName(item.product || item.description)
+        );
+        const inventoryItemId = item.inventoryItem || requirement?.inventoryItem?._id;
+        const quantity = Number(item.quantity) || Number(item.demand) || 0;
+        const reservation = orderReservations.find(candidate =>
+          (item.orderItemId && String(candidate.orderItemId) === String(item.orderItemId)) ||
+          Number(candidate.itemIndex) === Number(item.orderItemIndex ?? itemIndex)
+        );
+        return { item, itemIndex, requirement, inventoryItemId, quantity, reservation };
+      });
+
+      if (!deductions.length || deductions.some(entry => !entry.inventoryItemId || entry.quantity <= 0)) {
+        throw createHttpError(409, 'The Delivery Note contains an unlinked inventory line. Link or receive the item before confirming delivery.');
+      }
+
+      for (const deduction of deductions) {
+        const { inventoryItemId, quantity, reservation, item } = deduction;
+        const usesReservation = Boolean(reservation && reservationRemaining(reservation) > 0);
+        if (usesReservation && quantity > reservationRemaining(reservation)) {
+          throw createHttpError(409, `${item.product || item.description}: delivery quantity exceeds this order's remaining reservation.`);
+        }
+
+        const inventoryCondition = usesReservation
+          ? { _id: inventoryItemId, quantityOnHand: { $gte: quantity }, reservedQuantity: { $gte: quantity } }
+          : {
+              _id: inventoryItemId,
+              $expr: { $gte: [{ $subtract: [{ $ifNull: ['$quantityOnHand', 0] }, { $ifNull: ['$reservedQuantity', 0] }] }, quantity] }
+            };
+        const stockUpdate = usesReservation
+          ? {
+              quantityOnHand: { $subtract: [{ $ifNull: ['$quantityOnHand', 0] }, quantity] },
+              reservedQuantity: { $subtract: [{ $ifNull: ['$reservedQuantity', 0] }, quantity] }
+            }
+          : {
+              quantityOnHand: { $subtract: [{ $ifNull: ['$quantityOnHand', 0] }, quantity] }
+            };
+        const updated = await InventoryItem.findOneAndUpdate(
+          inventoryCondition,
+          [
+            {
+              $set: {
+                ...stockUpdate,
+                stockMovements: {
+                  $concatArrays: [
+                    { $ifNull: ['$stockMovements', []] },
+                    [{
+                      type: 'OUT',
+                      quantity,
+                      reference: deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber || '',
+                      salesOrder: order._id,
+                      orderNumber: order.orderNumber || order.orderReference || '',
+                      remarks: usesReservation
+                        ? 'Delivered from stock reserved for this Sales Order.'
+                        : 'Stock deducted on signed Delivery Note confirmation.',
+                      performedBy: req.user._id,
+                      performedByName: req.user.fullName || '',
+                      timestamp: new Date()
+                    }]
+                  ]
+                }
+              }
+            },
+            inventoryStatusStage
+          ],
+          { new: true, session }
+        );
+        if (!updated) {
+          throw createHttpError(409, `${item.product || item.description}: stock or reservation changed before confirmation. Refresh and try again.`);
+        }
+
+        if (usesReservation) {
+          reservation.remainingQuantity = reservationRemaining(reservation) - quantity;
+          reservation.deliveredQuantity = (Number(reservation.deliveredQuantity) || 0) + quantity;
+          reservation.status = reservation.remainingQuantity > 0 ? 'Partially Fulfilled' : 'Fulfilled';
+        }
+      }
+
+      deliveryNote.status = 'Done';
+      deliveryNote.deliveryDate = new Date();
+      deliveryNote.receivedBy = req.body.receivedBy || req.user.fullName;
+      deliveryNote.signedDeliveryNoteDocument = signedDocument;
+      deliveryNote.signedDeliveryNoteDocumentName = signedDocumentName.trim();
+      deliveryNote.signedDeliveryNoteUploadedAt = new Date();
+      deliveryNote.signedDeliveryNoteUploadedBy = req.user._id;
+      deliveryNote.signedDeliveryNoteUploadedByName = req.user.fullName || '';
+      await deliveryNote.save({ session });
+
+      const remainingReservation = activeReservations(order).reduce((sum, reservation) => sum + reservationRemaining(reservation), 0);
+      let fullyDelivered = order.inventoryReservations?.length > 0 ? remainingReservation === 0 : false;
+      if (!order.inventoryReservations?.length) {
+        const remainingRequirements = await getDeliveryStockRequirements(order, { session });
+        fullyDelivered = remainingRequirements.requirements.every(line => line.requiredQty <= 0);
+      }
+
+      const previousStatus = order.workflowStatus || 'Delivery Note Created';
+      order.deliveryStatus = fullyDelivered ? 'Delivered' : 'Partially Delivered';
+      order.workflowStatus = fullyDelivered ? 'Delivered' : 'Partially Delivered';
+      order.status = fullyDelivered ? 'Delivered' : 'Partially Delivered';
+      order.departmentResponsible = fullyDelivered ? 'Accounts' : 'Support';
+      order.currentDepartment = fullyDelivered ? 'Accounts' : 'Support';
+      order.currentStatus = fullyDelivered ? 'DELIVERED_SIGNED_DN' : 'PARTIAL_DELIVERY_AWAITING_NEXT_DN';
+      order.lastAction = fullyDelivered
+        ? `Delivery confirmed with signed Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber}`
+        : `Partial delivery confirmed with ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber}; remaining stock stays reserved`;
+      order.lastActionBy = req.user._id;
+      order.lastActionByName = req.user.fullName || '';
+      order.lastActionAt = new Date();
+      order.workflowHistory.push({
+        user: req.user._id,
+        userName: req.user.fullName,
+        department: 'Support',
+        action: fullyDelivered ? 'Delivery Confirmed' : 'Partial Delivery Confirmed',
+        previousStatus,
+        newStatus: order.workflowStatus,
+        timestamp: new Date(),
+        notes: fullyDelivered
+          ? `Signed Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} confirmed.`
+          : 'Only the delivered quantity was deducted; the remaining order quantity stays reserved.'
+      });
+      await order.save({ session });
+      confirmedDeliveryNote = deliveryNote;
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Delivery Note ${confirmedDeliveryNote.deliveryNumber || confirmedDeliveryNote.deliveryNoteNumber} confirmed and stock updated.`,
+      data: confirmedDeliveryNote
+    });
+  } catch (error) {
+    console.error('[Confirm Delivery Note R7 Error]:', error);
+    return res.status(error.statusCode || (error.code === 112 ? 409 : 500)).json({
+      success: false,
+      message: error.statusCode ? error.message : (error.code === 112 ? 'Delivery confirmation conflicted with another request. Refresh and try again.' : 'Server error confirming delivery note.')
+    });
+  } finally {
+    await session.endSession();
+  }
+};
+
 /**
  * @desc    Get pending Delivery Notes awaiting Draft Invoice in Accounts
  * @route   GET /api/sales-employee/accounts/pending-delivery-notes
@@ -5740,8 +6015,8 @@ const getAccountsStats = async (req, res) => {
     const { filter, startDate, endDate } = req.query;
     const dateFilter = getDateRangeFilter(filter, startDate, endDate, 'createdAt');
 
-    // Confirmed DNs received from Support (in period if filtered)
-    const dnReceivedQuery = { status: { $in: ['Done', 'Confirmed', 'Delivered', 'Ready'] } };
+    // Accounts receives the DN at creation; signed confirmation can follow later.
+    const dnReceivedQuery = { status: { $in: ['Created', 'Done', 'Confirmed', 'Delivered', 'Ready'] } };
     if (dateFilter) Object.assign(dnReceivedQuery, dateFilter);
     const dnsReceived = await DeliveryNote.countDocuments(dnReceivedQuery);
 
@@ -6266,7 +6541,7 @@ module.exports = {
   getInventoryItems,
   createOrUpdateInventoryItem,
   addInventoryStock,
-  confirmDeliveryNoteWithInventory,
+  confirmDeliveryNoteWithInventory: confirmDeliveryNoteWithInventoryR7,
   getAccountsStats,
   getAccountsPendingDeliveryNotes,
   sendInvoiceToFinance,

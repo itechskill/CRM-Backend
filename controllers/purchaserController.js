@@ -9,10 +9,13 @@ const ProductFile = require('../models/ProductFile');
 const DeliveryNote = require('../models/DeliveryNote');
 const Invoice = require('../models/Invoice');
 const Shipment = require('../models/Shipment');
+const InventoryItem = require('../models/InventoryItem');
 const logAudit = require('../utils/auditLogger');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
 const { resolvePOCompany } = require('../config/companies');
 const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
+const { getInventoryMatches } = require('../utils/inventoryMatching');
+const { activeReservations, inventoryStatusStage } = require('../utils/inventoryReservations');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -41,25 +44,6 @@ const getPayableBalances = (payable) => {
     outstandingAmountCents: Math.max(0, totalAmountCents - paidAmountCents)
   };
 };
-const normalizeInventoryName = (value) => {
-  const normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
-  const duplicatedSuffix = normalized.match(/^(.*?)\s*\((.*?)\)$/);
-  if (duplicatedSuffix && duplicatedSuffix[1].trim() === duplicatedSuffix[2].trim()) {
-    return duplicatedSuffix[1].trim();
-  }
-  return normalized;
-};
-
-const getInventoryMatches = (orderItem, inventoryItems) => {
-  const productName = normalizeInventoryName(orderItem?.description || orderItem?.productName || orderItem?.name);
-  const sku = String(orderItem?.productCode || orderItem?.sku || '').trim().toLowerCase();
-  return inventoryItems.filter(item => {
-    const nameMatches = productName && normalizeInventoryName(item.name) === productName;
-    const skuMatches = sku && String(item.sku || '').trim().toLowerCase() === sku;
-    return Boolean(nameMatches || skuMatches);
-  });
-};
-
 const findExistingLocalPayable = async ({ supplierPOId, poNumber, salesOrderId, session = null }) => {
   const duplicateChecks = [];
   if (supplierPOId) duplicateChecks.push({ supplierPO: supplierPOId });
@@ -955,7 +939,7 @@ exports.createLocalPayable = async (req, res) => {
     if (linkedOrder) {
       linkedOrder.currentDepartment = 'Support';
       linkedOrder.departmentResponsible = 'Support';
-      if (!['Delivery Note Created', 'Delivery Note Delivered', 'Invoice Draft Created', 'Invoice Finalized'].includes(linkedOrder.workflowStatus)) {
+      if (!['DN Created', 'Delivery Note Created', 'Delivery Note Delivered', 'Invoice Draft Created', 'Invoice Finalized'].includes(linkedOrder.workflowStatus)) {
         linkedOrder.workflowStatus = 'Goods Received in Office';
         linkedOrder.status = 'Goods Received in Office';
       }
@@ -1284,15 +1268,27 @@ exports.getPendingPurchaserOrders = async (req, res) => {
 };
 
 exports.performInventoryCheck = async (req, res) => {
+  const session = await mongoose.startSession();
   try {
+    session.startTransaction();
     const { id } = req.params;
-    const order = await SalesOrder.findById(id);
+    const order = await SalesOrder.findById(id).session(session);
     if (!order) {
+      await session.abortTransaction();
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
 
-    const InventoryItem = require('../models/InventoryItem');
-    const inventoryItems = await InventoryItem.find().lean();
+    const moveToSupport = Boolean(req.body?.moveToSupport || req.body?.isFullyInStock);
+    if (moveToSupport && activeReservations(order).length) {
+      await session.commitTransaction();
+      return res.status(200).json({
+        success: true,
+        message: 'This order already has an active stock reservation.',
+        data: { order, itemAnalysis: order.inventoryAnalysis || [], status: 'In Stock', alreadyReserved: true }
+      });
+    }
+
+    const inventoryItems = await InventoryItem.find().session(session);
     let totalOrdered = 0;
     let totalAvailable = 0;
     let totalStockValue = 0;
@@ -1311,24 +1307,29 @@ exports.performInventoryCheck = async (req, res) => {
       });
     });
 
-    const itemAnalysis = orderItems.map(item => {
+    const remainingByInventoryId = new Map(inventoryItems.map(item => [
+      String(item._id),
+      Math.max(0, (Number(item.quantityOnHand) || 0) - (Number(item.reservedQuantity) || 0))
+    ]));
+
+    const itemAnalysis = orderItems.map((item, itemIndex) => {
       const inventoryMatches = getInventoryMatches(item, inventoryItems);
       const receivedInventoryId = receivedInventoryByOrderItem.get(String(item._id));
-      const invMatch = receivedInventoryId
-        ? inventoryItems.find(inventoryItem => String(inventoryItem._id) === receivedInventoryId)
+      const explicitlyLinkedInventoryId = order.inventoryAnalysis?.[itemIndex]?.productId || receivedInventoryId;
+      const invMatch = explicitlyLinkedInventoryId
+        ? inventoryItems.find(inventoryItem => String(inventoryItem._id) === String(explicitlyLinkedInventoryId))
         : (inventoryMatches.length === 1 ? inventoryMatches[0] : null);
 
       const reqQty = Number(item.quantity) || 1;
-      let availQty = 0;
-      if (invMatch) {
-        availQty = Math.max(0, (Number(invMatch.quantityOnHand) || 0) - (Number(invMatch.reservedQuantity) || 0));
-      }
+      const availQty = invMatch ? (remainingByInventoryId.get(String(invMatch._id)) || 0) : 0;
+      if (invMatch) remainingByInventoryId.set(String(invMatch._id), Math.max(0, availQty - reqQty));
 
       const unitPrice = Number(item.unitPrice) || Number(invMatch?.unitPrice) || 0;
       const itemTotalPrice = Number(item.total) || (reqQty * unitPrice);
       const shortageQuantity = Math.max(0, reqQty - availQty);
+      const ambiguous = !explicitlyLinkedInventoryId && inventoryMatches.length > 1;
       const itemStatus = !invMatch
-        ? 'Not in inventory'
+        ? (ambiguous ? 'Ambiguous inventory match' : 'Not in inventory')
         : (shortageQuantity > 0 ? `Partly available (shortage ${shortageQuantity})` : 'Available');
       if (itemStatus !== 'Available') shortageFound = true;
 
@@ -1337,6 +1338,8 @@ exports.performInventoryCheck = async (req, res) => {
       totalStockValue += Math.min(availQty, reqQty) * unitPrice;
 
       return {
+        orderItemId: String(item._id || 'product-summary'),
+        itemIndex,
         productId: invMatch?._id || '',
         productName: item.description || item.productName || 'Product Item',
         requiredQuantity: reqQty,
@@ -1353,7 +1356,8 @@ exports.performInventoryCheck = async (req, res) => {
           category: invMatch.category || '',
           location: invMatch.location || ''
         } : null,
-        matchNote: !receivedInventoryId && inventoryMatches.length > 1 ? 'Multiple exact inventory matches found; resolve the duplicate before dispatch.' : ''
+        ambiguous,
+        matchNote: ambiguous ? 'Multiple normalized inventory matches found. Link this line to the intended inventory item.' : ''
       };
     });
 
@@ -1368,8 +1372,45 @@ exports.performInventoryCheck = async (req, res) => {
       shortageQty: it.shortageQuantity,
       status: it.status
     }));
-    const moveToSupport = Boolean(req.body?.moveToSupport || req.body?.isFullyInStock);
     if (moveToSupport && !shortageFound) {
+      const totalsByInventoryId = new Map();
+      itemAnalysis.forEach(item => totalsByInventoryId.set(
+        String(item.productId),
+        (totalsByInventoryId.get(String(item.productId)) || 0) + item.requiredQuantity
+      ));
+      for (const [inventoryItemId, quantity] of totalsByInventoryId.entries()) {
+        const reserved = await InventoryItem.findOneAndUpdate(
+          {
+            _id: inventoryItemId,
+            $expr: { $gte: [{ $subtract: [{ $ifNull: ['$quantityOnHand', 0] }, { $ifNull: ['$reservedQuantity', 0] }] }, quantity] }
+          },
+          [
+            { $set: { reservedQuantity: { $add: [{ $ifNull: ['$reservedQuantity', 0] }, quantity] } } },
+            inventoryStatusStage
+          ],
+          { new: true, session }
+        );
+        if (!reserved) {
+          const error = new Error('Inventory changed during reservation. Recheck stock and try again.');
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+
+      order.inventoryReservations = itemAnalysis.map(item => ({
+        orderItemId: item.orderItemId,
+        itemIndex: item.itemIndex,
+        inventoryItem: item.productId,
+        inventoryName: item.matchedInventoryItem?.name || item.productName,
+        quantity: item.requiredQuantity,
+        remainingQuantity: item.requiredQuantity,
+        deliveredQuantity: 0,
+        releasedQuantity: 0,
+        status: 'Reserved',
+        reservedAt: new Date(),
+        reservedBy: req.user._id,
+        reservedByName: req.user.fullName || ''
+      }));
       const totalQty = orderItems.reduce((sum, item) => sum + (Number(item.quantity) || 1), 0);
       order.workflowStatus = 'Goods Received in Office';
       order.status = 'Goods Received in Office';
@@ -1384,7 +1425,7 @@ exports.performInventoryCheck = async (req, res) => {
         receivedAt: new Date(),
         receivedBy: req.user._id,
         receivedByName: req.user.fullName,
-        remarks: 'Existing warehouse stock verified by Local Purchaser and routed to Support.'
+        remarks: 'Existing warehouse stock reserved by Local Purchaser and routed to Support.'
       };
       order.inventoryFulfilledFromExistingStock = true;
     }
@@ -1395,12 +1436,15 @@ exports.performInventoryCheck = async (req, res) => {
     order.lastActionByName = req.user.fullName;
     order.lastActionAt = new Date();
 
-    await order.save();
+    await order.save({ session });
 
     if (moveToSupport && shortageFound) {
+      await session.commitTransaction();
       return res.status(409).json({
         success: false,
-        message: 'Cannot send this order to Support as In Stock: a stock shortage was detected. Issue a Local Supplier PO for the shortage first.',
+        message: itemAnalysis.some(item => item.ambiguous)
+          ? 'Cannot send this order to Support: at least one order line has multiple normalized inventory matches. Link the line to the correct inventory item first.'
+          : 'Cannot send this order to Support as In Stock: a stock shortage was detected. Issue a Local Supplier PO for the shortage first.',
         data: {
           order,
           itemAnalysis,
@@ -1413,10 +1457,11 @@ exports.performInventoryCheck = async (req, res) => {
       });
     }
 
+    await session.commitTransaction();
     return res.status(200).json({
       success: true,
       message: moveToSupport && !shortageFound
-        ? 'Inventory is available. The order was moved to Support.'
+        ? 'Inventory is available and reserved for this order. The order was moved to Support.'
         : shortageFound
           ? 'Inventory check completed. Stock shortage detected — Local Supplier PO required.'
           : 'Inventory check completed. All goods are present and available in warehouse inventory!',
@@ -1431,8 +1476,69 @@ exports.performInventoryCheck = async (req, res) => {
       }
     });
   } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
     console.error('Perform Inventory Check Error:', error);
-    return res.status(500).json({ success: false, message: 'Server error performing inventory check.' });
+    const isWriteConflict = error.code === 112 || error.codeName === 'WriteConflict';
+    return res.status(error.statusCode || (isWriteConflict ? 409 : 500)).json({
+      success: false,
+      message: error.statusCode
+        ? error.message
+        : (isWriteConflict ? 'Inventory changed during reservation. Recheck stock and try again.' : 'Server error performing inventory check.')
+    });
+  } finally {
+    await session.endSession();
+  }
+};
+
+exports.linkOrderLineToInventory = async (req, res) => {
+  try {
+    const itemIndex = Number(req.body.itemIndex);
+    const inventoryItemId = String(req.body.inventoryItemId || '').trim();
+    if (!Number.isInteger(itemIndex) || itemIndex < 0 || !mongoose.Types.ObjectId.isValid(inventoryItemId)) {
+      return res.status(400).json({ success: false, message: 'Select a valid order line and inventory item.' });
+    }
+
+    const [order, inventoryItem] = await Promise.all([
+      SalesOrder.findById(req.params.id),
+      InventoryItem.findById(inventoryItemId)
+    ]);
+    if (!order) return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    if (!inventoryItem) return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+    const isLocalPurchaserStage = order.fileType === 'Green' && [order.currentDepartment, order.departmentResponsible]
+      .some(value => String(value || '').toLowerCase().includes('local purchaser'));
+    if (!isLocalPurchaserStage) {
+      return res.status(409).json({ success: false, message: 'Inventory links can only be changed while a Green order is assigned to Local Purchaser.' });
+    }
+    if (activeReservations(order).length) {
+      return res.status(409).json({ success: false, message: 'Inventory links cannot be changed after stock has been reserved for the order.' });
+    }
+
+    const orderItems = order.items && order.items.length
+      ? order.items
+      : [{ description: order.productSummary || 'Product Item', quantity: 1 }];
+    if (!orderItems[itemIndex]) return res.status(400).json({ success: false, message: 'The selected order line does not exist.' });
+
+    while (order.inventoryAnalysis.length <= itemIndex) order.inventoryAnalysis.push({});
+    const line = orderItems[itemIndex];
+    order.inventoryAnalysis[itemIndex].productId = String(inventoryItem._id);
+    order.inventoryAnalysis[itemIndex].productName = line.description || line.productName || 'Product Item';
+    order.inventoryAnalysis[itemIndex].orderedQty = Number(line.quantity) || 1;
+    order.inventoryAnalysis[itemIndex].status = `Linked to ${inventoryItem.name}`;
+    order.inventoryCheckStatus = 'Not Checked';
+    order.lastAction = `Order line linked to inventory item ${inventoryItem.name}`;
+    order.lastActionBy = req.user._id;
+    order.lastActionByName = req.user.fullName || '';
+    order.lastActionAt = new Date();
+    await order.save();
+
+    return res.status(200).json({
+      success: true,
+      message: `${order.inventoryAnalysis[itemIndex].productName} linked to ${inventoryItem.name}. Recheck stock before sending to Support.`,
+      data: { order, inventoryItem, itemIndex }
+    });
+  } catch (error) {
+    console.error('Link Order Inventory Error:', error);
+    return res.status(500).json({ success: false, message: 'Server error linking the order line to inventory.' });
   }
 };
 

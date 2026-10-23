@@ -20,6 +20,7 @@ const {
   getPurchaserDashboardStats,
   getPendingPurchaserOrders,
   performInventoryCheck,
+  linkOrderLineToInventory,
   completeProcurementAndSendToSupport,
   globalProcurementSendToLogistics,
   updateGlobalProcurementCheckpoint,
@@ -225,6 +226,7 @@ const requireSupplierPOOwnership = async (req, res, next) => {
 // Master Workflow Order Routes
 router.get('/pending-orders', purchaserAccess, scopePurchaserQuery(['subDept', 'type']), getPendingPurchaserOrders);
 router.post('/orders/:id/inventory-check', localPurchaserAccess, performInventoryCheck);
+router.post('/orders/:id/inventory-link', localPurchaserAccess, linkOrderLineToInventory);
 router.post('/orders/:id/complete-procurement', localPurchaserAccess, completeProcurementAndSendToSupport);
 router.post('/orders/:id/global-po', globalPurchaserAccess, globalProcurementSendToLogistics);
 router.post('/orders/:id/global-checkpoint', globalPurchaserAccess, updateGlobalProcurementCheckpoint);
