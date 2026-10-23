@@ -43,6 +43,15 @@ const QuotationSchema = new mongoose.Schema(
     salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
     salesOrderNumber: { type: String, default: '' },
     convertedAt: { type: Date, default: null },
+    owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    originalOwner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    forwardHistory: [{
+      from: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+      to: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+      forwardedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+      time: { type: Date, default: Date.now },
+      note: { type: String, trim: true, default: '' }
+    }],
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }
   },
   { timestamps: true }

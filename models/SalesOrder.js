@@ -260,6 +260,7 @@ const SalesOrderSchema = new mongoose.Schema(
     ],
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', default: null },
     salesPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
 
     // Financial Control: Inventory Shortage & Customer Advance Tracking

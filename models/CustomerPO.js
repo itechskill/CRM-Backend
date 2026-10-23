@@ -16,6 +16,7 @@ const CustomerPOSchema = new mongoose.Schema(
     uploadedDocument: { type: String, default: '' },
     documentName: { type: String, default: '' },
     status: { type: String, enum: ['Draft', 'Received', 'Linked', 'Processed'], default: 'Received' },
+    owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
   },
   { timestamps: true }

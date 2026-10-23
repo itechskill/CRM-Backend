@@ -21,6 +21,8 @@ const {
   createMyQuotation,
   updateMyQuotation,
   deleteMyQuotation,
+  getQuotationForwardTargets,
+  forwardQuotation,
   convertQuotationToSalesOrder,
   convertQuotationToCustomerPO,
   convertCustomerPOToProductFile,
@@ -80,122 +82,128 @@ const {
   getOrderDocumentPackage
 } = require('../controllers/salesEmployeeController');
 
-// All Departmental Roles, Admin & CEO access departmental CRM endpoints
-const salesEmployeeGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'logistics', 'purchaser', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
+const salesGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'admin', 'ceo')];
+const departmentReadGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'support', 'logistics', 'purchaser', 'accountant', 'finance', 'sales_manager', 'admin', 'ceo')];
+const salesAndSupportGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'support', 'admin', 'ceo')];
+const salesAccountsGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'accountant', 'admin', 'ceo')];
+const paymentGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'accountant', 'finance', 'admin', 'ceo')];
+const accountsGuard = [protect, authorize('accountant', 'admin', 'ceo')];
 const supportInventoryGuard = [protect, authorize('support', 'admin', 'ceo')];
 const financeReviewGuard = [protect, authorize('finance', 'admin', 'ceo')];
 
 // Dashboard stats
-router.get('/stats', salesEmployeeGuard, getMySalesStats);
+router.get('/stats', salesGuard, getMySalesStats);
 
 // Master Document Package
-router.get('/orders/:id/document-package', salesEmployeeGuard, getOrderDocumentPackage);
+router.get('/orders/:id/document-package', departmentReadGuard, getOrderDocumentPackage);
 
 // Customer Overdue Check
-router.get('/check-overdue', salesEmployeeGuard, checkCustomerOverdueApi);
+router.get('/check-overdue', departmentReadGuard, checkCustomerOverdueApi);
 
 // Leads
-router.get('/leads', salesEmployeeGuard, getMyLeads);
-router.post('/leads', salesEmployeeGuard, createMyLead);
-router.post('/leads/:id/convert-to-deal', salesEmployeeGuard, convertLeadToDeal);
-router.patch('/leads/:id', salesEmployeeGuard, updateMyLead);
-router.delete('/leads/:id', salesEmployeeGuard, deleteMyLead);
+router.get('/leads', salesGuard, getMyLeads);
+router.post('/leads', salesGuard, createMyLead);
+router.post('/leads/:id/convert-to-deal', salesGuard, convertLeadToDeal);
+router.patch('/leads/:id', salesGuard, updateMyLead);
+router.delete('/leads/:id', salesGuard, deleteMyLead);
 
 // Deals (Sales Pipeline)
-router.get('/deals', salesEmployeeGuard, getMyDeals);
-router.post('/deals', salesEmployeeGuard, createMyDeal);
-router.patch('/deals/:id', salesEmployeeGuard, updateMyDeal);
-router.delete('/deals/:id', salesEmployeeGuard, deleteMyDeal);
+router.get('/deals', salesGuard, getMyDeals);
+router.post('/deals', salesGuard, createMyDeal);
+router.patch('/deals/:id', salesGuard, updateMyDeal);
+router.delete('/deals/:id', salesGuard, deleteMyDeal);
 
 // Invoices & Finance Handoff
-router.get('/invoices', salesEmployeeGuard, getMyInvoices);
-router.post('/invoices', salesEmployeeGuard, createMyInvoice);
-router.patch('/invoices/:id', salesEmployeeGuard, updateMyInvoice);
-router.delete('/invoices/:id', salesEmployeeGuard, deleteMyInvoice);
-router.post('/invoices/:id/send-to-finance', salesEmployeeGuard, sendInvoiceToFinance);
-router.post('/invoices/:id/return-to-accounts', salesEmployeeGuard, returnInvoiceToAccounts);
-router.post('/invoices/:id/finalize', salesEmployeeGuard, finalizeInvoice);
+router.get('/invoices', departmentReadGuard, getMyInvoices);
+router.post('/invoices', salesAccountsGuard, createMyInvoice);
+router.patch('/invoices/:id', salesAccountsGuard, updateMyInvoice);
+router.delete('/invoices/:id', salesAccountsGuard, deleteMyInvoice);
+router.post('/invoices/:id/send-to-finance', accountsGuard, sendInvoiceToFinance);
+router.post('/invoices/:id/return-to-accounts', financeReviewGuard, returnInvoiceToAccounts);
+router.post('/invoices/:id/finalize', financeReviewGuard, finalizeInvoice);
 
 // Quotations
-router.get('/quotations', salesEmployeeGuard, getMyQuotations);
-router.post('/quotations', salesEmployeeGuard, createMyQuotation);
-router.post('/quotations/:id/convert-to-order', salesEmployeeGuard, convertQuotationToSalesOrder);
-router.post('/quotations/:id/convert-to-po', salesEmployeeGuard, convertQuotationToCustomerPO);
-router.patch('/quotations/:id', salesEmployeeGuard, updateMyQuotation);
-router.delete('/quotations/:id', salesEmployeeGuard, deleteMyQuotation);
+router.get('/quotations', salesGuard, getMyQuotations);
+router.get('/quotations/forward-targets', salesGuard, getQuotationForwardTargets);
+router.post('/quotations', salesGuard, createMyQuotation);
+router.post('/quotations/:id/forward', salesGuard, forwardQuotation);
+router.post('/quotations/:id/convert-to-order', salesGuard, convertQuotationToSalesOrder);
+router.post('/quotations/:id/convert-to-po', salesGuard, convertQuotationToCustomerPO);
+router.patch('/quotations/:id', salesGuard, updateMyQuotation);
+router.delete('/quotations/:id', salesGuard, deleteMyQuotation);
 
 // Sales Orders & Support Handoff
-router.get('/orders', salesEmployeeGuard, getMyOrders);
-router.get('/orders/available-for-delivery', salesEmployeeGuard, getAvailableOrdersForDelivery);
-router.get('/orders/:id/stock-check', salesEmployeeGuard, checkOrderStock);
+router.get('/orders', departmentReadGuard, getMyOrders);
+router.get('/orders/available-for-delivery', salesAndSupportGuard, getAvailableOrdersForDelivery);
+router.get('/orders/:id/stock-check', salesAndSupportGuard, checkOrderStock);
 router.get('/orders/:id/receiving-preview', supportInventoryGuard, getGoodsReceivingPreview);
-router.post('/orders', salesEmployeeGuard, createMyOrder);
-router.post('/orders/:id/send-to-support', salesEmployeeGuard, sendOrderToSupport);
-router.post('/orders/:id/send-to-finance', salesEmployeeGuard, sendSalesOrderToFinance);
+router.post('/orders', salesGuard, createMyOrder);
+router.post('/orders/:id/send-to-support', salesGuard, sendOrderToSupport);
+router.post('/orders/:id/send-to-finance', salesGuard, sendSalesOrderToFinance);
 router.post('/orders/:id/finance-review', financeReviewGuard, financeReviewSalesOrder);
 router.post('/orders/:id/goods-received', supportInventoryGuard, recordGoodsReceivedInOffice);
 router.post('/orders/:id/bl-input', supportInventoryGuard, recordBLInput);
-router.post('/orders/:id/issue-supplier-po', salesEmployeeGuard, issueSupplierPO);
-router.patch('/orders/:id', salesEmployeeGuard, updateMyOrder);
-router.delete('/orders/:id', salesEmployeeGuard, deleteMyOrder);
+router.post('/orders/:id/issue-supplier-po', salesGuard, issueSupplierPO);
+router.patch('/orders/:id', salesGuard, updateMyOrder);
+router.delete('/orders/:id', salesGuard, deleteMyOrder);
 
 // Support & Inventory Department Routes
-router.get('/support/stats', salesEmployeeGuard, getSupportStats);
-router.get('/inventory', salesEmployeeGuard, getInventoryItems);
+router.get('/support/stats', salesAndSupportGuard, getSupportStats);
+router.get('/inventory', departmentReadGuard, getInventoryItems);
 router.post('/inventory', supportInventoryGuard, createOrUpdateInventoryItem);
 router.post('/inventory/:id/in', supportInventoryGuard, addInventoryStock);
 
 // Proforma Invoices
-router.get('/proforma-invoices', salesEmployeeGuard, getMyProformaInvoices);
-router.post('/proforma-invoices', salesEmployeeGuard, createMyProformaInvoice);
-router.patch('/proforma-invoices/:id', salesEmployeeGuard, updateMyProformaInvoice);
-router.delete('/proforma-invoices/:id', salesEmployeeGuard, deleteMyProformaInvoice);
+router.get('/proforma-invoices', salesGuard, getMyProformaInvoices);
+router.post('/proforma-invoices', salesGuard, createMyProformaInvoice);
+router.patch('/proforma-invoices/:id', salesGuard, updateMyProformaInvoice);
+router.delete('/proforma-invoices/:id', salesGuard, deleteMyProformaInvoice);
 
 // Delivery Notes & Accounts Handoff
-router.get('/delivery-notes', salesEmployeeGuard, getMyDeliveryNotes);
-router.post('/delivery-notes', salesEmployeeGuard, createMyDeliveryNote);
-router.post('/delivery-notes/:id/confirm', salesEmployeeGuard, confirmDeliveryNoteWithInventory);
-router.patch('/delivery-notes/:id', salesEmployeeGuard, updateMyDeliveryNote);
-router.delete('/delivery-notes/:id', salesEmployeeGuard, deleteMyDeliveryNote);
+router.get('/delivery-notes', departmentReadGuard, getMyDeliveryNotes);
+router.post('/delivery-notes', salesAndSupportGuard, createMyDeliveryNote);
+router.post('/delivery-notes/:id/confirm', supportInventoryGuard, confirmDeliveryNoteWithInventory);
+router.patch('/delivery-notes/:id', salesAndSupportGuard, updateMyDeliveryNote);
+router.delete('/delivery-notes/:id', salesAndSupportGuard, deleteMyDeliveryNote);
 
 // Accounts Department Stats & Pending Delivery Notes
-router.get('/accounts/stats', salesEmployeeGuard, getAccountsStats);
-router.get('/accounts/pending-delivery-notes', salesEmployeeGuard, getAccountsPendingDeliveryNotes);
+router.get('/accounts/stats', accountsGuard, getAccountsStats);
+router.get('/accounts/pending-delivery-notes', accountsGuard, getAccountsPendingDeliveryNotes);
 
 // Finance Department Stats & Receivables
-router.get('/finance/stats', salesEmployeeGuard, getFinanceStats);
-router.get('/finance/receivables', salesEmployeeGuard, getFinanceReceivables);
+router.get('/finance/stats', financeReviewGuard, getFinanceStats);
+router.get('/finance/receivables', financeReviewGuard, getFinanceReceivables);
 
 // Follow-ups
-router.get('/followups', salesEmployeeGuard, getMyFollowUps);
-router.post('/followups', salesEmployeeGuard, createMyFollowUp);
-router.patch('/followups/:id', salesEmployeeGuard, updateMyFollowUp);
-router.delete('/followups/:id', salesEmployeeGuard, deleteMyFollowUp);
+router.get('/followups', salesGuard, getMyFollowUps);
+router.post('/followups', salesGuard, createMyFollowUp);
+router.patch('/followups/:id', salesGuard, updateMyFollowUp);
+router.delete('/followups/:id', salesGuard, deleteMyFollowUp);
 
 // Customer Purchase Orders
-router.get('/customer-pos', salesEmployeeGuard, getMyCustomerPOs);
-router.post('/customer-pos', salesEmployeeGuard, createMyCustomerPO);
-router.post('/customer-pos/:id/convert-to-file', salesEmployeeGuard, convertCustomerPOToProductFile);
-router.patch('/customer-pos/:id', salesEmployeeGuard, updateMyCustomerPO);
-router.delete('/customer-pos/:id', salesEmployeeGuard, deleteMyCustomerPO);
+router.get('/customer-pos', salesGuard, getMyCustomerPOs);
+router.post('/customer-pos', salesGuard, createMyCustomerPO);
+router.post('/customer-pos/:id/convert-to-file', salesGuard, convertCustomerPOToProductFile);
+router.patch('/customer-pos/:id', salesGuard, updateMyCustomerPO);
+router.delete('/customer-pos/:id', salesGuard, deleteMyCustomerPO);
 
 // Product Files (Blue/Green)
-router.get('/product-files', salesEmployeeGuard, getMyProductFiles);
-router.post('/product-files', salesEmployeeGuard, createMyProductFile);
-router.post('/product-files/:id/convert-to-order', salesEmployeeGuard, convertProductFileToSalesOrder);
-router.patch('/product-files/:id', salesEmployeeGuard, updateMyProductFile);
-router.delete('/product-files/:id', salesEmployeeGuard, deleteMyProductFile);
+router.get('/product-files', salesGuard, getMyProductFiles);
+router.post('/product-files', salesGuard, createMyProductFile);
+router.post('/product-files/:id/convert-to-order', salesGuard, convertProductFileToSalesOrder);
+router.patch('/product-files/:id', salesGuard, updateMyProductFile);
+router.delete('/product-files/:id', salesGuard, deleteMyProductFile);
 
 // Payments
-router.get('/payments', salesEmployeeGuard, getMyPayments);
-router.post('/payments', salesEmployeeGuard, createMyPayment);
-router.patch('/payments/:id', salesEmployeeGuard, updateMyPayment);
-router.delete('/payments/:id', salesEmployeeGuard, deleteMyPayment);
+router.get('/payments', paymentGuard, getMyPayments);
+router.post('/payments', paymentGuard, createMyPayment);
+router.patch('/payments/:id', paymentGuard, updateMyPayment);
+router.delete('/payments/:id', paymentGuard, deleteMyPayment);
 
 // Targets
-router.get('/targets', salesEmployeeGuard, getMyTargets);
+router.get('/targets', salesGuard, getMyTargets);
 
 // Activities
-router.get('/activities', salesEmployeeGuard, getMyActivities);
+router.get('/activities', salesGuard, getMyActivities);
 
 module.exports = router;

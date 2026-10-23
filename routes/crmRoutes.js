@@ -7,22 +7,25 @@ const {
   getSalesContacts, createSalesContact, deleteSalesContact,
   getSalesSummary
 } = require('../controllers/crmController');
-const { protect } = require('../middleware/authMiddleware');
+const { protect, authorize } = require('../middleware/authMiddleware');
 
 router.use(protect);
 
-router.route('/clients').get(getClients).post(createClient);
-router.route('/clients/:id').delete(deleteClient);
+const salesGuard = authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'admin', 'ceo');
+const salesMarketingGuard = authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'marketing', 'admin', 'ceo');
 
-router.route('/deals').get(getDeals).post(createDeal);
-router.route('/deals/:id').patch(updateDeal).delete(deleteDeal);
+router.route('/clients').get(salesMarketingGuard, getClients).post(salesMarketingGuard, createClient);
+router.route('/clients/:id').delete(salesMarketingGuard, deleteClient);
 
-router.route('/leads').get(getLeads).post(createLead);
-router.route('/leads/:id').patch(updateLead).delete(deleteLead);
+router.route('/deals').get(salesGuard, getDeals).post(salesGuard, createDeal);
+router.route('/deals/:id').patch(salesGuard, updateDeal).delete(salesGuard, deleteDeal);
+
+router.route('/leads').get(salesMarketingGuard, getLeads).post(salesMarketingGuard, createLead);
+router.route('/leads/:id').patch(salesMarketingGuard, updateLead).delete(salesMarketingGuard, deleteLead);
 
 router.route('/contacts').get(getSalesContacts).post(createSalesContact);
 router.route('/contacts/:id').delete(deleteSalesContact);
 
-router.route('/sales-summary').get(getSalesSummary);
+router.route('/sales-summary').get(salesMarketingGuard, getSalesSummary);
 
 module.exports = router;

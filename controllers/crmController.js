@@ -3,7 +3,13 @@ const Deal = require('../models/Deal');
 const Lead = require('../models/Lead');
 const SalesContact = require('../models/SalesContact');
 const { notifyRoleHelper } = require('./notificationController');
-const { getSalesManagerScope } = require('../utils/salesManagerScope');
+const { isGlobalSalesUser, ownsSalesRecord, applyOwnerScope } = require('../utils/salesOwnership');
+
+const crmScope = (user) => {
+  if (isGlobalSalesUser(user)) return {};
+  if (user?.role === 'marketing') return { createdBy: user._id };
+  return applyOwnerScope([], user);
+};
 
 
 // CLIENTS API
@@ -51,11 +57,7 @@ const deleteClient = async (req, res) => {
 // DEALS API
 const getDeals = async (req, res) => {
   try {
-    let query = {};
-    if (req.user && req.user.role === 'sales_manager') {
-      const scope = await getSalesManagerScope(req.user);
-      query = { $or: [{ assignedTo: { $in: scope.memberIds } }, { createdBy: { $in: scope.memberIds } }] };
-    }
+    const query = crmScope(req.user);
     const deals = await Deal.find(query).sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: deals.length, data: deals });
   } catch (error) {
@@ -76,6 +78,7 @@ const createDeal = async (req, res) => {
       probability: probability ? Number(probability) : 50,
       closingDate: closingDate || null,
       leadId: leadId || null,
+      owner: req.user._id,
       createdBy: req.user._id
     });
 
@@ -115,6 +118,9 @@ const createDeal = async (req, res) => {
 
 const updateDeal = async (req, res) => {
   try {
+    const existing = await Deal.findById(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Deal not found.' });
+    if (!ownsSalesRecord(existing, req.user)) return res.status(403).json({ success: false, message: 'Access denied. You can only update your own deals.' });
     const deal = await Deal.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
     if (!deal) {
       return res.status(404).json({ success: false, message: 'Deal not found.' });
@@ -163,6 +169,9 @@ const updateDeal = async (req, res) => {
 
 const deleteDeal = async (req, res) => {
   try {
+    const existing = await Deal.findById(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Deal not found.' });
+    if (!ownsSalesRecord(existing, req.user)) return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own deals.' });
     const deal = await Deal.findByIdAndDelete(req.params.id);
     if (!deal) {
       return res.status(404).json({ success: false, message: 'Deal not found.' });
@@ -176,11 +185,7 @@ const deleteDeal = async (req, res) => {
 // LEADS API
 const getLeads = async (req, res) => {
   try {
-    let query = {};
-    if (req.user && req.user.role === 'sales_manager') {
-      const scope = await getSalesManagerScope(req.user);
-      query = { $or: [{ assignedTo: { $in: scope.memberIds } }, { createdBy: { $in: scope.memberIds } }] };
-    }
+    const query = crmScope(req.user);
     const leads = await Lead.find(query)
       .populate('assignedTo', 'fullName email role')
       .populate('createdBy', 'fullName email')
@@ -207,6 +212,7 @@ const createLead = async (req, res) => {
       campaign: campaign || '',
       notes: notes || '',
       assignedTo: assignedTo || null,
+      owner: assignedTo || req.user._id,
       createdBy: req.user._id
     });
 
@@ -228,7 +234,15 @@ const createLead = async (req, res) => {
 
 const updateLead = async (req, res) => {
   try {
-    const lead = await Lead.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    const existing = await Lead.findById(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Lead not found.' });
+    const marketingOwns = req.user.role === 'marketing' && existing.createdBy?.toString() === req.user._id.toString();
+    if (!ownsSalesRecord(existing, req.user) && !marketingOwns) return res.status(403).json({ success: false, message: 'Access denied. You can only update your own leads.' });
+    const update = { ...req.body };
+    delete update.owner;
+    delete update.createdBy;
+    if (update.assignedTo) update.owner = update.assignedTo;
+    const lead = await Lead.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
     if (!lead) {
       return res.status(404).json({ success: false, message: 'Lead not found.' });
     }
@@ -251,10 +265,11 @@ const updateLead = async (req, res) => {
 
 const deleteLead = async (req, res) => {
   try {
+    const existing = await Lead.findById(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Lead not found.' });
+    const marketingOwns = req.user.role === 'marketing' && existing.createdBy?.toString() === req.user._id.toString();
+    if (!ownsSalesRecord(existing, req.user) && !marketingOwns) return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own leads.' });
     const lead = await Lead.findByIdAndDelete(req.params.id);
-    if (!lead) {
-      return res.status(404).json({ success: false, message: 'Lead not found.' });
-    }
     return res.status(200).json({ success: true, message: 'Lead deleted successfully.' });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error deleting lead.' });
@@ -314,8 +329,8 @@ const getSalesSummary = async (req, res) => {
     sixMonthsAgo.setDate(1);
 
     const [leads, deals, clients] = await Promise.all([
-      Lead.find().populate('assignedTo', 'fullName').lean(),
-      Deal.find().lean(),
+      Lead.find(crmScope(req.user)).populate('assignedTo', 'fullName').lean(),
+      Deal.find(crmScope(req.user)).lean(),
       Client.countDocuments()
     ]);
 

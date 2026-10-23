@@ -19,6 +19,7 @@ const Payroll = require('../models/Payroll');
 const Attendance = require('../models/Attendance');
 const Leave = require('../models/Leave');
 const User = require('../models/User');
+const Notification = require('../models/Notification');
 const Shipment = require('../models/Shipment');
 const SupplierPO = require('../models/SupplierPO');
 const PurchaserGRN = require('../models/PurchaserGRN');
@@ -29,6 +30,13 @@ const { allocateGrnNumber, withGrnDuplicateRecovery } = require('../utils/grnNum
 const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
 const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
+const {
+  isGlobalSalesUser,
+  effectiveOwnerId,
+  ownsSalesRecord,
+  ownerScope,
+  applyOwnerScope
+} = require('../utils/salesOwnership');
 const { getSalesManagerScope } = require('../utils/salesManagerScope');
 const { DOCUMENT_TYPES, getCompanySnapshot, inheritCompanySnapshot, resolvePOCompany } = require('../config/companies');
 
@@ -43,17 +51,28 @@ const logSalesActivity = async ({ type, description, relatedModel, relatedId, pe
   }
 };
 
-const checkOwnership = (record, fields, userId, reqUser) => {
-  if (reqUser && ['sales_manager', 'admin', 'ceo'].includes(reqUser.role)) {
-    return true; // Sales Manager, Admin, CEO have full authorized access to view, edit, and delete any record
-  }
-  if (!record) return false;
-  const userStr = userId.toString();
-  const fieldList = Array.isArray(fields) ? fields : [fields];
-  return fieldList.some(field => {
-    const val = record[field]?.toString?.() || record[field];
-    return val === userStr;
-  });
+const checkOwnership = (record, fields, userId, reqUser) => ownsSalesRecord(record, reqUser || { _id: userId });
+
+const ownershipDenied = (res, resource) => res.status(403).json({
+  success: false,
+  message: `Access denied. You can only access your own ${resource}.`
+});
+
+const canAccessDepartmentOrder = (order, user, department) => {
+  if (isGlobalSalesUser(user)) return true;
+  const userRole = String(user?.role || '').toLowerCase();
+  const userDepartment = String(user?.department || '').toLowerCase();
+  const required = String(department || '').toLowerCase();
+  const aliases = {
+    accounts: ['accountant', 'accounts', 'accounting'],
+    finance: ['finance'],
+    support: ['support'],
+    logistics: ['logistics'],
+    purchaser: ['purchaser', 'procurement']
+  }[required] || [required];
+  const isDepartmentUser = aliases.some(alias => userRole === alias || userDepartment.includes(alias));
+  const orderDepartment = `${order?.currentDepartment || ''} ${order?.departmentResponsible || ''}`.toLowerCase();
+  return isDepartmentUser && orderDepartment.includes(required);
 };
 
 const CUSTOMER_PO_ATTACHMENT_EXTENSION = /\.(pdf|xls|xlsx|png|jpe?g|webp|gif|bmp)$/i;
@@ -320,16 +339,17 @@ const getMySalesStats = async (req, res) => {
     const userId = req.user._id;
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const salesStatsScope = isGlobalSalesUser(req.user) ? {} : ownerScope(userId);
 
     const [leads, quotations, orders, deals, followUps, targets, user, invoices, payroll, attendances, leaves, tasks, projects] = await Promise.all([
-      Lead.find({ $or: [{ assignedTo: userId }, { createdBy: userId }] }),
-      Quotation.find({ createdBy: userId }),
-      SalesOrder.find({ $or: [{ salesPerson: userId }, { createdBy: userId }] }),
-      Deal.find({ $or: [{ assignedTo: userId }, { createdBy: userId }] }),
-      FollowUp.find({ createdBy: userId }),
-      SalesTarget.find({ employee: userId }).sort({ createdAt: -1 }),
+      Lead.find(salesStatsScope),
+      Quotation.find(salesStatsScope),
+      SalesOrder.find(salesStatsScope),
+      Deal.find(salesStatsScope),
+      FollowUp.find(isGlobalSalesUser(req.user) ? {} : { createdBy: userId }),
+      SalesTarget.find(isGlobalSalesUser(req.user) ? {} : { employee: userId }).sort({ createdAt: -1 }),
       User.findById(userId),
-      Invoice.find({ $or: [{ salesPerson: userId }, { createdBy: userId }] }),
+      Invoice.find(isGlobalSalesUser(req.user) ? {} : { $or: [{ salesPerson: userId }, { createdBy: userId }] }),
       Payroll.findOne({ user: userId, month: now.getMonth() + 1, year: now.getFullYear() }),
       Attendance.find({ user: userId, date: { $gte: startOfMonth } }),
       Leave.find({ user: userId, createdAt: { $gte: startOfMonth } }),
@@ -539,22 +559,18 @@ const getMyLeads = async (req, res) => {
     const userId = req.user._id;
     const { status, search } = req.query;
 
-    const query = {
-      $or: [{ assignedTo: userId }, { createdBy: userId }]
-    };
+    const conditions = [];
 
     if (status && status !== 'all') {
-      query.status = status;
+      conditions.push({ status });
     }
 
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$and = [
-        { $or: [{ assignedTo: userId }, { createdBy: userId }] },
-        { $or: [{ name: regex }, { company: regex }, { email: regex }, { phone: regex }] }
-      ];
-      delete query.$or;
+      conditions.push({ $or: [{ name: regex }, { company: regex }, { email: regex }, { phone: regex }] });
     }
+
+    const query = applyOwnerScope(conditions, req.user);
 
     const leads = await Lead.find(query).sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: leads.length, data: leads });
@@ -586,6 +602,7 @@ const createMyLead = async (req, res) => {
       requirements: requirements || '',
       followUpDate: followUpDate || null,
       assignedTo: req.user._id,
+      owner: req.user._id,
       createdBy: req.user._id
     });
 
@@ -624,7 +641,7 @@ const updateMyLead = async (req, res) => {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ success: false, message: 'Lead not found.' });
 
-    if (!checkOwnership(lead, ['assignedTo', 'createdBy'], req.user._id, req.user)) {
+    if (!ownsSalesRecord(lead, req.user)) {
       return res.status(403).json({ success: false, message: 'Access denied. You can only update your own leads.' });
     }
 
@@ -662,6 +679,7 @@ const convertLeadToDeal = async (req, res) => {
   try {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ success: false, message: 'Lead not found.' });
+    if (!ownsSalesRecord(lead, req.user)) return ownershipDenied(res, 'leads');
 
     const { title, value, stage, probability, closingDate, notes } = req.body;
 
@@ -680,7 +698,8 @@ const convertLeadToDeal = async (req, res) => {
       closingDate: closingDate ? new Date(closingDate) : null,
       notes: notes || lead.notes || '',
       leadId: lead._id,
-      assignedTo: lead.assignedTo || req.user._id,
+      assignedTo: effectiveOwnerId(lead) || req.user._id,
+      owner: effectiveOwnerId(lead) || req.user._id,
       createdBy: req.user._id
     });
 
@@ -729,22 +748,18 @@ const getMyDeals = async (req, res) => {
     const userId = req.user._id;
     const { stage, search } = req.query;
 
-    const query = {
-      $or: [{ assignedTo: userId }, { createdBy: userId }]
-    };
+    const conditions = [];
 
     if (stage && stage !== 'all') {
-      query.stage = stage;
+      conditions.push({ stage });
     }
 
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$and = [
-        { $or: [{ assignedTo: userId }, { createdBy: userId }] },
-        { $or: [{ title: regex }, { clientName: regex }] }
-      ];
-      delete query.$or;
+      conditions.push({ $or: [{ title: regex }, { clientName: regex }] });
     }
+
+    const query = applyOwnerScope(conditions, req.user);
 
     const deals = await Deal.find(query).populate('leadId', 'name company email phone').sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: deals.length, data: deals });
@@ -781,6 +796,7 @@ const createMyDeal = async (req, res) => {
       leadId: leadId || null,
       notes: notes || '',
       assignedTo: req.user._id,
+      owner: req.user._id,
       createdBy: req.user._id
     });
 
@@ -833,7 +849,7 @@ const updateMyDeal = async (req, res) => {
     const deal = await Deal.findById(req.params.id);
     if (!deal) return res.status(404).json({ success: false, message: 'Deal not found.' });
 
-    if (!checkOwnership(deal, ['assignedTo', 'createdBy'], req.user._id, req.user)) {
+    if (!ownsSalesRecord(deal, req.user)) {
       return res.status(403).json({ success: false, message: 'Access denied. You can only update your own deals.' });
     }
 
@@ -891,7 +907,7 @@ const getMyInvoices = async (req, res) => {
     const userId = req.user._id;
     const { status, search } = req.query;
 
-    const isGlobal = ['admin', 'ceo', 'accountant', 'finance', 'sales_manager'].includes(req.user.role) ||
+    const isGlobal = ['admin', 'ceo', 'accountant', 'finance'].includes(req.user.role) ||
       ['accounts', 'finance', 'administration'].includes((req.user.department || '').toLowerCase());
     const query = isGlobal ? {} : { createdBy: userId };
     if (status && status !== 'all') {
@@ -1215,6 +1231,7 @@ const convertQuotationToCustomerPO = async (req, res) => {
     if (!quotation) {
       return res.status(404).json({ success: false, message: 'Quotation not found.' });
     }
+    if (!ownsSalesRecord(quotation, req.user)) return ownershipDenied(res, 'quotations');
 
     const { poNumber, poDate, notes, uploadedDocument, documentName } = req.body;
     if (!hasValidCustomerPOAttachment({ uploadedDocument, documentName })) {
@@ -1235,6 +1252,7 @@ const convertQuotationToCustomerPO = async (req, res) => {
       uploadedDocument: uploadedDocument || '',
       documentName: documentName || '',
       status: 'Received',
+      owner: effectiveOwnerId(quotation),
       createdBy: req.user._id
     });
 
@@ -1275,6 +1293,7 @@ const convertCustomerPOToProductFile = async (req, res) => {
     if (!po) {
       return res.status(404).json({ success: false, message: 'Customer PO not found.' });
     }
+    if (!ownsSalesRecord(po, req.user)) return ownershipDenied(res, 'customer POs');
     if (!hasValidCustomerPOAttachment(po)) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
@@ -1287,6 +1306,7 @@ const convertCustomerPOToProductFile = async (req, res) => {
     if (po.quotationId) {
       linkedQuotation = await Quotation.findById(po.quotationId);
       if (linkedQuotation) {
+        if (!ownsSalesRecord(linkedQuotation, req.user)) return ownershipDenied(res, 'quotations');
         quotationNumber = linkedQuotation.orderReference || linkedQuotation.quotationNumber || quotationNumber;
         if (linkedQuotation.items && linkedQuotation.items.length) {
           quoteItems = linkedQuotation.items.map(it => ({
@@ -1313,6 +1333,7 @@ const convertCustomerPOToProductFile = async (req, res) => {
       products: Array.isArray(products) && products.length > 0 ? products : quoteItems,
       notes: notes || po.notes || '',
       status: 'Active',
+      owner: effectiveOwnerId(po),
       createdBy: req.user._id
     });
 
@@ -1353,6 +1374,7 @@ const convertProductFileToSalesOrder = async (req, res) => {
     if (!file) {
       return res.status(404).json({ success: false, message: 'Product file not found.' });
     }
+    if (!ownsSalesRecord(file, req.user)) return ownershipDenied(res, 'product files');
 
     if (!file.customerPOId) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
@@ -1361,6 +1383,7 @@ const convertProductFileToSalesOrder = async (req, res) => {
     if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
+    if (!ownsSalesRecord(customerPO, req.user)) return ownershipDenied(res, 'customer POs');
 
     const { orderReference, clientAddress, clientEmail, clientPhone, items, totalAmount, discount, tax, netAmount, deliveryDate, notes, stockStatus, suggestedFileType } = req.body;
 
@@ -1374,6 +1397,7 @@ const convertProductFileToSalesOrder = async (req, res) => {
 
     if (file.quotationId) {
       quoteRef = await Quotation.findById(file.quotationId);
+      if (quoteRef && !ownsSalesRecord(quoteRef, req.user)) return ownershipDenied(res, 'quotations');
       if (quoteRef && (!netAmt || netAmt === 0)) {
         netAmt = Number(quoteRef.netAmount) || Number(quoteRef.totalAmount) || 0;
       }
@@ -1435,7 +1459,8 @@ const convertProductFileToSalesOrder = async (req, res) => {
       customerPOId: customerPO._id,
       customerPONumber: customerPO.poNumber || file.customerPONumber || '',
       productFileId: file._id,
-      salesPerson: req.user._id,
+      salesPerson: effectiveOwnerId(file),
+      owner: effectiveOwnerId(file),
       createdBy: req.user._id,
       workflowHistory: [
         {
@@ -1506,6 +1531,7 @@ const convertQuotationToSalesOrder = async (req, res) => {
     if (!quotation) {
       return res.status(404).json({ success: false, message: 'Quotation not found.' });
     }
+    if (!ownsSalesRecord(quotation, req.user)) return ownershipDenied(res, 'quotations');
 
     if (quotation.status === 'Converted to Sales Order' || quotation.status === 'Converted') {
       return res.status(400).json({
@@ -1523,6 +1549,7 @@ const convertQuotationToSalesOrder = async (req, res) => {
     if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
+    if (!ownsSalesRecord(customerPO, req.user)) return ownershipDenied(res, 'customer POs');
 
     const { deliveryDate, notes, stockStatus, suggestedFileType } = req.body;
 
@@ -1535,7 +1562,7 @@ const convertQuotationToSalesOrder = async (req, res) => {
       orderReference: req.body.orderReference || quotation.orderReference || '',
       clientName: quotation.clientName,
       clientAddress: quotation.clientAddress || '',
-      salePerson: quotation.salePerson || req.user.fullName,
+      salePerson: req.user.fullName,
       fileNo: quotation.fileNo || '',
       fileType: quotation.fileType || '',
       suggestedFileType: ['Green', 'Blue'].includes(suggestedFileType) ? suggestedFileType : '',
@@ -1580,7 +1607,8 @@ const convertQuotationToSalesOrder = async (req, res) => {
       leadId: quotation.leadId || null,
       customerPOId: customerPO._id,
       customerPONumber: customerPO.poNumber || '',
-      salesPerson: req.user._id,
+      salesPerson: effectiveOwnerId(quotation),
+      owner: effectiveOwnerId(quotation),
       createdBy: req.user._id,
       workflowHistory: [
         {
@@ -1637,58 +1665,47 @@ const convertQuotationToSalesOrder = async (req, res) => {
 const getMyQuotations = async (req, res) => {
   try {
     const { status, search, employeeId } = req.query;
-    const isGlobal = ['admin', 'ceo'].includes(req.user.role);
-    const query = {};
+    const conditions = [];
 
-    if (req.user.role === 'sales_manager') {
-      const scope = await getSalesManagerScope(req.user);
-      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
-      const managerConditions = [
-        { createdBy: { $in: scope.memberIds } },
-        { salesPerson: { $in: scope.memberIds } }
-      ];
-      if (nameRegexes.length > 0) {
-        managerConditions.push({ salePerson: { $in: nameRegexes } });
-      }
-
-      if (employeeId && employeeId !== 'all') {
-        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
-        if (!isMember) {
-          return res.status(200).json({ success: true, count: 0, data: [] });
-        }
-        query.$or = [{ createdBy: employeeId }, { salesPerson: employeeId }];
-      } else {
-        query.$or = managerConditions;
-      }
-    } else if (isGlobal) {
-      if (employeeId && employeeId !== 'all') query.createdBy = employeeId;
+    if (isGlobalSalesUser(req.user)) {
+      if (employeeId && employeeId !== 'all') conditions.push(ownerScope(employeeId));
     } else {
-      query.createdBy = req.user._id;
+      conditions.push({ $or: [ownerScope(req.user._id), { originalOwner: req.user._id }] });
     }
 
     // Pending workflow: 'active' filter excludes converted quotations
     if (status === 'active' || !status) {
-      query.status = { $nin: ['Converted to Customer PO', 'Converted to Sales Order', 'Converted', 'Rejected', 'Expired'] };
+      conditions.push({ status: { $nin: ['Converted to Customer PO', 'Converted to Sales Order', 'Converted', 'Rejected', 'Expired'] } });
     } else if (status === 'converted') {
-      query.status = { $in: ['Converted to Customer PO', 'Converted to Sales Order', 'Converted'] };
+      conditions.push({ status: { $in: ['Converted to Customer PO', 'Converted to Sales Order', 'Converted'] } });
     } else if (status && status !== 'all') {
-      query.status = status;
+      conditions.push({ status });
     }
 
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [
+      conditions.push({ $or: [
         { orderReference: regex },
         { quotationNumber: regex },
         { clientName: regex },
         { salePerson: regex },
         { productSummary: regex },
         { fileNo: regex }
-      ];
+      ] });
     }
 
-    const quotations = await Quotation.find(query).sort({ creationDate: -1, createdAt: -1 });
-    return res.status(200).json({ success: true, count: quotations.length, data: quotations });
+    const query = conditions.length ? { $and: conditions } : {};
+    const quotations = await Quotation.find(query)
+      .populate('owner originalOwner', 'fullName email')
+      .populate('forwardHistory.from forwardHistory.to forwardHistory.forwardedBy', 'fullName email')
+      .sort({ creationDate: -1, createdAt: -1 })
+      .lean();
+    const data = quotations.map(quotation => ({
+      ...quotation,
+      isForwardedReadOnly: !isGlobalSalesUser(req.user) &&
+        effectiveOwnerId(quotation)?.toString() !== req.user._id.toString()
+    }));
+    return res.status(200).json({ success: true, count: data.length, data });
   } catch (error) {
     console.error('[Get Quotations Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching quotations.' });
@@ -1748,6 +1765,8 @@ const createMyQuotation = async (req, res) => {
       notes: notes || '',
       issuingCompany,
       leadId: leadId || null,
+      owner: req.user._id,
+      originalOwner: req.user._id,
       createdBy: req.user._id
     });
 
@@ -1774,6 +1793,7 @@ const updateMyQuotation = async (req, res) => {
   try {
     const quotation = await Quotation.findById(req.params.id);
     if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found.' });
+    if (!ownsSalesRecord(quotation, req.user)) return ownershipDenied(res, 'quotations');
 
     if (req.body.issuingCompanyCode !== undefined) {
       quotation.issuingCompany = getCompanySnapshot(req.body.issuingCompanyCode, DOCUMENT_TYPES.QUOTATION);
@@ -1842,6 +1862,124 @@ const updateMyQuotation = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════
+const getQuotationForwardTargets = async (req, res) => {
+  try {
+    if (!req.user.canForwardQuotations) {
+      return res.status(403).json({ success: false, message: 'Quotation forwarding permission is required.' });
+    }
+    const targets = await User.find({
+      _id: { $ne: req.user._id }, status: 'active', isApproved: true,
+      $or: [
+        { role: { $in: ['sales_member', 'sales_rep', 'sales_person', 'sales_manager'] } },
+        { role: 'employee', department: { $regex: /sales/i } }
+      ]
+    }).select('_id fullName email role').sort({ fullName: 1 }).lean();
+    return res.status(200).json({ success: true, count: targets.length, data: targets });
+  } catch (error) {
+    console.error('[Quotation Forward Targets Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching quotation forwarding targets.' });
+  }
+};
+
+const forwardQuotation = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    if (!req.user.canForwardQuotations) {
+      return res.status(403).json({ success: false, message: 'Quotation forwarding permission is required.' });
+    }
+    const { targetUserId, note = '' } = req.body;
+    if (!mongoose.Types.ObjectId.isValid(targetUserId)) {
+      return res.status(400).json({ success: false, message: 'Select a valid Sales account.' });
+    }
+    if (req.user._id.toString() === targetUserId.toString()) {
+      return res.status(400).json({ success: false, message: 'A quotation cannot be forwarded to its current owner.' });
+    }
+    const target = await User.findOne({
+      _id: targetUserId, status: 'active', isApproved: true,
+      $or: [
+        { role: { $in: ['sales_member', 'sales_rep', 'sales_person', 'sales_manager'] } },
+        { role: 'employee', department: { $regex: /sales/i } }
+      ]
+    }).select('_id fullName email role');
+    if (!target) {
+      return res.status(400).json({ success: false, message: 'The forwarding target must be an active Sales account.' });
+    }
+
+    let forwardedQuotation;
+    await session.withTransaction(async () => {
+      const ownershipCondition = { $or: [
+        { owner: req.user._id },
+        { owner: { $exists: false }, createdBy: req.user._id },
+        { owner: null, createdBy: req.user._id }
+      ] };
+      const current = await Quotation.findOne({ _id: req.params.id, ...ownershipCondition }).session(session);
+      if (!current) {
+        const exists = await Quotation.exists({ _id: req.params.id }).session(session);
+        const error = new Error(exists ? 'The quotation owner changed before forwarding. Refresh and try again.' : 'Quotation not found.');
+        error.statusCode = exists ? 409 : 404;
+        throw error;
+      }
+      if (current.customerPOId || ['Converted to Customer PO', 'Converted to Sales Order', 'Converted'].includes(current.status)) {
+        const error = new Error('This quotation can no longer be forwarded because its Customer PO has been confirmed or it has already been converted.');
+        error.statusCode = 409;
+        throw error;
+      }
+      const originalOwner = current.originalOwner || effectiveOwnerId(current);
+      forwardedQuotation = await Quotation.findOneAndUpdate(
+        { _id: current._id, ...ownershipCondition },
+        {
+          $set: { owner: target._id, originalOwner },
+          $push: { forwardHistory: { from: req.user._id, to: target._id, forwardedBy: req.user._id, time: new Date(), note: String(note || '').trim() } }
+        },
+        { new: true, session, runValidators: true }
+      );
+      if (!forwardedQuotation) {
+        const error = new Error('The quotation owner changed before forwarding. Refresh and try again.');
+        error.statusCode = 409;
+        throw error;
+      }
+      await Promise.all([
+        CustomerPO.updateMany({ quotationId: current._id }, { $set: { owner: target._id } }, { session }),
+        ProductFile.updateMany({ quotationId: current._id }, { $set: { owner: target._id } }, { session })
+      ]);
+      const firstItem = current.items?.[0];
+      const product = current.productSummary || firstItem?.description || 'Not specified';
+      const quantity = (current.items || []).reduce((sum, item) => sum + (Number(item.quantity) || 0), 0) || 1;
+      const issuingCompany = current.issuingCompany?.name || current.issuingCompany?.legalName || current.issuingCompany?.code || 'Not specified';
+      const linkedLead = current.leadId ? await Lead.findById(current.leadId).select('contactPerson name').session(session) : null;
+      const contactPerson = linkedLead?.contactPerson || linkedLead?.name || current.clientEmail || current.clientPhone || 'Not specified';
+      await Notification.create([{
+        recipient: target._id,
+        sender: req.user._id,
+        title: 'Quotation Forwarded to You',
+        message: `${req.user.fullName} forwarded quotation ${current.orderReference || current.quotationNumber || current.fileNo}. Customer: ${current.clientName}; contact: ${contactPerson}; product: ${product}; quantity: ${quantity}; issuing company: ${issuingCompany}.`,
+        type: 'sales',
+        link: `/sales/quotations?quotationId=${current._id}`,
+        data: {
+          quotationId: current._id,
+          customerCompany: current.clientName || '',
+          contactPerson,
+          product,
+          quantity,
+          issuingCompany
+        },
+        isRead: false
+      }], { session });
+    });
+    await forwardedQuotation.populate('owner originalOwner', 'fullName email');
+    return res.status(200).json({ success: true, message: `Quotation forwarded to ${target.fullName}.`, data: forwardedQuotation });
+  } catch (error) {
+    console.error('[Forward Quotation Error]:', error);
+    const isRace = error?.errorLabels?.includes?.('TransientTransactionError') || error?.code === 112;
+    return res.status(error.statusCode || (isRace ? 409 : 500)).json({
+      success: false,
+      message: (error.statusCode || isRace) ? error.message : 'Server error forwarding quotation.'
+    });
+  } finally {
+    await session.endSession();
+  }
+};
+
 // SALES ORDERS
 // ══════════════════════════════════════════════
 /**
@@ -1856,32 +1994,10 @@ const getMyOrders = async (req, res) => {
     
     const conditions = [];
 
-    if (req.user.role === 'sales_manager') {
-      const scope = await getSalesManagerScope(req.user);
-      const nameRegexes = scope.memberNames.map(n => new RegExp(`^${n}$`, 'i'));
-      const managerConditions = [
-        { createdBy: { $in: scope.memberIds } },
-        { salesPerson: { $in: scope.memberIds } }
-      ];
-      if (nameRegexes.length > 0) {
-        managerConditions.push({ salePerson: { $in: nameRegexes } });
-      }
-
-      if (employeeId && employeeId !== 'all') {
-        const isMember = scope.memberIds.some(id => id.toString() === employeeId.toString());
-        if (!isMember) {
-          return res.status(200).json({ success: true, count: 0, data: [] });
-        }
-        conditions.push({ $or: [{ createdBy: employeeId }, { salesPerson: employeeId }] });
-      } else {
-        conditions.push({ $or: managerConditions });
-      }
-    } else if (isGlobalAccess) {
-      if (employeeId) conditions.push({ createdBy: employeeId });
+    if (isGlobalAccess) {
+      if (employeeId && ['admin', 'ceo'].includes(req.user.role)) conditions.push(ownerScope(employeeId));
     } else {
-      conditions.push({
-        $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }]
-      });
+      conditions.push(ownerScope(req.user._id));
     }
 
     // Pending workflow: 'active' filter shows orders pending action by Sales (including rejected ones awaiting salesperson action)
@@ -2008,14 +2124,18 @@ const createMyOrder = async (req, res) => {
     if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
+    if (!ownsSalesRecord(customerPO, req.user)) return ownershipDenied(res, 'customer POs');
 
     const linkedProductFile = productFileId && mongoose.Types.ObjectId.isValid(productFileId)
       ? await ProductFile.findById(productFileId)
       : null;
+    if (linkedProductFile && !ownsSalesRecord(linkedProductFile, req.user)) return ownershipDenied(res, 'product files');
     const linkedQuotationId = quotationId && mongoose.Types.ObjectId.isValid(quotationId)
       ? quotationId
       : (linkedProductFile?.quotationId || customerPO.quotationId || null);
     const linkedQuotation = linkedQuotationId ? await Quotation.findById(linkedQuotationId) : null;
+    if (linkedQuotation && !ownsSalesRecord(linkedQuotation, req.user)) return ownershipDenied(res, 'quotations');
+    const orderOwner = effectiveOwnerId(linkedProductFile) || effectiveOwnerId(linkedQuotation) || effectiveOwnerId(customerPO) || req.user._id;
     const resolvedFileType = linkedProductFile?.fileType || linkedQuotation?.fileType || customerPO.fileType || '';
     const resolvedFileNumber = linkedProductFile?.fileNumber || linkedQuotation?.fileNo || customerPO.fileNumber || await allocateFileNumber();
 
@@ -2069,7 +2189,8 @@ const createMyOrder = async (req, res) => {
       customerPONumber: customerPO.poNumber || customerPONumber || '',
       productFileId: productFileId && mongoose.Types.ObjectId.isValid(productFileId) ? productFileId : null,
       leadId: leadId && mongoose.Types.ObjectId.isValid(leadId) ? leadId : null,
-      salesPerson: req.user._id,
+      salesPerson: orderOwner,
+      owner: orderOwner,
       createdBy: req.user._id
     });
 
@@ -2129,6 +2250,7 @@ const financeReviewSalesOrder = async (req, res) => {
     const fileTypeChoice = (req.body.fileType || '').trim(); // 'Green' or 'Blue'
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    if (!canAccessDepartmentOrder(order, req.user, 'finance')) return ownershipDenied(res, 'Finance queue sales orders');
 
     if (action === 'block' || action === 'hold') {
       // Flowchart: Overdue? YES -> Order Blocked / Hold -> STOP
@@ -2378,6 +2500,7 @@ const updateMyOrder = async (req, res) => {
   try {
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    if (!ownsSalesRecord(order, req.user)) return ownershipDenied(res, 'sales orders');
 
     if (req.body.orderNumber && !req.body.orderReference) req.body.orderReference = req.body.orderNumber;
     if (req.body.orderReference && !req.body.orderNumber) req.body.orderNumber = req.body.orderReference;
@@ -2454,6 +2577,9 @@ const checkOrderStock = async (req, res) => {
   try {
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    if (!ownsSalesRecord(order, req.user) && !canAccessDepartmentOrder(order, req.user, 'support')) {
+      return ownershipDenied(res, 'sales orders');
+    }
     const stock = await getDeliveryStockRequirements(order);
     const stockCheckResults = stock.requirements.map(line => {
       const inv = line.inventoryItem;
@@ -2511,6 +2637,7 @@ const getGoodsReceivingPreview = async (req, res) => {
   try {
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    if (!canAccessDepartmentOrder(order, req.user, 'support')) return ownershipDenied(res, 'Support queue sales orders');
 
     const inventoryItems = await InventoryItem.find({}).sort({ name: 1 });
     const receivedTotals = getReceivedQuantityByOrderItem(order);
@@ -2581,12 +2708,15 @@ const getGoodsReceivingPreview = async (req, res) => {
 const getAvailableOrdersForDelivery = async (req, res) => {
   try {
     // Support queue: goods must be physically received in office before Delivery Note creation.
-    const orders = await SalesOrder.find({
+    const conditions = [{
       goodsReceivedInOffice: { $ne: null },
       'goodsReceivedInOffice.received': true,
       $or: [{ currentDepartment: 'Support' }, { departmentResponsible: 'Support' }],
       deliveryNoteId: null
-    }).sort({ createdAt: -1 });
+    }];
+    const isSupportQueueUser = req.user.role === 'support' || String(req.user.department || '').toLowerCase().includes('support');
+    if (!isSupportQueueUser && !isGlobalSalesUser(req.user)) conditions.unshift(ownerScope(req.user._id));
+    const orders = await SalesOrder.find({ $and: conditions }).sort({ createdAt: -1 });
 
     return res.status(200).json({ success: true, count: orders.length, data: orders });
   } catch (error) {
@@ -2602,13 +2732,7 @@ const getMyDeliveryNotes = async (req, res) => {
   try {
     let filter = {};
     if (req.user.role === 'sales_manager') {
-      const scope = await getSalesManagerScope(req.user);
-      filter = {
-        $or: [
-          { createdBy: { $in: scope.memberIds } },
-          { salesPerson: { $in: scope.memberIds } }
-        ]
-      };
+      filter = { $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }] };
     } else {
       const isPrivilegedOrDept = ['admin', 'ceo', 'support', 'accountant', 'finance'].includes(req.user.role) ||
         ['support', 'accounts', 'finance'].includes((req.user.department || '').toLowerCase());
@@ -2814,7 +2938,7 @@ const createMyDeliveryNote = async (req, res) => {
 // ══════════════════════════════════════════════
 const getMyFollowUps = async (req, res) => {
   try {
-    const followUps = await FollowUp.find({ createdBy: req.user._id })
+    const followUps = await FollowUp.find(isGlobalSalesUser(req.user) ? {} : { createdBy: req.user._id })
       .populate('lead', 'name company email phone')
       .sort({ scheduledAt: 1 });
     return res.status(200).json({ success: true, count: followUps.length, data: followUps });
@@ -2909,14 +3033,21 @@ const updateMyFollowUp = async (req, res) => {
 const getMyTargets = async (req, res) => {
   try {
     const userId = req.user._id;
+    if (isGlobalSalesUser(req.user)) {
+      const allTargets = await SalesTarget.find({})
+        .populate('employee', 'fullName email role')
+        .populate('assignedBy', 'fullName')
+        .sort({ createdAt: -1 });
+      return res.status(200).json({ success: true, count: allTargets.length, data: allTargets });
+    }
     let targets = await SalesTarget.find({ employee: userId })
       .populate('assignedBy', 'fullName')
       .sort({ createdAt: -1 });
 
     // Calculate actual achieved amount from deals, orders, and invoices
     const [deals, orders, invoices] = await Promise.all([
-      Deal.find({ $or: [{ assignedTo: userId }, { createdBy: userId }], stage: { $in: ['Won', 'Closed Won'] } }),
-      SalesOrder.find({ $or: [{ salesPerson: userId }, { createdBy: userId }], status: { $in: ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Sales Order'] } }),
+      Deal.find({ $and: [ownerScope(userId), { stage: { $in: ['Won', 'Closed Won'] } }] }),
+      SalesOrder.find({ $and: [ownerScope(userId), { status: { $in: ['Confirmed', 'Processing', 'Shipped', 'Delivered', 'Sales Order'] } }] }),
       Invoice.find({ createdBy: userId, status: { $in: ['Approved', 'Paid', 'Sent', 'Partially Paid'] } })
     ]);
 
@@ -2963,7 +3094,7 @@ const getMyTargets = async (req, res) => {
 
 const getMyActivities = async (req, res) => {
   try {
-    const activities = await SalesActivity.find({ performedBy: req.user._id })
+    const activities = await SalesActivity.find(isGlobalSalesUser(req.user) ? {} : { performedBy: req.user._id })
       .sort({ createdAt: -1 })
       .limit(50);
     return res.status(200).json({ success: true, count: activities.length, data: activities });
@@ -3007,15 +3138,14 @@ const getSalesTeamMembers = async (req, res) => {
     const membersWithStats = await Promise.all(
       salesEmployees.map(async (emp) => {
         const empId = emp._id;
-        const empNameRegex = new RegExp(emp.fullName?.split(' ')[0] || '', 'i');
         const [leads, quotations, orders, deals, followUps, activeTarget, invoices, payroll] = await Promise.all([
-          Lead.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }),
-          Quotation.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }),
-          SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }, { salePerson: empNameRegex }] }),
-          Deal.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }),
+          Lead.find(ownerScope(empId)),
+          Quotation.find(ownerScope(empId)),
+          SalesOrder.find(ownerScope(empId)),
+          Deal.find(ownerScope(empId)),
           FollowUp.find({ createdBy: empId }),
           SalesTarget.findOne({ employee: empId, status: { $in: ['Active', 'Ongoing'] } }).sort({ createdAt: -1 }),
-          Invoice.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }),
+          Invoice.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }),
           Payroll.findOne({ user: empId, month: now.getMonth() + 1, year: now.getFullYear() })
         ]);
 
@@ -3144,20 +3274,18 @@ const getSalesTeamMemberProfile = async (req, res) => {
     }
 
     const empId = emp._id;
-    const empNameRegex = new RegExp(emp.fullName?.split(' ')[0] || '', 'i');
-
     const [leads, quotations, orders, deliveryNotes, followUps, targets, activities, invoices, deals, customerPOs, productFiles, payments, payroll] = await Promise.all([
-      Lead.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }).sort({ createdAt: -1 }),
-      Quotation.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }).sort({ creationDate: -1, createdAt: -1 }),
-      SalesOrder.find({ $or: [{ salesPerson: empId }, { createdBy: empId }, { salePerson: empNameRegex }] }).sort({ creationDate: -1, createdAt: -1 }),
-      DeliveryNote.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }).populate('salesOrder', 'orderNumber orderReference').sort({ createdAt: -1 }),
+      Lead.find(ownerScope(empId)).sort({ createdAt: -1 }),
+      Quotation.find(ownerScope(empId)).sort({ creationDate: -1, createdAt: -1 }),
+      SalesOrder.find(ownerScope(empId)).sort({ creationDate: -1, createdAt: -1 }),
+      DeliveryNote.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).populate('salesOrder', 'orderNumber orderReference').sort({ createdAt: -1 }),
       FollowUp.find({ createdBy: empId }).populate('lead', 'name company').sort({ scheduledAt: 1 }),
       SalesTarget.find({ employee: empId }).populate('assignedBy', 'fullName').sort({ createdAt: -1 }),
       SalesActivity.find({ performedBy: empId }).sort({ createdAt: -1 }).limit(50),
-      Invoice.find({ $or: [{ createdBy: empId }, { salesPerson: empId }, { salePerson: empNameRegex }] }).sort({ createdAt: -1 }),
-      Deal.find({ $or: [{ assignedTo: empId }, { createdBy: empId }] }).sort({ createdAt: -1 }),
-      CustomerPO.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).sort({ createdAt: -1 }),
-      ProductFile.find({ createdBy: empId }).sort({ createdAt: -1 }),
+      Invoice.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).sort({ createdAt: -1 }),
+      Deal.find(ownerScope(empId)).sort({ createdAt: -1 }),
+      CustomerPO.find(ownerScope(empId)).sort({ createdAt: -1 }),
+      ProductFile.find(ownerScope(empId)).sort({ createdAt: -1 }),
       Payment.find({ $or: [{ createdBy: empId }, { salesPerson: empId }] }).sort({ createdAt: -1 }),
       Payroll.findOne({ user: empId, month: now.getMonth() + 1, year: now.getFullYear() })
     ]);
@@ -3519,27 +3647,22 @@ const deleteMyFollowUp = async (req, res) => {
 const getMyCustomerPOs = async (req, res) => {
   try {
     const { status, search, employeeId } = req.query;
-    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
-    const query = {};
-
-    if (isManagerOrAdmin) {
-      if (employeeId) query.createdBy = employeeId;
-    } else {
-      query.createdBy = req.user._id;
-    }
+    const conditions = [];
+    if (isGlobalSalesUser(req.user) && employeeId) conditions.push(ownerScope(employeeId));
 
     if (status === 'active' || !status) {
-      query.status = { $nin: ['Processed'] };
+      conditions.push({ status: { $nin: ['Processed'] } });
     } else if (status === 'processed') {
-      query.status = 'Processed';
+      conditions.push({ status: 'Processed' });
     } else if (status && status !== 'all') {
-      query.status = status;
+      conditions.push({ status });
     }
 
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ poNumber: regex }, { customerName: regex }, { quotationNumber: regex }];
+      conditions.push({ $or: [{ poNumber: regex }, { customerName: regex }, { quotationNumber: regex }] });
     }
+    const query = applyOwnerScope(conditions, req.user);
     const pos = await CustomerPO.find(query).populate('quotationId', 'quotationNumber clientName').populate('createdBy', 'fullName email').sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: pos.length, data: pos });
   } catch (error) {
@@ -3558,6 +3681,7 @@ const createMyCustomerPO = async (req, res) => {
     const linkedQuotation = quotationId && mongoose.Types.ObjectId.isValid(quotationId)
       ? await Quotation.findById(quotationId)
       : null;
+    if (linkedQuotation && !ownsSalesRecord(linkedQuotation, req.user)) return ownershipDenied(res, 'quotations');
 
     const po = await CustomerPO.create({
       customerName: customerName.trim(),
@@ -3571,6 +3695,7 @@ const createMyCustomerPO = async (req, res) => {
       uploadedDocument: uploadedDocument || '',
       documentName: documentName || '',
       status: 'Received',
+      owner: linkedQuotation ? effectiveOwnerId(linkedQuotation) : req.user._id,
       createdBy: req.user._id
     });
 
@@ -3646,28 +3771,23 @@ const deleteMyCustomerPO = async (req, res) => {
 const getMyProductFiles = async (req, res) => {
   try {
     const { status, fileType, search, employeeId } = req.query;
-    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo'].includes(req.user.role);
-    const query = {};
-
-    if (isManagerOrAdmin) {
-      if (employeeId) query.createdBy = employeeId;
-    } else {
-      query.createdBy = req.user._id;
-    }
+    const conditions = [];
+    if (isGlobalSalesUser(req.user) && employeeId) conditions.push(ownerScope(employeeId));
 
     if (status === 'active' || !status) {
-      query.status = { $nin: ['Completed', 'Cancelled'] };
+      conditions.push({ status: { $nin: ['Completed', 'Cancelled'] } });
     } else if (status === 'completed') {
-      query.status = 'Completed';
+      conditions.push({ status: 'Completed' });
     } else if (status && status !== 'all') {
-      query.status = status;
+      conditions.push({ status });
     }
 
-    if (fileType && fileType !== 'all') query.fileType = fileType;
+    if (fileType && fileType !== 'all') conditions.push({ fileType });
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ fileNumber: regex }, { customerName: regex }];
+      conditions.push({ $or: [{ fileNumber: regex }, { customerName: regex }] });
     }
+    const query = applyOwnerScope(conditions, req.user);
     const files = await ProductFile.find(query).populate('createdBy', 'fullName email').sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: files.length, data: files });
   } catch (error) {
@@ -3689,8 +3809,10 @@ const createMyProductFile = async (req, res) => {
     if (!customerPO || !hasValidCustomerPOAttachment(customerPO)) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
+    if (!ownsSalesRecord(customerPO, req.user)) return ownershipDenied(res, 'customer POs');
     const linkedQuotationId = safeQuotationId || customerPO.quotationId || null;
     const linkedQuotation = linkedQuotationId ? await Quotation.findById(linkedQuotationId) : null;
+    if (linkedQuotation && !ownsSalesRecord(linkedQuotation, req.user)) return ownershipDenied(res, 'quotations');
     const resolvedFileType = customerPO.fileType || linkedQuotation?.fileType || '';
     const resolvedFileNumber = customerPO.fileNumber || linkedQuotation?.fileNo || await allocateFileNumber();
 
@@ -3706,6 +3828,7 @@ const createMyProductFile = async (req, res) => {
       salesOrderNumber: salesOrderNumber || '',
       products: Array.isArray(products) ? products : [],
       notes: notes || '',
+      owner: effectiveOwnerId(customerPO),
       createdBy: req.user._id
     });
 
@@ -3803,7 +3926,7 @@ const deleteMyProductFile = async (req, res) => {
 const getMyPayments = async (req, res) => {
   try {
     const { salesOrderId, search, employeeId } = req.query;
-    const isManagerOrAdmin = ['sales_manager', 'admin', 'ceo', 'finance', 'accountant'].includes(req.user.role) ||
+    const isManagerOrAdmin = ['admin', 'ceo', 'finance', 'accountant'].includes(req.user.role) ||
       ['finance', 'accounts', 'administration'].includes((req.user.department || '').toLowerCase());
     const query = {};
 
@@ -4155,8 +4278,7 @@ const getMyProformaInvoices = async (req, res) => {
   try {
     let query = {};
     if (req.user.role === 'sales_manager') {
-      const scope = await getSalesManagerScope(req.user);
-      query = { createdBy: { $in: scope.memberIds } };
+      query = { createdBy: req.user._id };
     } else if (['admin', 'ceo'].includes(req.user.role)) {
       query = {};
     } else {
@@ -4477,6 +4599,7 @@ const sendOrderToSupport = async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
+    if (!ownsSalesRecord(order, req.user)) return ownershipDenied(res, 'sales orders');
 
     if (!order.clientName || !order.netAmount) {
       return res.status(400).json({ success: false, message: 'Sales Order is incomplete.' });
@@ -4544,6 +4667,7 @@ const sendSalesOrderToFinance = async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
+    if (!ownsSalesRecord(order, req.user)) return ownershipDenied(res, 'sales orders');
 
     // Check customer overdue status in real-time
     const overdueInfo = await calculateCustomerOverdue(order.clientName || order.customerName);
@@ -4622,6 +4746,7 @@ const recordGoodsReceivedInOffice = async (req, res) => {
     await withGrnDuplicateRecovery(session, async () => {
       const order = await SalesOrder.findById(req.params.id).session(session);
       if (!order) throw createHttpError(404, 'Sales order not found.');
+      if (!canAccessDepartmentOrder(order, req.user, 'support')) throw createHttpError(403, 'Access denied. This order is not in the Support queue.');
       if (order.isOverdueBlocked) {
         throw createHttpError(400, 'Cannot receive goods: Order is on Finance HOLD due to customer overdue balance.');
       }
@@ -4938,6 +5063,7 @@ const recordBLInput = async (req, res) => {
   try {
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    if (!canAccessDepartmentOrder(order, req.user, 'support')) return ownershipDenied(res, 'Support queue sales orders');
 
     if (order.isOverdueBlocked) {
       return res.status(400).json({
@@ -5008,6 +5134,7 @@ const issueSupplierPO = async (req, res) => {
   try {
     const order = await SalesOrder.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Sales order not found.' });
+    if (!ownsSalesRecord(order, req.user)) return ownershipDenied(res, 'sales orders');
 
     if (order.isOverdueBlocked) {
       return res.status(400).json({ success: false, message: 'Cannot issue Supplier PO: Order is on Finance HOLD.' });
@@ -6001,6 +6128,9 @@ const getOrderDocumentPackage = async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'Sales Order not found.' });
     }
+    const departmentAccess = ['accounts', 'finance', 'support', 'logistics', 'purchaser']
+      .some(department => canAccessDepartmentOrder(order, req.user, department));
+    if (!ownsSalesRecord(order, req.user) && !departmentAccess) return ownershipDenied(res, 'sales orders');
 
     const [invoice, deliveryNote] = await Promise.all([
       Invoice.findOne({ salesOrderId: order._id, status: { $ne: 'Cancelled' } }).sort({ createdAt: -1 }),
@@ -6082,6 +6212,8 @@ module.exports = {
   createMyQuotation,
   updateMyQuotation,
   deleteMyQuotation,
+  getQuotationForwardTargets,
+  forwardQuotation,
   convertQuotationToSalesOrder,
   convertQuotationToCustomerPO,
   convertCustomerPOToProductFile,

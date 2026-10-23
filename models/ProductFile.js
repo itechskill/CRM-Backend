@@ -21,6 +21,7 @@ const ProductFileSchema = new mongoose.Schema(
     ],
     notes: { type: String, default: '' },
     status: { type: String, enum: ['Active', 'In Progress', 'Completed', 'Cancelled'], default: 'Active' },
+    owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
   },
   { timestamps: true }
