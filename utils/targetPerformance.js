@@ -1,0 +1,213 @@
+const Invoice = require('../models/Invoice');
+const Payment = require('../models/Payment');
+const SalesOrder = require('../models/SalesOrder');
+const SupplierPO = require('../models/SupplierPO');
+const { moneyToCents, totalCostPKR } = require('./purchaseExpenses');
+
+const SALES_ROLES = ['employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager'];
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const idString = value => String(value?._id || value || '');
+const safeCents = value => Number.isSafeInteger(value) ? value : 0;
+const utcDay = value => {
+  const date = new Date(value);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+};
+const addCalendarDays = (value, days) => new Date(utcDay(value) + days * DAY_MS);
+const calendarDaysBetween = (from, to) => Math.floor((utcDay(to) - utcDay(from)) / DAY_MS);
+const creditPercentForDays = days => days <= 30 ? 100 : (days <= 40 ? 20 : 0);
+const performancePercent = (achievedCents, targetCents) => targetCents > 0
+  ? Math.round((safeCents(achievedCents) * 10000) / targetCents) / 100
+  : 0;
+
+const monthRange = value => {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})$/);
+  const now = new Date();
+  const year = match ? Number(match[1]) : now.getUTCFullYear();
+  const month = match ? Number(match[2]) - 1 : now.getUTCMonth();
+  if (month < 0 || month > 11) throw Object.assign(new Error('Month must use YYYY-MM format.'), { statusCode: 400 });
+  return {
+    key: `${year}-${String(month + 1).padStart(2, '0')}`,
+    start: new Date(Date.UTC(year, month, 1)),
+    end: new Date(Date.UTC(year, month + 1, 1))
+  };
+};
+
+const invoiceRevenueExcludingTaxCents = invoice => {
+  const amountLessTax = moneyToCents(invoice?.amount) - moneyToCents(invoice?.tax);
+  if (amountLessTax > 0) return amountLessTax;
+  return Math.max(0, moneyToCents(invoice?.subtotal) - moneyToCents(invoice?.discount));
+};
+
+const paymentAmountForInvoiceCents = (payment, invoiceId) => {
+  if (Array.isArray(payment?.allocations) && payment.allocations.length) {
+    return payment.allocations.reduce((sum, allocation) => (
+      idString(allocation.invoiceId) === idString(invoiceId) ? sum + moneyToCents(allocation.amount) : sum
+    ), 0);
+  }
+  return idString(payment?.invoiceId) === idString(invoiceId) ? moneyToCents(payment.amount) : 0;
+};
+
+const latestCostChangeAt = supplierPO => {
+  const dates = [supplierPO?.updatedAt];
+  for (const expense of supplierPO?.expenses || []) {
+    dates.push(expense.addedAt, expense.deletedAt);
+    for (const history of expense.editHistory || []) dates.push(history.changedAt);
+  }
+  const times = dates.filter(Boolean).map(value => new Date(value).getTime()).filter(Number.isFinite);
+  return times.length ? new Date(Math.max(...times)) : null;
+};
+
+const analyzeInvoicePerformance = ({ invoice, order, supplierPO, payments = [], purchaseCostCents, asOf = new Date() }) => {
+  const invoiceDate = invoice.issueDate || invoice.createdAt;
+  const invoiceTotalCents = moneyToCents(invoice.amount);
+  const revenueExcludingTaxCents = invoiceRevenueExcludingTaxCents(invoice);
+  const foreignCurrency = supplierPO && String(supplierPO.currency || 'PKR').toUpperCase() !== 'PKR';
+  const missingExchangeRate = Boolean(foreignCurrency && !(Number(supplierPO.exchangeRateToPKR) > 0));
+  const costUnavailable = purchaseCostCents === null || purchaseCostCents === undefined || missingExchangeRate;
+  const grossProfitCents = costUnavailable ? null : revenueExcludingTaxCents - safeCents(purchaseCostCents);
+  let remainingInvoiceCents = Math.max(0, invoiceTotalCents);
+  const paymentRows = [];
+
+  const orderedPayments = [...payments].sort((a, b) => (
+    new Date(a.paymentDate || a.createdAt) - new Date(b.paymentDate || b.createdAt)
+  ));
+  for (const payment of orderedPayments) {
+    const requestedCents = paymentAmountForInvoiceCents(payment, invoice._id);
+    const appliedCents = Math.min(Math.max(0, requestedCents), remainingInvoiceCents);
+    if (!appliedCents) continue;
+    remainingInvoiceCents -= appliedCents;
+    const clearedAt = payment.paymentDate || payment.createdAt;
+    const daysAfterInvoice = Math.max(0, calendarDaysBetween(invoiceDate, clearedAt));
+    const creditPercent = creditPercentForDays(daysAfterInvoice);
+    const grossProfitShareCents = grossProfitCents === null || invoiceTotalCents <= 0
+      ? 0
+      : Math.round(grossProfitCents * appliedCents / invoiceTotalCents);
+    paymentRows.push({
+      paymentId: payment._id,
+      paymentReference: payment.paymentRefNumber || '',
+      clearedAt,
+      amountCents: appliedCents,
+      daysAfterInvoice,
+      creditPercent,
+      grossProfitShareCents,
+      creditedGrossProfitCents: Math.round(grossProfitShareCents * creditPercent / 100)
+    });
+  }
+
+  const fullyPaid = remainingInvoiceCents === 0 && invoiceTotalCents > 0;
+  const effectiveDays = fullyPaid && paymentRows.length
+    ? Math.max(...paymentRows.map(payment => payment.daysAfterInvoice))
+    : Math.max(0, calendarDaysBetween(invoiceDate, asOf));
+  const needsFinance = paymentRows.some(payment => payment.daysAfterInvoice > 40) || (!fullyPaid && effectiveDays > 40);
+  const status = needsFinance
+    ? 'Overdue / Needs Finance'
+    : (effectiveDays <= 30 ? 'Within 30 days' : '31-40 days');
+  const costChangedAt = latestCostChangeAt(supplierPO);
+  const costChangedAfterCredit = Boolean(costChangedAt && paymentRows.some(payment => (
+    new Date(payment.clearedAt).getTime() < costChangedAt.getTime()
+  )));
+
+  return {
+    invoiceId: invoice._id,
+    invoiceNumber: invoice.invoiceNumber || '',
+    salesOrderId: order?._id || invoice.salesOrderId || null,
+    salesOrderNumber: order?.orderNumber || order?.orderReference || invoice.salesOrderNumber || '',
+    customerName: invoice.clientName || '',
+    invoiceDate,
+    invoiceAmountCents: invoiceTotalCents,
+    revenueExcludingTaxCents,
+    purchaseCostCents: costUnavailable ? null : safeCents(purchaseCostCents),
+    grossProfitCents,
+    paidCents: invoiceTotalCents - remainingInvoiceCents,
+    outstandingCents: remainingInvoiceCents,
+    deadline30: addCalendarDays(invoiceDate, 30),
+    deadline40: addCalendarDays(invoiceDate, 40),
+    status,
+    needsFinance,
+    costChangedAfterCredit,
+    costChangedAt,
+    costGap: missingExchangeRate
+      ? `Supplier PO ${supplierPO.poNumber || ''} uses ${supplierPO.currency} but has no exchange rate to PKR.`
+      : (!supplierPO ? 'No linked Supplier PO; purchase cost is treated as PKR 0.' : ''),
+    payments: paymentRows
+  };
+};
+
+const loadPerformanceForUsers = async ({ users, month, asOf = new Date() }) => {
+  const range = monthRange(month);
+  const userIds = users.map(user => user._id);
+  const orders = await SalesOrder.find({
+    $or: [{ owner: { $in: userIds } }, { owner: null, createdBy: { $in: userIds } }, { owner: { $exists: false }, createdBy: { $in: userIds } }]
+  }).lean();
+  const orderIds = orders.map(order => order._id);
+  const invoices = orderIds.length ? await Invoice.find({
+    salesOrderId: { $in: orderIds },
+    status: { $nin: ['Draft', 'Cancelled', 'Rejected'] },
+    isDraft: { $ne: true }
+  }).lean() : [];
+  const invoiceIds = invoices.map(invoice => invoice._id);
+  const payments = invoiceIds.length ? await Payment.find({
+    $or: [{ invoiceId: { $in: invoiceIds } }, { 'allocations.invoiceId': { $in: invoiceIds } }]
+  }).lean() : [];
+  const supplierPOs = orderIds.length ? await SupplierPO.find({ salesOrderId: { $in: orderIds } }).sort({ createdAt: -1 }).lean() : [];
+  const orderMap = new Map(orders.map(order => [idString(order._id), order]));
+  const poMap = new Map();
+  for (const po of supplierPOs) if (!poMap.has(idString(po.salesOrderId))) poMap.set(idString(po.salesOrderId), po);
+  const rowsByOwner = new Map(users.map(user => [idString(user._id), []]));
+
+  for (const invoice of invoices) {
+    const order = orderMap.get(idString(invoice.salesOrderId));
+    const ownerId = idString(order?.owner || order?.createdBy);
+    if (!rowsByOwner.has(ownerId)) continue;
+    const supplierPO = poMap.get(idString(order._id)) || null;
+    const cost = await totalCostPKR(supplierPO || order);
+    const invoicePayments = payments.filter(payment => paymentAmountForInvoiceCents(payment, invoice._id) > 0);
+    rowsByOwner.get(ownerId).push(analyzeInvoicePerformance({
+      invoice,
+      order,
+      supplierPO,
+      payments: invoicePayments,
+      purchaseCostCents: cost === null ? null : moneyToCents(cost),
+      asOf
+    }));
+  }
+
+  return users.map(user => {
+    const salaryCents = safeCents(user.monthlySalesSalaryCents);
+    const targetCents = salaryCents * 5;
+    const invoicesForUser = rowsByOwner.get(idString(user._id)) || [];
+    const achievedGrossProfitCents = invoicesForUser.reduce((total, invoice) => total + invoice.payments.reduce((sum, payment) => {
+      const clearedAt = new Date(payment.clearedAt);
+      return clearedAt >= range.start && clearedAt < range.end ? sum + payment.creditedGrossProfitCents : sum;
+    }, 0), 0);
+    return {
+      userId: user._id,
+      fullName: user.fullName,
+      email: user.email,
+      role: user.role,
+      month: range.key,
+      salaryCents,
+      targetCents,
+      achievedGrossProfitCents,
+      performancePercent: performancePercent(achievedGrossProfitCents, targetCents),
+      targetStatus: targetCents > 0 && achievedGrossProfitCents >= targetCents ? 'Target met' : 'Target not met',
+      overdueDeals: invoicesForUser.filter(invoice => invoice.needsFinance).length,
+      costRecalculationFlags: invoicesForUser.filter(invoice => invoice.costChangedAfterCredit).length,
+      invoices: invoicesForUser
+    };
+  });
+};
+
+module.exports = {
+  SALES_ROLES,
+  addCalendarDays,
+  calendarDaysBetween,
+  creditPercentForDays,
+  performancePercent,
+  monthRange,
+  invoiceRevenueExcludingTaxCents,
+  paymentAmountForInvoiceCents,
+  analyzeInvoicePerformance,
+  loadPerformanceForUsers
+};

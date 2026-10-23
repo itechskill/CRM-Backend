@@ -134,6 +134,11 @@ const supplierPOSchema = new mongoose.Schema(
       type: String,
       default: 'PKR'
     },
+    exchangeRateToPKR: {
+      type: Number,
+      default: null,
+      min: 0.000001
+    },
     status: {
       type: String,
       enum: ['Draft', 'Issued', 'In Transit', 'In Logistics', 'Shipped', 'Partially Received', 'Fully Received', 'Completed', 'Cancelled', 'Payment Blocked – Customer Advance Required', 'Payment Blocked – Awaiting Customer Advance', 'Payment Eligible'],
