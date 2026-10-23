@@ -31,6 +31,7 @@ const {
   getMyOrders,
   getAvailableOrdersForDelivery,
   checkOrderStock,
+  checkDeliveryNoteStock,
   getGoodsReceivingPreview,
   createMyOrder,
   updateMyOrder,
@@ -162,6 +163,7 @@ router.delete('/proforma-invoices/:id', salesGuard, deleteMyProformaInvoice);
 // Delivery Notes & Accounts Handoff
 router.get('/delivery-notes', departmentReadGuard, getMyDeliveryNotes);
 router.post('/delivery-notes', salesAndSupportGuard, createMyDeliveryNote);
+router.get('/delivery-notes/:id/stock-check', supportInventoryGuard, checkDeliveryNoteStock);
 router.post('/delivery-notes/:id/confirm', supportInventoryGuard, confirmDeliveryNoteWithInventory);
 router.patch('/delivery-notes/:id', salesAndSupportGuard, updateMyDeliveryNote);
 router.delete('/delivery-notes/:id', salesAndSupportGuard, deleteMyDeliveryNote);
