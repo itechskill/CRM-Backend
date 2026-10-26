@@ -36,8 +36,10 @@ const SalesOrder = require('../models/SalesOrder');
 const InventoryItem = require('../models/InventoryItem');
 const PurchaserGRN = require('../models/PurchaserGRN');
 const Counter = require('../models/Counter');
+const SalesActivity = require('../models/SalesActivity');
 const { getCounterKey } = require('../utils/counterKey');
 const { buildExpenseValues, summarizeExpenses, totalCostPKR } = require('../utils/purchaseExpenses');
+const { canAccessPO } = require('../controllers/purchaseExpenseController');
 
 let server;
 let baseUrl;
@@ -48,7 +50,9 @@ let localPurchaser;
 let globalPurchaser;
 let ceo;
 let sales;
+let salesOther;
 let localPO;
+let globalPO;
 
 const tokenFor = user => jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'nexus_crm_super_secret_jwt_token_key_2026', { expiresIn: '15m' });
 const request = async (user, path, method = 'GET', body = undefined) => {
@@ -66,21 +70,29 @@ before(async () => {
   assert.notEqual(mongoose.connection.name, 'test');
   assert.notEqual(mongoose.connection.name, 'fortline_dev');
   const password = `R10-${runId}`;
-  [admin, finance, support, localPurchaser, globalPurchaser, ceo, sales] = await User.create([
+  [admin, finance, support, localPurchaser, globalPurchaser, ceo, sales, salesOther] = await User.create([
     { fullName: 'R10 Admin', email: `r10.admin.${runId}@example.com`, password, role: 'admin', status: 'active', isApproved: true },
     { fullName: 'R10 Finance', email: `r10.finance.${runId}@example.com`, password, role: 'finance', status: 'active', isApproved: true },
     { fullName: 'R10 Support', email: `r10.support.${runId}@example.com`, password, role: 'support', status: 'active', isApproved: true },
     { fullName: 'R10 Local', email: `r10.local.${runId}@example.com`, password, role: 'purchaser', purchaserSubDept: 'Local', status: 'active', isApproved: true },
     { fullName: 'R10 Global', email: `r10.global.${runId}@example.com`, password, role: 'purchaser', purchaserSubDept: 'Global', status: 'active', isApproved: true },
     { fullName: 'R10 CEO', email: `r10.ceo.${runId}@example.com`, password, role: 'ceo', status: 'active', isApproved: true },
-    { fullName: 'R10 Sales', email: `r10.sales.${runId}@example.com`, password, role: 'sales_person', status: 'active', isApproved: true }
+    { fullName: 'R10 Sales', email: `r10.sales.${runId}@example.com`, password, role: 'sales_person', status: 'active', isApproved: true },
+    { fullName: 'R10 Other Sales', email: `r10.other.sales.${runId}@example.com`, password, role: 'sales_person', status: 'active', isApproved: true }
   ]);
   const supplier = await Supplier.create({ name: 'R10 Supplier', supplierType: 'Local', country: 'Pakistan', createdBy: localPurchaser._id });
+  const globalSupplier = await Supplier.create({ name: 'R10 Global Supplier', supplierType: 'Global', country: 'United States', createdBy: globalPurchaser._id });
   localPO = await SupplierPO.create({
     poNumber: `LPO-R10-${runId}`, supplier: supplier._id, supplierName: supplier.name, poType: 'Local',
     items: [{ productName: 'SSD', quantity: 1, unitPrice: 1000, totalAmount: 1000 }],
     subtotal: 1000, gstRate: 18, gstAmount: 180, total: 1180, totalAmount: 1180,
     salesOrderNumber: 'SO-R10', createdBy: localPurchaser._id, createdByName: localPurchaser.fullName
+  });
+  globalPO = await SupplierPO.create({
+    poNumber: `GPO-R10-${runId}`, supplier: globalSupplier._id, supplierName: globalSupplier.name, poType: 'Global',
+    items: [{ productName: 'Server', quantity: 1, unitPrice: 100, totalAmount: 100 }],
+    subtotal: 100, total: 100, totalAmount: 100, currency: 'USD', exchangeRateToPKR: 280,
+    salesOrderNumber: 'SO-R10-GLOBAL', createdBy: globalPurchaser._id, createdByName: globalPurchaser.fullName
   });
   await Counter.create({ _id: getCounterKey('grn-number'), sequence: 0 });
   await Counter.create({ _id: getCounterKey('sales-order-number'), sequence: 2000 });
@@ -139,15 +151,57 @@ test('Finance can add/edit/soft-delete expenses, history is retained, and Admin 
   assert.equal(expense.editHistory.at(-1).action, 'Removed');
   assert.equal(removed.body.data.expenseTotals.totalExpensesPKRCents, 0);
   assert.equal(await Notification.countDocuments({ recipient: admin._id, 'data.supplierPOId': localPO._id }), 3);
+  assert.equal(await Notification.countDocuments({ recipient: admin._id, 'data.supplierPOId': localPO._id, link: '/admin/supplier-po-expenses' }), 3);
 });
 
-test('Support and matching purchaser may edit; CEO is read-only; other purchaser and Sales are denied', async () => {
-  assert.equal((await request(support, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Delivery', amount: 50 })).status, 201);
-  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'GST', amount: 20 })).status, 201);
+test('role matrix allows Support and matching purchasers to add, but only Finance and Admin may edit or delete', async () => {
+  assert.equal(canAccessPO(support, localPO, 'add'), true);
+  assert.equal(canAccessPO(support, localPO, 'edit'), false);
+  assert.equal(canAccessPO(localPurchaser, localPO, 'add'), true);
+  assert.equal(canAccessPO(localPurchaser, localPO, 'edit'), false);
+  assert.equal(canAccessPO(globalPurchaser, localPO, 'add'), false);
+  assert.equal(canAccessPO(globalPurchaser, globalPO, 'add'), true);
+  assert.equal(canAccessPO(globalPurchaser, globalPO, 'edit'), false);
+  assert.equal(canAccessPO(finance, localPO, 'edit'), true);
+  assert.equal(canAccessPO(admin, localPO, 'edit'), true);
+  assert.equal(canAccessPO(ceo, localPO, 'read'), true);
+  assert.equal(canAccessPO(ceo, localPO, 'add'), false);
+  assert.equal(canAccessPO(ceo, localPO, 'edit'), false);
+
+  const supportAdd = await request(support, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Delivery', amount: 50 });
+  assert.equal(supportAdd.status, 201, JSON.stringify(supportAdd.body));
+  const supportExpense = supportAdd.body.data.expenses.find(item => item.addedBy === String(support._id) && !item.isDeleted);
+  assert.equal((await request(support, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'PATCH', { amount: 51 })).status, 403);
+  assert.equal((await request(support, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'DELETE')).status, 403);
+
+  const localAdd = await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'GST', amount: 20 });
+  assert.equal(localAdd.status, 201, JSON.stringify(localAdd.body));
+  const localExpense = localAdd.body.data.expenses.find(item => item.addedBy === String(localPurchaser._id) && !item.isDeleted);
+  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses/${localExpense._id}`, 'PATCH', { amount: 21 })).status, 403);
+  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses/${localExpense._id}`, 'DELETE')).status, 403);
+
   assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Other', amount: 1 })).status, 403);
+  const globalAdd = await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses`, 'POST', { category: 'Freight', amount: 10, currency: 'USD', exchangeRateToPKR: 280 });
+  assert.equal(globalAdd.status, 201, JSON.stringify(globalAdd.body));
+  const globalExpense = globalAdd.body.data.expenses.find(item => !item.isDeleted);
+  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses/${globalExpense._id}`, 'PATCH', { amount: 11 })).status, 403);
+  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses/${globalExpense._id}`, 'DELETE')).status, 403);
+  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses`, 'POST', { category: 'Other', amount: 1 })).status, 403);
+
+  const adminAdd = await request(admin, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Miscellaneous', amount: 5 });
+  assert.equal(adminAdd.status, 201, JSON.stringify(adminAdd.body));
+  const adminExpense = adminAdd.body.data.expenses.find(item => item.addedBy === String(admin._id) && !item.isDeleted);
+  assert.equal((await request(admin, `/api/purchaser/pos/${localPO._id}/expenses/${adminExpense._id}`, 'PATCH', { amount: 6 })).status, 200);
+  assert.equal((await request(admin, `/api/purchaser/pos/${localPO._id}/expenses/${adminExpense._id}`, 'DELETE')).status, 200);
+
   assert.equal((await request(ceo, `/api/purchaser/pos/${localPO._id}/expenses`)).status, 200);
   assert.equal((await request(ceo, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Other', amount: 1 })).status, 403);
+  assert.equal((await request(ceo, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'PATCH', { amount: 1 })).status, 403);
+  assert.equal((await request(ceo, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'DELETE')).status, 403);
   assert.equal((await request(sales, `/api/purchaser/pos/${localPO._id}/expenses`)).status, 403);
+  assert.equal((await request(sales, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Other', amount: 1 })).status, 403);
+  assert.equal((await request(sales, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'PATCH', { amount: 1 })).status, 403);
+  assert.equal((await request(sales, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'DELETE')).status, 403);
   assert.equal((await request(sales, '/api/purchaser/pos')).status, 403);
 });
 
@@ -175,6 +229,32 @@ test('Support Inventory IN records the expense on the canonical PO and links it 
   assert.equal(String(receiptExpense.grn), String(grn._id));
   assert.equal(receiptExpense.grnNumber, grn.grnNumber);
   assert.equal(receiptExpense.amountPKRCents, 2500);
+  assert.ok(await SalesActivity.findOne({ type: 'Inventory IN', performedBy: support._id, relatedId: order._id }));
+});
+
+test('all six Release 10.2 activity types save and activity feeds remain performer-scoped except for Admin and CEO', async () => {
+  const types = [
+    'Quotation Converted to Customer PO',
+    'Customer PO Converted to Product File',
+    'Product File Converted to Sales Order',
+    'Order Sent to Finance',
+    'Invoice Finalized',
+    'Inventory IN'
+  ];
+  const marker = `R10.2 ${runId}`;
+  await SalesActivity.create(types.map(type => ({ type, description: `${marker}: ${type}`, performedBy: sales._id })));
+  assert.equal(await SalesActivity.countDocuments({ performedBy: sales._id, description: { $regex: `^${marker}` } }), 6);
+
+  const own = await request(sales, '/api/sales-employee/activities');
+  const other = await request(salesOther, '/api/sales-employee/activities');
+  const adminView = await request(admin, '/api/sales-employee/activities');
+  const ceoView = await request(ceo, '/api/sales-employee/activities');
+  assert.equal(own.status, 200);
+  assert.equal(own.body.data.filter(item => item.description.startsWith(marker)).length, 6);
+  assert.equal(other.status, 200);
+  assert.equal(other.body.data.filter(item => item.description.startsWith(marker)).length, 0);
+  assert.equal(adminView.body.data.filter(item => item.description.startsWith(marker)).length, 6);
+  assert.equal(ceoView.body.data.filter(item => item.description.startsWith(marker)).length, 6);
 });
 
 test('custom categories are case-insensitively de-duplicated and Admin can rename/deactivate', async () => {

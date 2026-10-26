@@ -9,8 +9,10 @@ const ACTIVITY_TYPES = [
   'Quotation Accepted',
   'Quotation Rejected',
   'Quotation Updated',
+  'Quotation Converted to Customer PO',
   'Sales Order Created',
   'Sales Order Updated',
+  'Order Sent to Finance',
   'Delivery Note Created',
   'Delivery Completed',
   'Follow-up Created',
@@ -24,9 +26,13 @@ const ACTIVITY_TYPES = [
   'Invoice Updated',
   'Invoice Sent',
   'Invoice Paid',
+  'Invoice Finalized',
   'Customer PO Uploaded',
+  'Customer PO Converted to Product File',
   'Product File Created',
+  'Product File Converted to Sales Order',
   'Payment Recorded',
+  'Inventory IN',
   'Other'
 ];
 
