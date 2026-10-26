@@ -10,16 +10,18 @@ const {
   valuesForHistory
 } = require('../utils/purchaseExpenses');
 
-const EDIT_ROLES = new Set(['support', 'finance', 'admin', 'purchaser']);
-const READ_ROLES = new Set([...EDIT_ROLES, 'ceo']);
+const ADD_ROLES = new Set(['support', 'finance', 'admin', 'purchaser']);
+const EDIT_ROLES = new Set(['finance', 'admin']);
+const READ_ROLES = new Set([...ADD_ROLES, 'ceo']);
 
 const getPOType = po => {
   if (po?.poType === 'Global' || po?.supplierType === 'Global' || po?.fileType === 'Blue' || /^(GPO|IPO)-/i.test(po?.poNumber || '')) return 'Global';
   return 'Local';
 };
 
-const canAccessPO = (user, po, write = false) => {
-  if (!user || !(write ? EDIT_ROLES : READ_ROLES).has(user.role)) return false;
+const canAccessPO = (user, po, action = 'read') => {
+  const allowedRoles = action === 'add' ? ADD_ROLES : action === 'edit' ? EDIT_ROLES : READ_ROLES;
+  if (!user || !allowedRoles.has(user.role)) return false;
   if (user.role !== 'purchaser') return true;
   const subDept = user.purchaserSubDept === 'Global' ? 'Global' : 'Local';
   return getPOType(po) === subDept;
@@ -141,7 +143,7 @@ exports.getSupplierPOExpenses = async (req, res) => {
   try {
     const po = await SupplierPO.findById(req.params.id);
     if (!po) return res.status(404).json({ success: false, message: 'Supplier PO not found.' });
-    if (!canAccessPO(req.user, po, false)) return res.status(403).json({ success: false, message: 'You cannot view costs for this Supplier PO.' });
+    if (!canAccessPO(req.user, po, 'read')) return res.status(403).json({ success: false, message: 'You cannot view costs for this Supplier PO.' });
     return res.json({ success: true, data: poPayload(po) });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error loading Supplier PO expenses.' });
@@ -155,7 +157,7 @@ exports.addSupplierPOExpense = async (req, res) => {
     await session.withTransaction(async () => {
       const po = await SupplierPO.findById(req.params.id).session(session);
       if (!po) { const error = new Error('Supplier PO not found.'); error.statusCode = 404; throw error; }
-      if (!canAccessPO(req.user, po, true)) { const error = new Error('You cannot edit costs for this Supplier PO.'); error.statusCode = 403; throw error; }
+      if (!canAccessPO(req.user, po, 'add')) { const error = new Error('You cannot add costs to this Supplier PO.'); error.statusCode = 403; throw error; }
       const category = await ensureCategoryAvailable(req.body.category, req.user, session);
       const values = buildExpenseValues({ ...req.body, category }, po);
       po.expenses.push({
@@ -184,7 +186,7 @@ exports.updateSupplierPOExpense = async (req, res) => {
     await session.withTransaction(async () => {
       const po = await SupplierPO.findById(req.params.id).session(session);
       if (!po) { const error = new Error('Supplier PO not found.'); error.statusCode = 404; throw error; }
-      if (!canAccessPO(req.user, po, true)) { const error = new Error('You cannot edit costs for this Supplier PO.'); error.statusCode = 403; throw error; }
+      if (!canAccessPO(req.user, po, 'edit')) { const error = new Error('Only Finance and Admin can edit Supplier PO expenses.'); error.statusCode = 403; throw error; }
       const expense = po.expenses.id(req.params.expenseId);
       if (!expense || expense.isDeleted) { const error = new Error('Active expense not found.'); error.statusCode = 404; throw error; }
       const category = await ensureCategoryAvailable(req.body.category ?? expense.category, req.user, session);
@@ -209,7 +211,7 @@ exports.removeSupplierPOExpense = async (req, res) => {
     await session.withTransaction(async () => {
       const po = await SupplierPO.findById(req.params.id).session(session);
       if (!po) { const error = new Error('Supplier PO not found.'); error.statusCode = 404; throw error; }
-      if (!canAccessPO(req.user, po, true)) { const error = new Error('You cannot edit costs for this Supplier PO.'); error.statusCode = 403; throw error; }
+      if (!canAccessPO(req.user, po, 'edit')) { const error = new Error('Only Finance and Admin can remove Supplier PO expenses.'); error.statusCode = 403; throw error; }
       const expense = po.expenses.id(req.params.expenseId);
       if (!expense || expense.isDeleted) { const error = new Error('Active expense not found.'); error.statusCode = 404; throw error; }
       const oldValues = valuesForHistory(expense);

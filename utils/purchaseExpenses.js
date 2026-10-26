@@ -150,7 +150,7 @@ const notifyAdminsOfExpense = async ({ po, expense, action, user, oldValues = nu
     title: `Supplier PO expense ${action.toLowerCase()}`,
     message: `${po.poNumber} / ${po.salesOrderNumber || 'no order'}: ${expense.category} (${valueText}) by ${user.fullName || user.email || user.role}.`,
     type: 'system',
-    link: '/purchaser/pos',
+    link: '/admin/supplier-po-expenses',
     data: {
       supplierPOId: po._id,
       poNumber: po.poNumber,

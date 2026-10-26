@@ -49,7 +49,7 @@ const {
   releaseDeliveryNoteReservations
 } = require('../utils/inventoryReservations');
 const { appendExpenseLines } = require('../utils/purchaseExpenses');
-const { ensureCategoryAvailable } = require('./purchaseExpenseController');
+const { ensureCategoryAvailable, canAccessPO } = require('./purchaseExpenseController');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -5401,6 +5401,9 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         throw createHttpError(409, 'Expenses cannot be recorded because this order is not linked to a Supplier PO.');
       }
       if (submittedExpenses.length) {
+        if (!canAccessPO(req.user, supplierPO, 'add')) {
+          throw createHttpError(403, 'You cannot add costs to this Supplier PO.');
+        }
         for (const expense of submittedExpenses) {
           expense.category = await ensureCategoryAvailable(expense.category, req.user, session);
         }
