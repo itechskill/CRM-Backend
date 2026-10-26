@@ -50,6 +50,7 @@ const {
 } = require('../utils/inventoryReservations');
 const { appendExpenseLines } = require('../utils/purchaseExpenses');
 const { ensureCategoryAvailable, canAccessPO } = require('./purchaseExpenseController');
+const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -547,6 +548,13 @@ const getMySalesStats = async (req, res) => {
       Project.find({ $or: [{ team: userId }, { createdBy: userId }, { projectManager: userId }] })
     ]);
 
+    const dashboardMetrics = await getSalesDashboardMetrics({
+      userId,
+      isGlobal: isGlobalSalesUser(req.user),
+      month: req.query.month,
+      now
+    });
+
     // Lead stats
     const totalLeads = leads.length;
     const convertedLeads = leads.filter(l => l.status === 'Converted').length;
@@ -682,8 +690,8 @@ const getMySalesStats = async (req, res) => {
           receivables,
           invoiceReceivables,
           orderReceivables,
-          overdueAmount,
-          overdueInvoiceAmount,
+          overdueAmount: dashboardMetrics.tiles.overdue.amount,
+          overdueInvoiceAmount: dashboardMetrics.tiles.overdue.amount,
           overdueOrderAmount,
           salaryTarget,
           liability,
@@ -693,7 +701,7 @@ const getMySalesStats = async (req, res) => {
           paidInvoicesAmount,
           paidInvoicesCount: paidInvoices.length,
           unpaidInvoicesCount: receivableInvoices.length,
-          overdueInvoicesCount: overdueInvoices.length
+          overdueInvoicesCount: dashboardMetrics.tiles.overdue.count
         },
         // Flat aliases for backwards compatibility
         totalLeads,
@@ -710,7 +718,10 @@ const getMySalesStats = async (req, res) => {
         remainingTarget,
         targetAchievementPct,
         receivables,
-        overdueAmount,
+        overdueAmount: dashboardMetrics.tiles.overdue.amount,
+        overdueList: dashboardMetrics.tiles.overdue.records,
+        dashboardMonth: dashboardMetrics.month,
+        dashboardTiles: dashboardMetrics.tiles,
         salaryTarget,
         liability,
         totalInvoicesCount,

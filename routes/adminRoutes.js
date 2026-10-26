@@ -12,6 +12,7 @@ const {
   updateUserStatus,
   updateUserDepartment,
   updateUserSalesPermissions,
+  updateUserPriceRequestLabel,
   deleteUser,
   createCeoAccount,
   getExecutiveSummary,
@@ -56,6 +57,7 @@ router.patch('/users/:id/role', authorize('admin', 'ceo'), updateUserRole);
 router.patch('/users/:id/status', authorize('admin', 'ceo', 'administration'), updateUserStatus);
 router.patch('/users/:id/department', authorize('admin', 'ceo', 'administration'), updateUserDepartment);
 router.patch('/users/:id/sales-permissions', authorize('admin'), updateUserSalesPermissions);
+router.patch('/users/:id/price-request-label', authorize('admin'), updateUserPriceRequestLabel);
 
 // POST /api/admin/ceo — Admin creates CEO account
 router.post('/ceo', createCeoAccount);

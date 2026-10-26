@@ -1147,6 +1147,32 @@ const updateUserSalesPermissions = async (req, res) => {
   }
 };
 
+const updateUserPriceRequestLabel = async (req, res) => {
+  try {
+    if (typeof req.body.priceRequestLabel !== 'string') {
+      return res.status(400).json({ success: false, message: 'priceRequestLabel must be a string.' });
+    }
+    const priceRequestLabel = req.body.priceRequestLabel.trim();
+    if (priceRequestLabel.length > 80) {
+      return res.status(400).json({ success: false, message: 'Price Request label cannot exceed 80 characters.' });
+    }
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { $set: { priceRequestLabel } },
+      { new: true, runValidators: true }
+    );
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    return res.status(200).json({
+      success: true,
+      message: priceRequestLabel ? `Price Request label updated for ${user.fullName}.` : `Price Request label cleared for ${user.fullName}.`,
+      data: user.toJSON()
+    });
+  } catch (error) {
+    console.error('[Update User Price Request Label Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating Price Request label.' });
+  }
+};
+
 /**
  * @desc    Get Centralized Employee/User Directory (Admin & CEO)
  * @route   GET /api/admin/directory
@@ -1978,6 +2004,7 @@ module.exports = {
   updateUserStatus,
   updateUserDepartment,
   updateUserSalesPermissions,
+  updateUserPriceRequestLabel,
   deleteUser,
   createCeoAccount,
   getExecutiveSummary,
