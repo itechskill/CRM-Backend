@@ -1,5 +1,3 @@
-const User = require('../models/User');
-
 /**
  * Infer branch or city from user fields or email tags
  */
@@ -20,8 +18,7 @@ function inferBranchOrCity(user) {
  * Get managed team member IDs, names, and scoping for a given user.
  * 
  * - CEO and Admin: isGlobal = true (full visibility across all branches and managers).
- * - Sales Manager: isGlobal = false (restricted strictly to sales persons created by or assigned to this manager,
- *   or within their designated regional branch e.g. Islamabad, Karachi, Lahore).
+ * - Sales Manager: isGlobal = false and restricted to their own records only.
  */
 async function getSalesManagerScope(user) {
   if (!user) {
@@ -47,40 +44,13 @@ async function getSalesManagerScope(user) {
     };
   }
 
-  const branch = inferBranchOrCity(user);
-  const orConditions = [
-    { createdBy: user._id },
-    { manager: user._id }
-  ];
-
-  if (branch) {
-    const branchRegex = new RegExp(`^${branch}$`, 'i');
-    orConditions.push({ branch: branchRegex });
-    orConditions.push({ city: branchRegex });
-
-    const code = branch.toLowerCase().slice(0, 3); // 'isb', 'khi', 'lhr'
-    if (['isb', 'khi', 'lhr'].includes(code)) {
-      orConditions.push({ email: new RegExp(code, 'i') });
-    }
-  }
-
-  // Query all eligible sales persons under this manager or branch
-  const teamMembers = await User.find({
-    $or: orConditions,
-    role: { $in: ['employee', 'sales_rep', 'sales_member', 'sales_person'] },
-    _id: { $ne: user._id }
-  }).select('_id fullName email branch city createdBy manager role status position salaryTarget profileImage').sort({ fullName: 1 });
-
-  const memberIds = [user._id, ...teamMembers.map(m => m._id)];
-  const memberNames = [user.fullName, ...teamMembers.map(m => m.fullName)].filter(Boolean);
-
   return {
     isGlobal: false,
     managerId: user._id,
-    memberIds,
-    memberNames,
-    teamMembers,
-    branch
+    memberIds: [user._id],
+    memberNames: [user.fullName].filter(Boolean),
+    teamMembers: [],
+    branch: ''
   };
 }
 

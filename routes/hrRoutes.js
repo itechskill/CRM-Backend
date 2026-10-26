@@ -16,18 +16,24 @@ const {
   deletePerformanceReview,
   getHRReportData
 } = require('../controllers/hrController');
-const { protect } = require('../middleware/authMiddleware');
+const { protect, authorize } = require('../middleware/authMiddleware');
 
 router.use(protect);
 
-router.get('/stats', getHRStats);
-router.get('/report-data', getHRReportData);
-router.route('/employees').get(getEmployees).post(createEmployee);
-router.route('/leaves').get(getLeaves).post(createLeave);
-router.route('/leaves/:id/status').patch(updateLeaveStatus);
-router.route('/attendance').get(getAttendance).post(recordAttendance);
-router.route('/attendance/:id').patch(updateAttendanceSingle);
-router.route('/performance').get(getPerformanceReviews).post(createPerformanceReview);
-router.route('/performance/:id').patch(updatePerformanceReview).delete(deletePerformanceReview);
+const hrAdminGuard = authorize('hr_manager', 'administration', 'admin', 'ceo');
+const personalHrGuard = authorize(
+  'employee', 'support', 'finance', 'logistics', 'accountant', 'purchaser',
+  'project_manager', 'marketing', 'hr_manager', 'administration', 'admin', 'ceo'
+);
+
+router.get('/stats', hrAdminGuard, getHRStats);
+router.get('/report-data', hrAdminGuard, getHRReportData);
+router.route('/employees').get(hrAdminGuard, getEmployees).post(hrAdminGuard, createEmployee);
+router.route('/leaves').get(personalHrGuard, getLeaves).post(personalHrGuard, createLeave);
+router.route('/leaves/:id/status').patch(hrAdminGuard, updateLeaveStatus);
+router.route('/attendance').get(personalHrGuard, getAttendance).post(hrAdminGuard, recordAttendance);
+router.route('/attendance/:id').patch(hrAdminGuard, updateAttendanceSingle);
+router.route('/performance').get(hrAdminGuard, getPerformanceReviews).post(hrAdminGuard, createPerformanceReview);
+router.route('/performance/:id').patch(hrAdminGuard, updatePerformanceReview).delete(hrAdminGuard, deletePerformanceReview);
 
 module.exports = router;

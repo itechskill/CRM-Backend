@@ -17,9 +17,9 @@ const {
   createImportInventoryItem,
   updateImportInventoryItem
 } = require('../controllers/logisticsController');
-const { protect } = require('../middleware/authMiddleware');
+const { protect, authorize } = require('../middleware/authMiddleware');
 
-router.use(protect);
+router.use(protect, authorize('logistics', 'admin', 'ceo'));
 
 router.get('/stats', getLogisticsDashboardStats);
 router.get('/incoming-orders', getIncomingOrders);

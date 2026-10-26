@@ -16,6 +16,7 @@ const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../util
 
 // Sales Manager, Admin, CEO can view and manage the Sales team
 const managerGuard = [protect, authorize('sales_manager', 'admin', 'ceo')];
+const adminCeoGuard = [protect, authorize('admin', 'ceo')];
 
 // Workflow Action Endpoints
 router.post('/leads/:id/convert-to-deal', managerGuard, convertLeadToDeal);
@@ -39,7 +40,7 @@ const Task = require('../models/Task');
 const User = require('../models/User');
 const logAudit = require('../utils/auditLogger');
 const { getSalesManagerScope, inferBranchOrCity } = require('../utils/salesManagerScope');
-const { ownerScope } = require('../utils/salesOwnership');
+const { ownerScope, ownsSalesRecord } = require('../utils/salesOwnership');
 
 const ownersScope = (memberIds) => ({
   $or: [
@@ -384,13 +385,13 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
 });
 
 // ── GET ALL SALES TEAM MEMBERS ───────────────────────────────────────────────
-router.get('/team-members', managerGuard, getSalesTeamMembers);
+router.get('/team-members', adminCeoGuard, getSalesTeamMembers);
 
 // ── GET SPECIFIC SALES TEAM MEMBER PROFILE ───────────────────────────────────
-router.get('/team-members/:id/profile', managerGuard, getSalesTeamMemberProfile);
+router.get('/team-members/:id/profile', adminCeoGuard, getSalesTeamMemberProfile);
 
 // ── UPDATE SALES EMPLOYEE DETAILS (Name, Email, Phone, Position, Salary Target, Status) ──
-router.patch('/team-members/:id/details', managerGuard, async (req, res) => {
+router.patch('/team-members/:id/details', adminCeoGuard, async (req, res) => {
   try {
     const scope = await getSalesManagerScope(req.user);
     if (!scope.isGlobal && !scope.memberIds.some(id => id.toString() === req.params.id.toString())) {
@@ -438,7 +439,7 @@ router.patch('/team-members/:id/details', managerGuard, async (req, res) => {
 });
 
 // ── INVITE / REGISTER NEW SALES EMPLOYEE (SUBMITTED TO SYSTEM ADMIN FOR APPROVAL) ──
-router.post('/invite-member', managerGuard, async (req, res) => {
+router.post('/invite-member', adminCeoGuard, async (req, res) => {
   try {
     const { fullName, email, phone, position, salaryTarget, password } = req.body;
 
@@ -537,7 +538,7 @@ router.post('/invite-member', managerGuard, async (req, res) => {
 });
 
 // ── DELETE / DEACTIVATE SALES TEAM MEMBER ─────────────────────────────────────
-router.delete('/team-members/:id', managerGuard, async (req, res) => {
+router.delete('/team-members/:id', adminCeoGuard, async (req, res) => {
   try {
     const scope = await getSalesManagerScope(req.user);
     if (!scope.isGlobal && !scope.memberIds.some(id => id.toString() === req.params.id.toString())) {
@@ -580,7 +581,7 @@ router.delete('/team-members/:id', managerGuard, async (req, res) => {
 });
 
 // ── WORK ASSIGNMENT: ASSIGN LEAD ──────────────────────────────────────────────
-router.post('/assign-lead', managerGuard, async (req, res) => {
+router.post('/assign-lead', adminCeoGuard, async (req, res) => {
   try {
     const { leadId, employeeId, name, company, email, phone, status, value, source, notes } = req.body;
 
@@ -660,7 +661,7 @@ router.post('/assign-lead', managerGuard, async (req, res) => {
 });
 
 // ── WORK ASSIGNMENT: ASSIGN FOLLOW-UP ─────────────────────────────────────────
-router.post('/assign-followup', managerGuard, async (req, res) => {
+router.post('/assign-followup', adminCeoGuard, async (req, res) => {
   try {
     const { employeeId, title, description, contactName, contactEmail, contactPhone, type, scheduledAt, leadId } = req.body;
 
@@ -720,7 +721,7 @@ router.post('/assign-followup', managerGuard, async (req, res) => {
 });
 
 // ── MONTHLY SALES TARGET ASSIGNMENT ───────────────────────────────────────────
-router.post('/targets', managerGuard, async (req, res) => {
+router.post('/targets', adminCeoGuard, async (req, res) => {
   try {
     const { employeeId, period, periodType, targetAmount, currency, notes, startDate, endDate } = req.body;
 
@@ -805,7 +806,7 @@ router.post('/targets', managerGuard, async (req, res) => {
 });
 
 // ── UPDATE TARGET ─────────────────────────────────────────────────────────────
-router.patch('/targets/:id', managerGuard, async (req, res) => {
+router.patch('/targets/:id', adminCeoGuard, async (req, res) => {
   try {
     const target = await SalesTarget.findById(req.params.id);
     if (!target) return res.status(404).json({ success: false, message: 'Target not found.' });
@@ -824,7 +825,7 @@ router.patch('/targets/:id', managerGuard, async (req, res) => {
 });
 
 // ── DELETE TARGET ─────────────────────────────────────────────────────────────
-router.delete('/targets/:id', managerGuard, async (req, res) => {
+router.delete('/targets/:id', adminCeoGuard, async (req, res) => {
   try {
     const target = await SalesTarget.findById(req.params.id);
     if (!target) return res.status(404).json({ success: false, message: 'Target not found.' });
@@ -919,6 +920,10 @@ router.get('/invoices/:id', managerGuard, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Invoice not found.' });
     }
 
+    if (!ownsSalesRecord(invoice, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only view your own invoices.' });
+    }
+
     if (!scope.isGlobal) {
       const creatorId = invoice.createdBy?._id || invoice.createdBy;
       const salesPersonId = invoice.salesPerson?._id || invoice.salesPerson;
@@ -947,6 +952,10 @@ router.patch('/invoices/:id', managerGuard, async (req, res) => {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) {
       return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    if (!ownsSalesRecord(invoice, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only update your own invoices.' });
     }
 
     const changes = {};
@@ -1103,6 +1112,10 @@ router.delete('/invoices/:id', managerGuard, async (req, res) => {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) {
       return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    }
+
+    if (!ownsSalesRecord(invoice, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own invoices.' });
     }
 
     const invNum = invoice.invoiceNumber;
@@ -1395,7 +1408,7 @@ router.get('/all-delivery-notes', managerGuard, async (req, res) => {
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       conditions.push({
-        $or: [{ deliveryNoteNumber: regex }, { customerName: regex }, { salesOrderRef: regex }]
+        $or: [{ deliveryNumber: regex }, { deliveryNoteNumber: regex }, { clientName: regex }, { salesOrderNumber: regex }]
       });
     }
 
@@ -1403,7 +1416,7 @@ router.get('/all-delivery-notes', managerGuard, async (req, res) => {
 
     const deliveryNotes = await DeliveryNote.find(query)
       .populate('createdBy', 'fullName email position department profileImage')
-      .populate('salesOrderId')
+      .populate('salesOrder')
       .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: deliveryNotes.length, data: deliveryNotes });
   } catch (error) {
@@ -1417,6 +1430,9 @@ router.patch('/delivery-notes/:id', managerGuard, async (req, res) => {
   try {
     const deliveryNote = await DeliveryNote.findById(req.params.id);
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
+    if (!ownsSalesRecord(deliveryNote, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only update your own delivery notes.' });
+    }
 
     const changes = {};
     Object.keys(req.body).forEach(field => {
@@ -1476,6 +1492,9 @@ router.delete('/delivery-notes/:id', managerGuard, async (req, res) => {
   try {
     const deliveryNote = await DeliveryNote.findById(req.params.id);
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
+    if (!ownsSalesRecord(deliveryNote, req.user)) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own delivery notes.' });
+    }
     await DeliveryNote.findByIdAndDelete(req.params.id);
     return res.status(200).json({ success: true, message: 'Delivery note deleted successfully.' });
   } catch (error) {
