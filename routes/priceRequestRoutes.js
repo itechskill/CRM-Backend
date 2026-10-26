@@ -3,6 +3,7 @@ const router = express.Router();
 const { protect, authorize } = require('../middleware/authMiddleware');
 const {
   PRICE_REQUEST_ROLES,
+  getLabelledUsers,
   getPriceRequests,
   createPriceRequest,
   priceRequest,
@@ -21,6 +22,7 @@ const {
 router.use(protect, authorize(...PRICE_REQUEST_ROLES));
 
 router.get('/', getPriceRequests);
+router.get('/labelled-users', getLabelledUsers);
 router.post('/', createPriceRequest);
 router.get('/assignee-suggestion', getRoutingSuggestion);
 router.get('/quotations', getAvailableQuotations);

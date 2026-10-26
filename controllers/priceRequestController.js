@@ -38,7 +38,33 @@ const findEligibleUser = async (userId) => {
     status: 'active',
     isApproved: true,
     role: { $in: PRICE_REQUEST_ROLES }
-  }).select('fullName email role purchaserSubDept department');
+  }).select('fullName email role purchaserSubDept department priceRequestLabel');
+};
+
+const getLabelledUsers = async (req, res) => {
+  try {
+    const users = await User.find({
+      status: 'active',
+      role: { $in: PRICE_REQUEST_ROLES },
+      priceRequestLabel: { $type: 'string', $regex: /\S/ }
+    })
+      .select('_id fullName priceRequestLabel')
+      .sort({ fullName: 1 })
+      .collation({ locale: 'en', strength: 2 })
+      .lean();
+    return res.status(200).json({
+      success: true,
+      count: users.length,
+      data: users.map(user => ({
+        _id: user._id,
+        name: user.fullName,
+        label: user.priceRequestLabel.trim()
+      }))
+    });
+  } catch (error) {
+    console.error('[Get Labelled Price Request Users Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error retrieving Price Request people.' });
+  }
 };
 
 const allocateRequestNumber = async () => {
@@ -483,8 +509,8 @@ const getRoutingSuggestion = async (req, res) => {
       ruleType,
       active: true,
       normalizedMatchValues: normalizeValue(matchValue)
-    }).populate('assignee', 'fullName email role purchaserSubDept');
-    if (!rule?.assignee || !isFeatureUser(rule.assignee)) {
+    }).populate('assignee', 'fullName role priceRequestLabel');
+    if (!rule?.assignee || !isFeatureUser(rule.assignee) || !String(rule.assignee.priceRequestLabel || '').trim()) {
       return res.status(200).json({ success: true, data: null });
     }
     return res.status(200).json({ success: true, data: { rule, assignee: rule.assignee } });
@@ -497,7 +523,7 @@ const getRoutingSuggestion = async (req, res) => {
 const getRoutingRules = async (req, res) => {
   try {
     const rules = await PriceRequestRoutingRule.find()
-      .populate('assignee', 'fullName email role purchaserSubDept')
+      .populate('assignee', 'fullName role priceRequestLabel')
       .populate('updatedBy', 'fullName email role')
       .sort({ priority: -1, label: 1 });
     return res.status(200).json({ success: true, count: rules.length, data: rules });
@@ -563,7 +589,7 @@ const createRoutingRule = async (req, res) => {
       createdBy: req.user._id,
       updatedBy: req.user._id
     });
-    await rule.populate('assignee', 'fullName email role purchaserSubDept');
+    await rule.populate('assignee', 'fullName role priceRequestLabel');
     return res.status(201).json({ success: true, message: 'Routing rule created.', data: rule });
   } catch (error) {
     console.error('[Create Routing Rule Error]:', error);
@@ -589,7 +615,7 @@ const updateRoutingRule = async (req, res) => {
     if (validated.error) return res.status(400).json({ success: false, message: validated.error });
     Object.assign(existing, validated.value, { updatedBy: req.user._id });
     await existing.save();
-    await existing.populate('assignee', 'fullName email role purchaserSubDept');
+    await existing.populate('assignee', 'fullName role priceRequestLabel');
     return res.status(200).json({ success: true, message: 'Routing rule updated.', data: existing });
   } catch (error) {
     console.error('[Update Routing Rule Error]:', error);
@@ -620,6 +646,7 @@ const deleteRoutingRule = async (req, res) => {
 
 module.exports = {
   PRICE_REQUEST_ROLES,
+  getLabelledUsers,
   allocateRequestNumber,
   getPriceRequests,
   createPriceRequest,

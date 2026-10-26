@@ -41,6 +41,7 @@ const User = require('../models/User');
 const logAudit = require('../utils/auditLogger');
 const { getSalesManagerScope, inferBranchOrCity } = require('../utils/salesManagerScope');
 const { ownerScope, ownsSalesRecord } = require('../utils/salesOwnership');
+const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 
 const ownersScope = (memberIds) => ({
   $or: [
@@ -305,6 +306,12 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
     const ordersDelivered = orders.filter(o => o.status === 'Delivered');
     const deliveredOrdersValue = ordersDelivered.reduce((sum, o) => sum + (Number(o.netAmount) || Number(o.totalAmount) || 0), 0);
     const totalMonthlyRevenue = wonDealsValue || deliveredOrdersValue || paidInvoicesAmount;
+    const dashboardMetrics = await getSalesDashboardMetrics({
+      userId: req.user._id,
+      isGlobal: scope.isGlobal,
+      month: req.query.month,
+      now
+    });
 
     // 5. Target Aggregation
     const activeTargets = targets.filter(t => t.status === 'Active' || t.status === 'Ongoing');
@@ -366,8 +373,11 @@ router.get('/dashboard-stats', managerGuard, async (req, res) => {
         totalInvoices,
         paidInvoicesAmount,
         totalReceivables,
-        overdueInvoiceAmount,
-        overdueList,
+        overdueInvoiceAmount: dashboardMetrics.tiles.overdue.amount,
+        overdueInvoicesCount: dashboardMetrics.tiles.overdue.count,
+        overdueList: dashboardMetrics.tiles.overdue.records,
+        dashboardMonth: dashboardMetrics.month,
+        dashboardTiles: dashboardMetrics.tiles,
         receivablesList,
         totalMonthlyRevenue,
         totalTargetAmount,

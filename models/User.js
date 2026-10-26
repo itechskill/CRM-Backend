@@ -112,6 +112,12 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
+    priceRequestLabel: {
+      type: String,
+      trim: true,
+      maxlength: [80, 'Price Request label cannot exceed 80 characters'],
+      default: ''
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
