@@ -19,9 +19,9 @@ const {
   updateMaintenanceCharge,
   deleteMaintenanceCharge
 } = require('../controllers/financeController');
-const { protect } = require('../middleware/authMiddleware');
+const { protect, authorize } = require('../middleware/authMiddleware');
 
-router.use(protect);
+router.use(protect, authorize('finance', 'accountant', 'admin', 'ceo'));
 
 router.get('/summary', getFinanceSummary);
 router.get('/reports/full', getFullFinanceReports);

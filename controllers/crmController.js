@@ -2,8 +2,8 @@ const Client = require('../models/Client');
 const Deal = require('../models/Deal');
 const Lead = require('../models/Lead');
 const SalesContact = require('../models/SalesContact');
-const { notifyRoleHelper } = require('./notificationController');
-const { isGlobalSalesUser, ownsSalesRecord, applyOwnerScope } = require('../utils/salesOwnership');
+const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
+const { isGlobalSalesUser, isSalesUser, effectiveOwnerId, ownsSalesRecord, applyOwnerScope } = require('../utils/salesOwnership');
 
 const crmScope = (user) => {
   if (isGlobalSalesUser(user)) return {};
@@ -11,11 +11,13 @@ const crmScope = (user) => {
   return applyOwnerScope([], user);
 };
 
+const clientContactScope = (user) => isSalesUser(user) ? { createdBy: user._id } : {};
+
 
 // CLIENTS API
 const getClients = async (req, res) => {
   try {
-    const clients = await Client.find().sort({ createdAt: -1 });
+    const clients = await Client.find(clientContactScope(req.user)).sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: clients.length, data: clients });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error retrieving clients.' });
@@ -47,6 +49,11 @@ const createClient = async (req, res) => {
 
 const deleteClient = async (req, res) => {
   try {
+    const client = await Client.findById(req.params.id);
+    if (!client) return res.status(404).json({ success: false, message: 'Client not found.' });
+    if (isSalesUser(req.user) && client.createdBy?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own clients.' });
+    }
     await Client.findByIdAndDelete(req.params.id);
     return res.status(200).json({ success: true, message: 'Client deleted successfully.' });
   } catch (error) {
@@ -217,8 +224,9 @@ const createLead = async (req, res) => {
     });
 
     if (status === 'Qualified') {
-      await notifyRoleHelper({
-        role: 'sales_manager',
+      const recipient = effectiveOwnerId(lead);
+      if (recipient) await createNotificationHelper({
+        recipient,
         sender: req.user._id,
         title: 'New Qualified Lead Handed Off',
         message: `Qualified lead "${lead.name}" (${lead.company || 'Direct'}) was handed off from Marketing.`,
@@ -248,8 +256,9 @@ const updateLead = async (req, res) => {
     }
 
     if (req.body.status === 'Qualified') {
-      await notifyRoleHelper({
-        role: 'sales_manager',
+      const recipient = effectiveOwnerId(lead);
+      if (recipient) await createNotificationHelper({
+        recipient,
         sender: req.user._id,
         title: 'Lead Qualified & Handed Off',
         message: `Lead "${lead.name}" (${lead.company || 'Direct'}) is now Qualified and ready for Sales engagement.`,
@@ -279,7 +288,7 @@ const deleteLead = async (req, res) => {
 // SALES CONTACTS API
 const getSalesContacts = async (req, res) => {
   try {
-    const contacts = await SalesContact.find().sort({ createdAt: -1 });
+    const contacts = await SalesContact.find(clientContactScope(req.user)).sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: contacts.length, data: contacts });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error retrieving contacts.' });
@@ -312,6 +321,11 @@ const createSalesContact = async (req, res) => {
 
 const deleteSalesContact = async (req, res) => {
   try {
+    const contact = await SalesContact.findById(req.params.id);
+    if (!contact) return res.status(404).json({ success: false, message: 'Contact not found.' });
+    if (isSalesUser(req.user) && contact.createdBy?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'Access denied. You can only delete your own contacts.' });
+    }
     await SalesContact.findByIdAndDelete(req.params.id);
     return res.status(200).json({ success: true, message: 'Contact deleted successfully.' });
   } catch (error) {
@@ -331,7 +345,7 @@ const getSalesSummary = async (req, res) => {
     const [leads, deals, clients] = await Promise.all([
       Lead.find(crmScope(req.user)).populate('assignedTo', 'fullName').lean(),
       Deal.find(crmScope(req.user)).lean(),
-      Client.countDocuments()
+      Client.countDocuments(clientContactScope(req.user))
     ]);
 
     const totalLeads = leads.length;

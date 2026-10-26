@@ -23,8 +23,8 @@ router.route('/deals/:id').patch(salesGuard, updateDeal).delete(salesGuard, dele
 router.route('/leads').get(salesMarketingGuard, getLeads).post(salesMarketingGuard, createLead);
 router.route('/leads/:id').patch(salesMarketingGuard, updateLead).delete(salesMarketingGuard, deleteLead);
 
-router.route('/contacts').get(getSalesContacts).post(createSalesContact);
-router.route('/contacts/:id').delete(deleteSalesContact);
+router.route('/contacts').get(salesMarketingGuard, getSalesContacts).post(salesMarketingGuard, createSalesContact);
+router.route('/contacts/:id').delete(salesMarketingGuard, deleteSalesContact);
 
 router.route('/sales-summary').get(salesMarketingGuard, getSalesSummary);
 

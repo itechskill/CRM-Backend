@@ -11,6 +11,7 @@ const Expense = require('../models/Expense');
 const Campaign = require('../models/Campaign');
 const CompanyResource = require('../models/CompanyResource');
 const Notification = require('../models/Notification');
+const { isSalesUser, ownerScope } = require('../utils/salesOwnership');
 
 /**
  * @desc    Get current user profile
@@ -220,6 +221,15 @@ const updateProfile = async (req, res) => {
  */
 const getAllUsers = async (req, res) => {
   try {
+    if (isSalesUser(req.user)) {
+      const users = await User.find({ status: 'active', isApproved: true })
+        .select('_id fullName role')
+        .sort({ fullName: 1 })
+        .lean();
+      const safeUsers = users.map(user => ({ _id: user._id, name: user.fullName, role: user.role }));
+      return res.status(200).json({ success: true, count: safeUsers.length, data: safeUsers });
+    }
+
     const users = await User.find({ status: 'active', isApproved: true })
       .select('fullName email role department employeeId')
       .sort({ fullName: 1 });
@@ -246,6 +256,11 @@ const getAllUsers = async (req, res) => {
 const getSidebarCounts = async (req, res) => {
   try {
     const userId = req.user?._id;
+    const salesScoped = isSalesUser(req.user);
+    const salesOwnerQuery = salesScoped ? ownerScope(userId) : {};
+    const createdByQuery = salesScoped ? { createdBy: userId } : {};
+    const taskQuery = salesScoped ? { $or: [{ assignedTo: userId }, { createdBy: userId }] } : {};
+    const leaveQuery = salesScoped ? { user: userId } : {};
 
     const [
       usersCount,
@@ -269,26 +284,26 @@ const getSidebarCounts = async (req, res) => {
       proposalsCount,
       meetingsCount
     ] = await Promise.all([
-      User.countDocuments({ isApproved: true }),
-      User.countDocuments({ isApproved: true, role: { $ne: 'admin' } }),
-      User.countDocuments({ isApproved: false, status: 'pending' }),
-      Leave.countDocuments({ status: 'Pending' }),
-      JobApplication.countDocuments(),
-      Lead.countDocuments(),
-      Deal.countDocuments(),
-      Deal.countDocuments({ stage: { $in: ['Closed Won', 'Won'] } }),
-      Project.countDocuments(),
-      Project.countDocuments({ status: { $in: ['In Progress', 'Active', 'Ongoing'] } }),
-      Task.countDocuments(),
-      Task.countDocuments({ status: { $ne: 'Completed' } }),
-      Client.countDocuments(),
-      CompanyResource.countDocuments(),
-      Invoice ? Invoice.countDocuments() : Promise.resolve(0),
-      Expense ? Expense.countDocuments() : Promise.resolve(0),
-      Campaign ? Campaign.countDocuments({ status: { $in: ['Active', 'Running', 'Ongoing'] } }) : Promise.resolve(0),
+      salesScoped ? Promise.resolve(1) : User.countDocuments({ isApproved: true }),
+      salesScoped ? Promise.resolve(1) : User.countDocuments({ isApproved: true, role: { $ne: 'admin' } }),
+      salesScoped ? Promise.resolve(0) : User.countDocuments({ isApproved: false, status: 'pending' }),
+      Leave.countDocuments({ ...leaveQuery, status: 'Pending' }),
+      salesScoped ? Promise.resolve(0) : JobApplication.countDocuments(),
+      Lead.countDocuments(salesOwnerQuery),
+      Deal.countDocuments(salesOwnerQuery),
+      Deal.countDocuments({ $and: [salesOwnerQuery, { stage: { $in: ['Closed Won', 'Won'] } }] }),
+      Project.countDocuments(createdByQuery),
+      Project.countDocuments({ ...createdByQuery, status: { $in: ['In Progress', 'Active', 'Ongoing'] } }),
+      Task.countDocuments(taskQuery),
+      Task.countDocuments({ $and: [taskQuery, { status: { $ne: 'Completed' } }] }),
+      Client.countDocuments(createdByQuery),
+      salesScoped ? Promise.resolve(0) : CompanyResource.countDocuments(),
+      Invoice ? Invoice.countDocuments(createdByQuery) : Promise.resolve(0),
+      salesScoped ? Promise.resolve(0) : (Expense ? Expense.countDocuments() : Promise.resolve(0)),
+      salesScoped ? Promise.resolve(0) : (Campaign ? Campaign.countDocuments({ status: { $in: ['Active', 'Running', 'Ongoing'] } }) : Promise.resolve(0)),
       userId ? Notification.countDocuments({ recipient: userId, isRead: false }) : Promise.resolve(0),
-      Deal.countDocuments({ stage: 'Proposal' }),
-      Deal.countDocuments({ stage: { $in: ['Negotiation', 'Proposal'] } })
+      Deal.countDocuments({ $and: [salesOwnerQuery, { stage: 'Proposal' }] }),
+      Deal.countDocuments({ $and: [salesOwnerQuery, { stage: { $in: ['Negotiation', 'Proposal'] } }] })
     ]);
 
     return res.status(200).json({

@@ -32,6 +32,7 @@ const { notifyRoleHelper, createNotificationHelper } = require('./notificationCo
 const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const {
   isGlobalSalesUser,
+  isSalesUser,
   effectiveOwnerId,
   ownsSalesRecord,
   ownerScope,
@@ -59,6 +60,12 @@ const logSalesActivity = async ({ type, description, relatedModel, relatedId, pe
   } catch (e) {
     console.error('[SalesActivity Log Error]:', e.message);
   }
+};
+
+const notifySalesOwner = async ({ record, recipient, ...notification }) => {
+  const ownerId = recipient || effectiveOwnerId(record);
+  if (!ownerId) return null;
+  return createNotificationHelper({ ...notification, recipient: ownerId });
 };
 
 const checkOwnership = (record, fields, userId, reqUser) => ownsSalesRecord(record, reqUser || { _id: userId });
@@ -799,9 +806,8 @@ const createMyLead = async (req, res) => {
       performedBy: req.user._id
     });
 
-    // Notify Sales Manager
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: lead,
       sender: req.user._id,
       title: 'New Lead Created',
       message: `${req.user.fullName} created a new lead: ${lead.name}${lead.company ? ' from ' + lead.company : ''}.`,
@@ -900,8 +906,8 @@ const convertLeadToDeal = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: deal,
       sender: req.user._id,
       title: 'Lead Converted to Deal',
       message: `${req.user.fullName} converted lead "${lead.name}" into deal "${deal.title}".`,
@@ -997,9 +1003,8 @@ const createMyDeal = async (req, res) => {
       performedBy: req.user._id
     });
 
-    // Notify Sales Manager about new deal
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: deal,
       sender: req.user._id,
       title: 'New Deal Created',
       message: `${req.user.fullName} created deal "${deal.title}" for ${deal.clientName} (Rs. ${Number(deal.value).toLocaleString()}).`,
@@ -1316,9 +1321,9 @@ const createMyInvoice = async (req, res) => {
       performedBy: req.user._id
     });
 
-    // Notify Sales Manager for invoice review
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: invoice,
+      recipient: invoice.salesPerson || invoice.createdBy,
       sender: req.user._id,
       title: 'New Invoice Submitted for Review',
       message: `New invoice ${invoiceNumber} has been submitted by ${req.user.fullName} for review.`,
@@ -2449,9 +2454,8 @@ const createMyOrder = async (req, res) => {
       performedBy: req.user._id
     });
 
-    // Notify Sales Manager
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: order,
       sender: req.user._id,
       title: 'New Sales Order Created',
       message: `${req.user.fullName} created Sales Order ${order.orderNumber || order.orderReference} for ${order.clientName} (Rs. ${netAmt.toLocaleString()}).`,
@@ -3083,6 +3087,9 @@ const createMyDeliveryNote = async (req, res) => {
     await session.withTransaction(async () => {
       const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson').session(session);
       if (!parentSo) throw createHttpError(404, 'Sales Order not found.');
+      if (isSalesUser(req.user) && !ownsSalesRecord(parentSo, req.user)) {
+        throw createHttpError(403, 'Access denied. You can only create delivery notes for your own sales orders.');
+      }
       if (parentSo.isOverdueBlocked) {
         throw createHttpError(400, `Cannot create Delivery Note: Sales Order ${parentSo.orderNumber || parentSo.orderReference} is on Finance HOLD due to overdue customer balance.`);
       }
@@ -3228,9 +3235,9 @@ const createMyDeliveryNote = async (req, res) => {
       performedBy: req.user._id
     });
 
-    // Notify Sales Manager
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: deliveryNote,
+      recipient: deliveryNote.salesPerson || deliveryNote.createdBy,
       sender: req.user._id,
       title: 'Delivery Note Created',
       message: `${req.user.fullName} created delivery note ${deliveryNote.deliveryNoteNumber} — Status: ${dnStatus}.`,
@@ -3781,6 +3788,9 @@ const updateMyInvoice = async (req, res) => {
   try {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    if (isSalesUser(req.user) && !ownsSalesRecord(invoice, req.user)) {
+      return ownershipDenied(res, 'invoices');
+    }
 
     const changes = {};
     const allowedFields = ['clientName', 'customerEmail', 'customerPhone', 'customerAddress', 'items', 'subtotal', 'tax', 'taxRate', 'discount', 'amount', 'paymentTerms', 'issueDate', 'dueDate', 'description', 'notes', 'status', 'salesOrderId', 'deliveryNoteId', 'fileNumber', 'fileType', 'paidAmount', 'outstandingAmount'];
@@ -3883,6 +3893,9 @@ const updateMyDeliveryNote = async (req, res) => {
   try {
     const deliveryNote = await DeliveryNote.findById(req.params.id);
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
+    if (isSalesUser(req.user) && !ownsSalesRecord(deliveryNote, req.user)) {
+      return ownershipDenied(res, 'delivery notes');
+    }
 
     const changes = {};
     const allowedFields = [
@@ -4086,8 +4099,8 @@ const createMyCustomerPO = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: po,
       sender: req.user._id,
       title: 'Customer PO Received',
       message: `${req.user.fullName} recorded Customer PO ${po.poNumber} for ${po.customerName} (Rs. ${Number(po.amount).toLocaleString()}).`,
@@ -4214,8 +4227,8 @@ const createMyProductFile = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: pf,
       sender: req.user._id,
       title: 'Product File Created',
       message: `${req.user.fullName} created a ${pf.fileType} Product File (${pf.fileNumber || 'File'}) for ${pf.customerName}.`,
@@ -4262,8 +4275,8 @@ const updateMyProductFile = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: pf,
       sender: req.user._id,
       title: 'Product File Updated',
       message: `${req.user.fullName} updated Product File ${pf.fileNumber || pf._id} for ${pf.customerName}.`,
@@ -4552,13 +4565,22 @@ const createMyPayment = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper(['finance', 'accountant', 'sales_manager', 'sales_member', 'sales_rep', 'sales_person', 'admin', 'ceo'], {
+    await notifyRoleHelper(['finance', 'accountant', 'admin', 'ceo'], {
       role: 'finance',
       sender: req.user._id,
       title: 'Payment Recorded',
       message: `Payment of PKR ${Number(amount).toFixed(2)} recorded for Invoice ${payment.invoiceNumber || 'Direct'}.`,
       type: 'finance',
       link: '/finance/payments'
+    });
+    await notifySalesOwner({
+      record: payment,
+      recipient: payment.salesPerson || payment.createdBy,
+      sender: req.user._id,
+      title: 'Payment Recorded',
+      message: `Payment of PKR ${Number(amount).toFixed(2)} recorded for Invoice ${payment.invoiceNumber || 'Direct'}.`,
+      type: 'finance',
+      link: '/sales/payments'
     });
 
     return res.status(201).json({ success: true, message: 'Payment recorded successfully.', data: payment });
@@ -4800,8 +4822,8 @@ const createMyProformaInvoice = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper({
-      role: 'sales_manager',
+    await notifySalesOwner({
+      record: salesOrder,
       sender: req.user._id,
       title: 'Proforma Invoice Created',
       message: `${req.user.fullName} generated Proforma Invoice ${proforma.proformaNumber} for ${resolvedClientName} (Rs. ${proforma.netAmount.toLocaleString()}).`,
@@ -6558,11 +6580,20 @@ const finalizeInvoice = async (req, res) => {
       performedBy: req.user._id
     });
 
-    await notifyRoleHelper(['accountant', 'accounts', 'sales_manager', 'sales_member', 'sales_person', 'sales_rep', 'admin', 'ceo'], {
+    await notifyRoleHelper(['accountant', 'accounts', 'admin', 'ceo'], {
       type: 'invoice',
       title: 'Invoice Finalized',
       message: `Finance finalized Invoice ${invoice.invoiceNumber}.`,
       link: '/finance/invoices',
+      sender: req.user._id
+    });
+    await notifySalesOwner({
+      record: invoice,
+      recipient: invoice.salesPerson || invoice.createdBy,
+      type: 'invoice',
+      title: 'Invoice Finalized',
+      message: `Finance finalized Invoice ${invoice.invoiceNumber}.`,
+      link: '/sales/invoices',
       sender: req.user._id
     });
 
