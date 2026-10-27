@@ -44,6 +44,7 @@ const {
   getMyDeliveryNotes,
   createMyDeliveryNote,
   updateMyDeliveryNote,
+  updateDeliveryNoteExpiry,
   deleteMyDeliveryNote,
   getMyFollowUps,
   createMyFollowUp,
@@ -149,7 +150,7 @@ router.patch('/orders/:id', salesGuard, updateMyOrder);
 router.delete('/orders/:id', salesGuard, deleteMyOrder);
 
 // Support & Inventory Department Routes
-router.get('/support/stats', salesAndSupportGuard, getSupportStats);
+router.get('/support/stats', supportInventoryGuard, getSupportStats);
 router.get('/inventory', departmentReadGuard, getInventoryItems);
 router.post('/inventory', supportInventoryGuard, createOrUpdateInventoryItem);
 router.post('/inventory/:id/in', supportInventoryGuard, addInventoryStock);
@@ -165,6 +166,7 @@ router.get('/delivery-notes', departmentReadGuard, getMyDeliveryNotes);
 router.post('/delivery-notes', salesAndSupportGuard, createMyDeliveryNote);
 router.get('/delivery-notes/:id/stock-check', supportInventoryGuard, checkDeliveryNoteStock);
 router.post('/delivery-notes/:id/confirm', supportInventoryGuard, confirmDeliveryNoteWithInventory);
+router.patch('/delivery-notes/:id/expiry', supportInventoryGuard, updateDeliveryNoteExpiry);
 router.patch('/delivery-notes/:id', salesAndSupportGuard, updateMyDeliveryNote);
 router.delete('/delivery-notes/:id', salesAndSupportGuard, deleteMyDeliveryNote);
 

@@ -14,6 +14,7 @@ const DeliveryNoteSchema = new mongoose.Schema(
     sourceLocation: { type: String, trim: true, default: 'WH/Stock' },
     scheduledDate: { type: Date, default: Date.now },
     deadline: { type: Date, default: Date.now },
+    expiryDate: { type: Date, default: null },
     productAvailability: { type: String, trim: true, default: 'Available' },
     starred: { type: Boolean, default: false },
     recipientName: { type: String, trim: true, default: '' },
