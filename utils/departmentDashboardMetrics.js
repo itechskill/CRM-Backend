@@ -1,6 +1,7 @@
 const DeliveryNote = require('../models/DeliveryNote');
 const PurchaserGRN = require('../models/PurchaserGRN');
 const SalesOrder = require('../models/SalesOrder');
+const Shipment = require('../models/Shipment');
 const SupplierPO = require('../models/SupplierPO');
 const SupportTicket = require('../models/SupportTicket');
 const User = require('../models/User');
@@ -266,9 +267,106 @@ const getSupportDashboardMetrics = async ({ month, now = new Date() }) => {
   };
 };
 
+const getLogisticsDashboardMetrics = async ({ month }) => {
+  const range = monthRange(month);
+  const carryOver = range.key === monthRange().key;
+
+  const [orderCandidates, poCandidates, grnCandidates, pickupCount, inTransitCount] = await Promise.all([
+    SalesOrder.find({
+      fileType: 'Blue',
+      createdAt: { $lt: range.end },
+      $or: [
+        {
+          workflowHistory: {
+            $elemMatch: {
+              department: 'Global Purchaser',
+              newStatus: 'In Logistics',
+              timestamp: { $lt: range.end }
+            }
+          }
+        },
+        {
+          $and: [
+            { $or: [{ currentDepartment: 'Logistics' }, { workflowStatus: 'In Logistics' }] },
+            { lastActionAt: { $lt: range.end } }
+          ]
+        }
+      ]
+    }).select('status workflowStatus deliveryStatus createdAt lastActionAt workflowHistory').lean(),
+    SupplierPO.find({
+      poType: 'Global',
+      status: { $nin: ['Draft', 'Cancelled'] },
+      createdAt: { $lt: range.end }
+    }).select('salesOrderId poDate createdAt').lean(),
+    PurchaserGRN.find({ createdAt: { $lt: range.end } })
+      .select('grnType supplierPO supplierPOId salesOrder salesOrderId grnDate createdAt')
+      .lean(),
+    Shipment.countDocuments({ status: 'Picked Up' }),
+    Shipment.countDocuments({ status: 'In Transit' })
+  ]);
+
+  const linkedOrderIds = [
+    ...poCandidates.map(po => po.salesOrderId),
+    ...grnCandidates.flatMap(grn => [grn.salesOrder, grn.salesOrderId])
+  ].filter(Boolean);
+  const linkedPoIds = grnCandidates.flatMap(grn => [grn.supplierPO, grn.supplierPOId]).filter(Boolean);
+  const [linkedOrders, linkedPOs] = await Promise.all([
+    SalesOrder.find({ _id: { $in: linkedOrderIds } })
+      .select('fileType status workflowStatus deliveryStatus createdAt lastActionAt workflowHistory')
+      .lean(),
+    SupplierPO.find({ _id: { $in: linkedPoIds } }).select('poType salesOrderId').lean()
+  ]);
+  const orderMap = new Map(linkedOrders.map(order => [String(order._id), order]));
+  const poMap = new Map(linkedPOs.map(po => [String(po._id), po]));
+
+  const arrivedOrders = orderCandidates.filter(order => includeEventForMonth({
+    eventDate: sentToLogisticsDate(order), order, range, carryOver
+  }));
+
+  const issuedPOs = poCandidates.filter(po => {
+    const order = orderMap.get(String(po.salesOrderId || ''));
+    const arrivalDate = sentToLogisticsDate(order);
+    if (!order || !arrivalDate || new Date(arrivalDate) >= range.end) return false;
+    return includeEventForMonth({
+      eventDate: po.poDate || po.createdAt,
+      order,
+      range,
+      carryOver
+    });
+  });
+
+  const globalGRNs = grnCandidates.filter(grn => {
+    const po = poMap.get(String(grn.supplierPO || grn.supplierPOId || ''));
+    const orderId = grn.salesOrder || grn.salesOrderId || po?.salesOrderId;
+    const order = orderMap.get(String(orderId || ''));
+    const isGlobal = grn.grnType === 'Logistics' || po?.poType === 'Global' || order?.fileType === 'Blue';
+    if (!isGlobal) return false;
+    const arrivalDate = sentToLogisticsDate(order);
+    if (order && (!arrivalDate || new Date(arrivalDate) >= range.end)) return false;
+    return includeEventForMonth({
+      eventDate: grn.grnDate || grn.createdAt,
+      order,
+      range,
+      carryOver
+    });
+  });
+
+  return {
+    month: range.key,
+    tiles: {
+      soReceived: { count: arrivedOrders.length },
+      poIssued: { count: issuedPOs.length },
+      globalGrnInput: { count: globalGRNs.length },
+      pickup: { count: pickupCount },
+      inTransit: { count: inTransitCount }
+    }
+  };
+};
+
 module.exports = {
   SUPPORT_EXPIRY_WINDOW_DAYS,
   buildPurchaserOrderQueueQuery,
+  getLogisticsDashboardMetrics,
   getPurchaserDashboardMetrics,
   getSupportDashboardMetrics,
   supplierPoAmountPKRCents
