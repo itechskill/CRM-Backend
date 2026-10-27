@@ -3,7 +3,7 @@ const Quotation = require('../models/Quotation');
 const SalesOrder = require('../models/SalesOrder');
 const Invoice = require('../models/Invoice');
 const { ownerScope } = require('./salesOwnership');
-const { monthRange } = require('./targetPerformance');
+const { calendarDaysBetween, monthRange } = require('./targetPerformance');
 
 const finalizedLifecycleStatuses = new Set(['Finalized', 'Sent', 'Partially Paid', 'Overdue', 'Paid']);
 
@@ -16,6 +16,8 @@ const inRange = (value, range) => {
   const date = new Date(value);
   return date >= range.start && date < range.end;
 };
+const invoiceDate = invoice => invoice?.finalizedAt || invoice?.issueDate || invoice?.createdAt;
+const invoiceAgeDays = (invoice, now) => Math.max(0, calendarDaysBetween(invoiceDate(invoice), now));
 const isFinalizedInvoice = invoice => (
   invoice?.isDraft !== true
   && !['Draft', 'Cancelled'].includes(invoice?.status)
@@ -49,9 +51,15 @@ const getSalesDashboardMetrics = async ({ userId, isGlobal = false, month, now =
   const sentQuotations = quotations.filter(quotation => !/draft|cancel/i.test(String(quotation.status || '')));
   const acceptedOrders = orders.filter(order => !/reject/i.test(String(order.status || '')));
   const finalizedInvoices = invoices.filter(isFinalizedInvoice);
-  const monthFinalizedInvoices = finalizedInvoices.filter(invoice => inRange(invoice.finalizedAt || invoice.issueDate || invoice.createdAt, range));
+  const monthFinalizedInvoices = finalizedInvoices.filter(invoice => inRange(invoiceDate(invoice), range));
   const receivableInvoices = finalizedInvoices.filter(invoice => invoice.status !== 'Paid' && invoiceRemaining(invoice) > 0);
   const overdueInvoices = receivableInvoices.filter(invoice => invoice.dueDate && new Date(invoice.dueDate) < now);
+  const safeReceivables = receivableInvoices.filter(invoice => invoiceAgeDays(invoice, now) <= 30);
+  const dueReceivables = receivableInvoices.filter(invoice => {
+    const age = invoiceAgeDays(invoice, now);
+    return age >= 31 && age <= 45;
+  });
+  const above45Days = receivableInvoices.filter(invoice => invoiceAgeDays(invoice, now) > 45);
 
   const serializeInvoice = invoice => ({
     _id: invoice._id,
@@ -62,6 +70,7 @@ const getSalesDashboardMetrics = async ({ userId, isGlobal = false, month, now =
     amount: Number(invoice.amount || 0),
     paidAmount: Number(invoice.paidAmount || 0),
     remainingBalance: invoiceRemaining(invoice),
+    ageDays: invoiceAgeDays(invoice, now),
     status: invoice.status,
     type: 'Invoice'
   });
@@ -83,6 +92,21 @@ const getSalesDashboardMetrics = async ({ userId, isGlobal = false, month, now =
         count: monthFinalizedInvoices.length,
         amount: monthFinalizedInvoices.reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0)
       },
+      safeReceivable: {
+        count: safeReceivables.length,
+        amount: safeReceivables.reduce((sum, invoice) => sum + invoiceRemaining(invoice), 0),
+        records: safeReceivables.map(serializeInvoice)
+      },
+      dueReceivable: {
+        count: dueReceivables.length,
+        amount: dueReceivables.reduce((sum, invoice) => sum + invoiceRemaining(invoice), 0),
+        records: dueReceivables.map(serializeInvoice)
+      },
+      above45Days: {
+        count: above45Days.length,
+        amount: above45Days.reduce((sum, invoice) => sum + invoiceRemaining(invoice), 0),
+        records: above45Days.map(serializeInvoice)
+      },
       receivable: {
         count: receivableInvoices.length,
         amount: receivableInvoices.reduce((sum, invoice) => sum + invoiceRemaining(invoice), 0),
@@ -99,6 +123,8 @@ const getSalesDashboardMetrics = async ({ userId, isGlobal = false, month, now =
 
 module.exports = {
   getSalesDashboardMetrics,
+  invoiceAgeDays,
+  invoiceDate,
   invoiceRemaining,
   isFinalizedInvoice
 };
