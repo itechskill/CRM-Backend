@@ -5,6 +5,17 @@ const User = require('../models/User');
 const MaintenanceCharge = require('../models/MaintenanceCharge');
 const InventoryItem = require('../models/InventoryItem');
 const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../utils/editPermissionHelper');
+const { getFinanceDashboardMetrics } = require('../utils/departmentDashboardMetrics');
+
+const getFinanceDashboardStats = async (req, res) => {
+  try {
+    const data = await getFinanceDashboardMetrics({ month: req.query.month });
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    console.error('[Get Finance Dashboard Stats Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error fetching Finance dashboard.' });
+  }
+};
 
 // INVOICES API
 const getInvoices = async (req, res) => {
@@ -513,6 +524,7 @@ const deleteMaintenanceCharge = async (req, res) => {
 };
 
 module.exports = {
+  getFinanceDashboardStats,
   getInvoices,
   createInvoice,
   updateInvoice,

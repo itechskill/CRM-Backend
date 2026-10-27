@@ -6,6 +6,7 @@ const SupplierPO = require('../models/SupplierPO');
 const SupportTicket = require('../models/SupportTicket');
 const User = require('../models/User');
 const { monthRange } = require('./targetPerformance');
+const { getSalesDashboardMetrics } = require('./salesDashboardMetrics');
 
 const SUPPORT_EXPIRY_WINDOW_DAYS = 45;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -58,6 +59,10 @@ const stockFulfilledDate = order => historyDate(order, entry =>
 ) || order.createdAt;
 const sentToLogisticsDate = order => historyDate(order, entry => entry.newStatus === 'In Logistics') ||
   order.lastActionAt || order.createdAt;
+const financeReceivedDate = order => historyDate(order, entry =>
+  /sent to finance for overdue verification/i.test(String(entry.action || entry.notes || '')) ||
+  /pending finance overdue check|pending finance approval/i.test(String(entry.newStatus || ''))
+) || order.financeApprovedAt || order.createdAt;
 
 const buildPurchaserOrderQueueQuery = subDept => {
   const isGlobal = subDept === 'Global';
@@ -363,9 +368,109 @@ const getLogisticsDashboardMetrics = async ({ month }) => {
   };
 };
 
+const getFinanceDashboardMetrics = async ({ month, now = new Date() }) => {
+  const range = monthRange(month);
+  const carryOver = range.key === monthRange().key;
+
+  const [orderCandidates, poCandidates, grnCandidates, deliveryNotes, salesMetrics] = await Promise.all([
+    SalesOrder.find({
+      createdAt: { $lt: range.end },
+      $or: [
+        { currentDepartment: 'Finance' },
+        { departmentResponsible: 'Finance' },
+        { previousDepartment: 'Finance' },
+        { requiresFinanceApproval: true },
+        { financeApprovedAt: { $ne: null } },
+        { workflowHistory: { $elemMatch: { newStatus: { $in: ['Pending Finance Overdue Check', 'Pending Finance Approval'] } } } }
+      ]
+    })
+      .select('totalAmount netAmount status workflowStatus deliveryStatus currentDepartment departmentResponsible previousDepartment requiresFinanceApproval financeApprovedAt createdAt workflowHistory')
+      .lean(),
+    SupplierPO.find({
+      status: { $nin: ['Draft', 'Cancelled'] },
+      createdAt: { $lt: range.end }
+    }).select('poType total totalAmount currency exchangeRateToPKR salesOrderId poDate createdAt').lean(),
+    PurchaserGRN.find({ createdAt: { $lt: range.end } })
+      .select('grnType supplierPO supplierPOId salesOrder salesOrderId grnDate createdAt')
+      .lean(),
+    DeliveryNote.find({ createdAt: { $gte: range.start, $lt: range.end } })
+      .select('_id')
+      .lean(),
+    getSalesDashboardMetrics({ isGlobal: true, month: range.key, now })
+  ]);
+
+  const linkedOrderIds = [
+    ...poCandidates.map(po => po.salesOrderId),
+    ...grnCandidates.flatMap(grn => [grn.salesOrder, grn.salesOrderId])
+  ].filter(Boolean);
+  const linkedPoIds = grnCandidates.flatMap(grn => [grn.supplierPO, grn.supplierPOId]).filter(Boolean);
+  const [linkedOrders, linkedPOs] = await Promise.all([
+    SalesOrder.find({ _id: { $in: linkedOrderIds } })
+      .select('fileType status workflowStatus deliveryStatus createdAt workflowHistory')
+      .lean(),
+    SupplierPO.find({ _id: { $in: linkedPoIds } }).select('poType salesOrderId').lean()
+  ]);
+  const orderMap = new Map(linkedOrders.map(order => [String(order._id), order]));
+  const poMap = new Map(linkedPOs.map(po => [String(po._id), po]));
+
+  const financeOrders = orderCandidates.filter(order => includeEventForMonth({
+    eventDate: financeReceivedDate(order), order, range, carryOver
+  }));
+  const issuedPOs = poCandidates.filter(po => includeEventForMonth({
+    eventDate: po.poDate || po.createdAt,
+    order: orderMap.get(String(po.salesOrderId || '')),
+    range,
+    carryOver
+  }));
+
+  const poTiles = issuedPOs.reduce((tiles, po) => {
+    const key = po.poType === 'Global' ? 'global' : 'local';
+    const converted = supplierPoAmountPKRCents(po);
+    tiles[key].count += 1;
+    tiles[key].amountCents += converted.amountCents;
+    if (converted.missingRate) tiles[key].missingExchangeRateCount += 1;
+    return tiles;
+  }, {
+    local: { count: 0, amountCents: 0, missingExchangeRateCount: 0 },
+    global: { count: 0, amountCents: 0, missingExchangeRateCount: 0 }
+  });
+
+  const grnCounts = grnCandidates.reduce((counts, grn) => {
+    if (!inRange(grn.grnDate || grn.createdAt, range)) return counts;
+    const po = poMap.get(String(grn.supplierPO || grn.supplierPOId || ''));
+    const orderId = grn.salesOrder || grn.salesOrderId || po?.salesOrderId;
+    const order = orderMap.get(String(orderId || ''));
+    if (grn.grnType === 'Logistics' || po?.poType === 'Global' || order?.fileType === 'Blue') counts.global += 1;
+    else counts.local += 1;
+    return counts;
+  }, { local: 0, global: 0 });
+
+  const invoiceTile = tile => ({
+    count: Number(tile?.count || 0),
+    amountCents: moneyToCents(tile?.amount || 0)
+  });
+
+  return {
+    month: range.key,
+    tiles: {
+      so: { count: financeOrders.length, amountCents: financeOrders.reduce((sum, order) => sum + orderAmountCents(order), 0) },
+      localPoIssued: poTiles.local,
+      globalPoIssued: poTiles.global,
+      localGrnInput: { count: grnCounts.local },
+      globalGrnInput: { count: grnCounts.global },
+      deliveryNote: { count: deliveryNotes.length },
+      invoiced: invoiceTile(salesMetrics.tiles.invoiced),
+      receivable1To30: invoiceTile(salesMetrics.tiles.safeReceivable),
+      overdueGrace31To45: invoiceTile(salesMetrics.tiles.dueReceivable),
+      overdue45Plus: invoiceTile(salesMetrics.tiles.above45Days)
+    }
+  };
+};
+
 module.exports = {
   SUPPORT_EXPIRY_WINDOW_DAYS,
   buildPurchaserOrderQueueQuery,
+  getFinanceDashboardMetrics,
   getLogisticsDashboardMetrics,
   getPurchaserDashboardMetrics,
   getSupportDashboardMetrics,

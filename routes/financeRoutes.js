@@ -12,6 +12,7 @@ const {
   getPayroll,
   updatePayroll,
   deletePayroll,
+  getFinanceDashboardStats,
   getFinanceSummary,
   getFullFinanceReports,
   getMaintenanceCharges,
@@ -23,6 +24,7 @@ const { protect, authorize } = require('../middleware/authMiddleware');
 
 router.use(protect, authorize('finance', 'accountant', 'admin', 'ceo'));
 
+router.get('/dashboard-stats', getFinanceDashboardStats);
 router.get('/summary', getFinanceSummary);
 router.get('/reports/full', getFullFinanceReports);
 router.route('/invoices').get(getInvoices).post(createInvoice);
