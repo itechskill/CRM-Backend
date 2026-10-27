@@ -5,6 +5,7 @@ const DeliveryNote = require('../models/DeliveryNote');
 const User = require('../models/User');
 const InventoryItem = require('../models/InventoryItem');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
+const { getLogisticsDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 
 /**
  * @desc    Get real Logistics Dashboard statistics
@@ -12,88 +13,11 @@ const { createNotificationHelper, notifyRoleHelper } = require('./notificationCo
  */
 const getLogisticsDashboardStats = async (req, res) => {
   try {
-    const now = new Date();
-
-    // Get all Sales Order IDs that ALREADY have an initialized shipment
-    const initializedOrderIds = await Shipment.distinct('salesOrder');
-
-    const [
-      incomingOrdersCount,
-      pendingShipmentsCount,
-      inTransitCount,
-      expectedArrivalsCount,
-      receivedCount,
-      delayedCount,
-      totalActiveCount,
-      recentShipments
-    ] = await Promise.all([
-      // Incoming Blue File Orders awaiting Shipment Initialization (NOT YET INITIALIZED)
-      SalesOrder.countDocuments({
-        _id: { $nin: initializedOrderIds },
-        shipmentId: null,
-        fileType: 'Blue',
-        $or: [
-          { 'supplierPO.poType': 'International' },
-          { workflowStatus: { $in: ['International Supplier PO Issued', 'Finance Approved', 'Routed to Logistics', 'In Logistics', 'Pending Logistics Handover'] } }
-        ]
-      }),
-      // Pending Shipments (PO Issued, Shipment Pending, Booked)
-      Shipment.countDocuments({
-        status: { $in: ['PO Issued', 'Shipment Pending', 'Booked'] },
-        receivedInOffice: false
-      }),
-      // In Transit
-      Shipment.countDocuments({
-        status: 'In Transit',
-        receivedInOffice: false
-      }),
-      // Expected Arrivals (In Transit or Booked or Dispatched with ETA)
-      Shipment.countDocuments({
-        status: { $in: ['In Transit', 'Booked', 'Dispatched', 'Arrived'] },
-        receivedInOffice: false,
-        eta: { $ne: null }
-      }),
-      // Shipments Received in Office
-      Shipment.countDocuments({
-        $or: [{ receivedInOffice: true }, { status: 'Received in Office' }]
-      }),
-      // Delayed Shipments (Explicitly marked Delayed or past ETA and not received)
-      Shipment.countDocuments({
-        $or: [
-          { status: 'Delayed' },
-          {
-            receivedInOffice: false,
-            eta: { $lt: now, $ne: null },
-            status: { $nin: ['Received in Office', 'Cancelled'] }
-          }
-        ]
-      }),
-      // Total Active Shipments
-      Shipment.countDocuments({
-        receivedInOffice: false,
-        status: { $nin: ['Received in Office', 'Cancelled'] }
-      }),
-      // 10 most recent shipments for live activity
-      Shipment.find({})
-        .sort({ createdAt: -1 })
-        .limit(10)
-        .populate('salesPerson', 'fullName email')
-        .lean()
-    ]);
+    const data = await getLogisticsDashboardMetrics({ month: req.query.month });
 
     return res.status(200).json({
       success: true,
-      data: {
-        incomingOrders: incomingOrdersCount,
-        internationalSupplierPOs: incomingOrdersCount,
-        pendingShipments: pendingShipmentsCount,
-        inTransit: inTransitCount,
-        expectedArrivals: expectedArrivalsCount,
-        shipmentsReceived: receivedCount,
-        delayedShipments: delayedCount,
-        totalActiveShipments: totalActiveCount,
-        recentShipments
-      }
+      data
     });
   } catch (error) {
     console.error('[Logistics Dashboard Stats Error]:', error);
@@ -411,6 +335,14 @@ const updateShipmentTracking = async (req, res) => {
       status,
       trackingNote
     } = req.body;
+
+    if (status !== undefined && req.user?.role !== 'logistics') {
+      return res.status(403).json({ success: false, message: 'Only Logistics can set shipment status.' });
+    }
+    const allowedStatuses = Shipment.schema.path('status').enumValues;
+    if (status !== undefined && !allowedStatuses.includes(status)) {
+      return res.status(400).json({ success: false, message: 'Select a valid shipment status.' });
+    }
 
     const previousStatus = shipment.status;
 
