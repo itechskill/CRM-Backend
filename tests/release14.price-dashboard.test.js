@@ -59,8 +59,31 @@ const request = async (user, path, options = {}) => {
 const selectedMonth = new Date().toISOString().slice(0, 7);
 const selectedDate = new Date(`${selectedMonth}-10T12:00:00.000Z`);
 const previousDate = new Date(Date.UTC(selectedDate.getUTCFullYear(), selectedDate.getUTCMonth() - 1, 10, 12));
+const utcDay = value => Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate());
+const selectedDateAge = Math.max(0, Math.floor((utcDay(new Date()) - utcDay(selectedDate)) / 86400000));
 
 const setCreatedAt = (Model, id, date) => Model.collection.updateOne({ _id: id }, { $set: { createdAt: date, updatedAt: date } });
+const utcDaysAgo = days => {
+  const today = new Date();
+  return new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - days, 12));
+};
+
+const createAgingInvoice = ({ owner, order, suffix, daysOld, amount, paidAmount = 0, status = 'Finalized', isDraft = false }) => Invoice.create({
+  invoiceNumber: `INV-AGING-${suffix}`,
+  clientName: `${suffix} aging customer`,
+  salesOrderId: order._id,
+  salesOrderNumber: order.orderNumber,
+  amount,
+  paidAmount,
+  outstandingAmount: Math.max(0, amount - paidAmount),
+  dueDate: utcDaysAgo(daysOld),
+  issueDate: utcDaysAgo(daysOld),
+  finalizedAt: isDraft ? null : utcDaysAgo(daysOld),
+  status,
+  isDraft,
+  salesPerson: owner._id,
+  createdBy: owner._id
+});
 
 const createDashboardSet = async (owner, suffix, baseAmount) => {
   const quotation = await Quotation.collection.insertOne({
@@ -227,7 +250,7 @@ test('an existing request assigned to an unlabelled user remains readable', asyn
   assert.equal(String(oldRequest.requestedFrom._id), String(users.salesB._id));
 });
 
-test('nine dashboard tiles use the selected month and remain owner-scoped for two salespeople and a manager', async () => {
+test('dashboard monthly tiles and initial aging buckets remain owner-scoped for two salespeople and a manager', async () => {
   const salesResult = await request(users.salesA, `/api/sales-employee/stats?month=${selectedMonth}`);
   assert.equal(salesResult.response.status, 200, JSON.stringify(salesResult.data));
   const salesTiles = salesResult.data.data.dashboardTiles;
@@ -237,28 +260,28 @@ test('nine dashboard tiles use the selected month and remain owner-scoped for tw
   assert.deepEqual(salesTiles.quotationSent, { count: 1, amount: 400 });
   assert.deepEqual(salesTiles.saleOrder, { count: 1, amount: 400 });
   assert.deepEqual(salesTiles.invoiced, { count: 1, amount: 400 });
-  assert.equal(salesTiles.receivable.count, 1);
-  assert.equal(salesTiles.receivable.amount, 300);
-  assert.equal(salesTiles.overdue.count, 1);
-  assert.equal(salesTiles.overdue.amount, 300);
-  assert.equal(salesTiles.overdue.records[0].invoiceNumber, 'INV-A');
+  assert.equal(salesTiles.safeReceivable.count, 1);
+  assert.equal(salesTiles.safeReceivable.amount, 300);
+  assert.equal(salesTiles.dueReceivable.count, 0);
+  assert.equal(salesTiles.above45Days.count, 0);
+  assert.equal(salesTiles.safeReceivable.records[0].invoiceNumber, 'INV-A');
 
   const salesBResult = await request(users.salesB, `/api/sales-employee/stats?month=${selectedMonth}`);
   assert.equal(salesBResult.response.status, 200, JSON.stringify(salesBResult.data));
   assert.equal(salesBResult.data.data.dashboardTiles.quotationSent.amount, 800);
-  assert.equal(salesBResult.data.data.dashboardTiles.overdue.amount, 600);
-  assert.equal(salesBResult.data.data.dashboardTiles.overdue.records[0].invoiceNumber, 'INV-B');
+  assert.equal(salesBResult.data.data.dashboardTiles.safeReceivable.amount, 600);
+  assert.equal(salesBResult.data.data.dashboardTiles.safeReceivable.records[0].invoiceNumber, 'INV-B');
 
   const managerResult = await request(users.manager, `/api/sales-manager/dashboard-stats?month=${selectedMonth}`);
   assert.equal(managerResult.response.status, 200, JSON.stringify(managerResult.data));
   const managerTiles = managerResult.data.data.dashboardTiles;
   assert.equal(managerTiles.priceRequested.count, 2);
   assert.equal(managerTiles.quotationSent.amount, 1200);
-  assert.equal(managerTiles.overdue.amount, 900);
-  assert.equal(managerTiles.overdue.records[0].invoiceNumber, 'INV-M');
+  assert.equal(managerTiles.safeReceivable.amount, 900);
+  assert.equal(managerTiles.safeReceivable.records[0].invoiceNumber, 'INV-M');
 });
 
-test('month filter changes monthly tiles while receivable and overdue stay as-of-today', async () => {
+test('month filter changes monthly tiles while aging buckets stay as-of-today', async () => {
   const previousMonth = previousDate.toISOString().slice(0, 7);
   const result = await request(users.salesA, `/api/sales-employee/stats?month=${previousMonth}`);
   assert.equal(result.response.status, 200, JSON.stringify(result.data));
@@ -270,17 +293,19 @@ test('month filter changes monthly tiles while receivable and overdue stay as-of
   assert.equal(tiles.saleOrder.count, 0);
   assert.equal(tiles.invoiced.count, 1);
   assert.equal(tiles.invoiced.amount, 200);
-  assert.equal(tiles.receivable.count, 1);
-  assert.equal(tiles.overdue.count, 1);
+  assert.equal(tiles.safeReceivable.count, 1);
+  assert.equal(tiles.dueReceivable.count, 0);
+  assert.equal(tiles.above45Days.count, 0);
 });
 
-test('draft invoices are excluded from invoiced, receivable and overdue tiles', async () => {
+test('draft invoices are excluded from invoiced and every aging bucket', async () => {
   const result = await request(users.salesA, `/api/sales-employee/stats?month=${selectedMonth}`);
   const tiles = result.data.data.dashboardTiles;
   assert.equal(tiles.invoiced.count, 1);
-  assert.equal(tiles.receivable.count, 1);
-  assert.equal(tiles.overdue.count, 1);
-  assert.ok(tiles.receivable.records.every(invoice => !invoice.invoiceNumber.includes('DRAFT')));
+  assert.equal(tiles.safeReceivable.count, 1);
+  assert.equal(tiles.dueReceivable.count, 0);
+  assert.equal(tiles.above45Days.count, 0);
+  assert.ok(tiles.safeReceivable.records.every(invoice => !invoice.invoiceNumber.includes('DRAFT')));
 });
 
 test('Target Performance source covers feature OFF, salary set, and salary not set', async () => {
@@ -305,4 +330,48 @@ test('Target Performance source covers feature OFF, salary set, and salary not s
   const hiddenAgain = await request(users.manager, `/api/target-performance/me?month=${selectedMonth}`);
   assert.equal(hiddenAgain.response.status, 200);
   assert.equal(hiddenAgain.data.data.visible, false);
+});
+
+test('aging buckets use whole invoice-date days at 0/30/31/45/46 and unpaid balances only', async () => {
+  const order = await SalesOrder.findOne({ owner: users.salesA._id }).lean();
+  await Promise.all([
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'DAY-0', daysOld: 0, amount: 100 }),
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'DAY-30-PARTIAL', daysOld: 30, amount: 200, paidAmount: 50 }),
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'DAY-31', daysOld: 31, amount: 300 }),
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'DAY-45', daysOld: 45, amount: 400 }),
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'DAY-46', daysOld: 46, amount: 500 }),
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'DRAFT', daysOld: 46, amount: 600, status: 'Draft', isDraft: true }),
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'CANCELLED', daysOld: 46, amount: 700, status: 'Cancelled' }),
+    createAgingInvoice({ owner: users.salesA, order, suffix: 'PAID', daysOld: 46, amount: 800, paidAmount: 800, status: 'Paid' })
+  ]);
+
+  const current = await request(users.salesA, `/api/sales-employee/stats?month=${selectedMonth}`);
+  assert.equal(current.response.status, 200, JSON.stringify(current.data));
+  const tiles = current.data.data.dashboardTiles;
+  assert.equal(tiles.safeReceivable.count, 3);
+  assert.equal(tiles.safeReceivable.amount, 550);
+  assert.deepEqual(tiles.safeReceivable.records.map(invoice => invoice.ageDays).sort((a, b) => a - b), [0, selectedDateAge, 30].sort((a, b) => a - b));
+  assert.equal(tiles.dueReceivable.count, 2);
+  assert.equal(tiles.dueReceivable.amount, 700);
+  assert.deepEqual(tiles.dueReceivable.records.map(invoice => invoice.ageDays).sort((a, b) => a - b), [31, 45]);
+  assert.equal(tiles.above45Days.count, 1);
+  assert.equal(tiles.above45Days.amount, 500);
+  assert.equal(tiles.above45Days.records[0].ageDays, 46);
+  assert.equal(tiles.safeReceivable.records.find(invoice => invoice.invoiceNumber === 'INV-AGING-DAY-30-PARTIAL').remainingBalance, 150);
+
+  const otherMonth = previousDate.toISOString().slice(0, 7);
+  const filtered = await request(users.salesA, `/api/sales-employee/stats?month=${otherMonth}`);
+  for (const key of ['safeReceivable', 'dueReceivable', 'above45Days']) {
+    assert.equal(filtered.data.data.dashboardTiles[key].count, tiles[key].count);
+    assert.equal(filtered.data.data.dashboardTiles[key].amount, tiles[key].amount);
+  }
+
+  const salesB = await request(users.salesB, `/api/sales-employee/stats?month=${selectedMonth}`);
+  const manager = await request(users.manager, `/api/sales-manager/dashboard-stats?month=${selectedMonth}`);
+  assert.equal(salesB.data.data.dashboardTiles.safeReceivable.amount, 600);
+  assert.equal(salesB.data.data.dashboardTiles.dueReceivable.count, 0);
+  assert.equal(salesB.data.data.dashboardTiles.above45Days.count, 0);
+  assert.equal(manager.data.data.dashboardTiles.safeReceivable.amount, 900);
+  assert.equal(manager.data.data.dashboardTiles.dueReceivable.count, 0);
+  assert.equal(manager.data.data.dashboardTiles.above45Days.count, 0);
 });
