@@ -16,6 +16,7 @@ const { resolvePOCompany } = require('../config/companies');
 const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
 const { getInventoryMatches } = require('../utils/inventoryMatching');
 const { activeReservations, inventoryStatusStage } = require('../utils/inventoryReservations');
+const { getPurchaserDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -1179,43 +1180,7 @@ exports.createFinancialCharge = async (req, res) => {
 exports.getPurchaserDashboardStats = async (req, res) => {
   try {
     const subDept = req.query.subDept || req.query.type || req.user.purchaserSubDept || 'Local';
-
-    const [pos, grns, payables, products, pendingOrders] = await Promise.all([
-      SupplierPO.find({ poType: subDept }),
-      PurchaserGRN.find({ grnType: 'Supplier' }),
-      LocalPayable.find(),
-      ProductFile.find(),
-      SalesOrder.countDocuments({
-        fileType: subDept === 'Global' ? 'Blue' : 'Green',
-        $or: [
-          { departmentResponsible: subDept === 'Global' ? 'Global Purchaser' : 'Local Purchaser' },
-          { currentDepartment: subDept === 'Global' ? 'Global Purchaser' : 'Local Purchaser' },
-          { workflowStatus: subDept === 'Global' ? 'Pending Global Procurement' : 'Pending Local Procurement' },
-          { fileType: subDept === 'Global' ? 'Blue' : 'Green', financeApprovedBy: { $ne: null }, workflowStatus: { $nin: ['Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'] } }
-        ]
-      })
-    ]);
-
-    const totalPOs = pos.length;
-    const pendingPOs = pos.filter(p => p.status === 'Issued' || p.status === 'Partially Received').length;
-    const totalGRNs = grns.length;
-    const pendingGRNs = grns.filter(g => g.status === 'Partial').length;
-    const totalPayablesAmount = payables.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-    const totalValuePKR = pos.reduce((sum, p) => sum + (Number(p.totalAmountPKR || p.totalAmount) || 0), 0);
-
-    const statsObj = {
-      subDept,
-      totalPOs,
-      pendingPOs,
-      totalGRNs,
-      pendingGRNs,
-      totalPayablesAmount,
-      totalProducts: products.length,
-      totalSuppliers: await Supplier.countDocuments(subDept === 'Global' ? { type: 'Global' } : {}),
-      totalValuePKR,
-      pendingOrdersCount: pendingOrders,
-      recentPOs: pos.slice(-5).reverse()
-    };
+    const statsObj = await getPurchaserDashboardMetrics({ subDept, month: req.query.month });
 
     return res.status(200).json({
       success: true,

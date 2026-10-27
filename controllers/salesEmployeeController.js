@@ -29,6 +29,7 @@ const { getCounterKey } = require('../utils/counterKey');
 const { allocateGrnNumber, withGrnDuplicateRecovery } = require('../utils/grnNumber');
 const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
+const { getSupportDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const {
   isGlobalSalesUser,
@@ -3081,6 +3082,7 @@ const createMyDeliveryNote = async (req, res) => {
       sourceLocation,
       scheduledDate,
       deadline,
+      expiryDate,
       productAvailability,
       sourceDocument,
       starred
@@ -3205,6 +3207,7 @@ const createMyDeliveryNote = async (req, res) => {
         deliveryAddress: deliveryAddress || '', trackingNumber: trackingNumber || '', carrier: carrier || '',
         operationType: operationType || 'Fortline: Delivery Orders', sourceLocation: sourceLocation || 'WH/Stock',
         scheduledDate: scheduledDate || deliveryDate || new Date(), deadline: deadline || scheduledDate || deliveryDate || new Date(),
+        expiryDate: expiryDate ? new Date(expiryDate) : null,
         productAvailability: productAvailability || 'Available', starred: !!starred,
         deliveryDate: deliveryDate || scheduledDate || new Date(), items: cleanDnItems, subtotal,
         discount: Math.round((Number(parentSo.discount) || 0) * priceRatio * 100) / 100,
@@ -3982,6 +3985,29 @@ const updateMyDeliveryNote = async (req, res) => {
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error updating delivery note.' });
   } finally {
     await session.endSession();
+  }
+};
+
+const updateDeliveryNoteExpiry = async (req, res) => {
+  try {
+    const rawExpiryDate = req.body.expiryDate;
+    let expiryDate = null;
+    if (rawExpiryDate) {
+      expiryDate = new Date(rawExpiryDate);
+      if (Number.isNaN(expiryDate.getTime())) {
+        return res.status(400).json({ success: false, message: 'Expiry date must be a valid calendar date.' });
+      }
+    }
+    const deliveryNote = await DeliveryNote.findByIdAndUpdate(
+      req.params.id,
+      { $set: { expiryDate } },
+      { new: true, runValidators: true }
+    );
+    if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
+    return res.status(200).json({ success: true, message: 'Delivery Note expiry date updated.', data: deliveryNote });
+  } catch (error) {
+    console.error('[Update Delivery Note Expiry Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error updating Delivery Note expiry date.' });
   }
 };
 
@@ -5724,92 +5750,14 @@ const issueSupplierPO = async (req, res) => {
 
 const getSupportStats = async (req, res) => {
   try {
-    const { filter, startDate, endDate } = req.query;
-    const dateFilter = getDateRangeFilter(filter, startDate, endDate, 'createdAt');
-
-    // Total orders sent to Support (in period if filtered)
-    const orderQuery = {
-      isOverdueBlocked: { $ne: true },
-      $or: [
-        { departmentResponsible: 'Support' },
-        {
-          workflowStatus: {
-            $in: [
-              'Finance Approved',
-              'Local Supplier PO Issued',
-              'Shipment Received in Office',
-              'Goods Received in Office',
-              'Inventory & BL Verified',
-              'Sent to Support',
-              'Support Reviewing',
-              'Delivery Note Created',
-              'Delivery Note Confirmed',
-              'Sent to Accounts',
-              'Draft Invoice Created',
-              'Sent to Finance',
-              'Pending Finance Finalization',
-              'Completed'
-            ]
-          }
-        }
-      ]
-    };
-    if (dateFilter) {
-      orderQuery.$and = [{ $or: orderQuery.$or }, dateFilter];
-      delete orderQuery.$or;
-    }
-    const ordersReceived = await SalesOrder.countDocuments(orderQuery);
-
-    // Total delivery notes created (in period if filtered)
-    const dnQuery = {};
-    if (dateFilter) Object.assign(dnQuery, dateFilter);
-    const deliveryNotesCount = await DeliveryNote.countDocuments(dnQuery);
-
-    // Active pending queue: Sales Orders in Support that DO NOT have a Delivery Note yet
-    const ordersPendingDelivery = await SalesOrder.countDocuments({
-      isOverdueBlocked: { $ne: true },
-      $or: [
-        { departmentResponsible: 'Support' },
-        {
-          workflowStatus: {
-            $in: [
-              'Finance Approved',
-              'Local Supplier PO Issued',
-              'Shipment Received in Office',
-              'Goods Received in Office',
-              'Inventory & BL Verified',
-              'Sent to Support',
-              'Support Reviewing'
-            ]
-          }
-        }
-      ],
-      deliveryNoteId: null
-    });
-
-    const deliveryNotesPending = await DeliveryNote.countDocuments({ status: { $nin: ['Done', 'Delivered', 'Cancelled'] } });
-    const completedDeliveries = await DeliveryNote.countDocuments({ status: { $in: ['Done', 'Delivered'] } });
-
-    const totalInventoryItems = await InventoryItem.countDocuments();
-    const lowStockCount = await InventoryItem.countDocuments({ status: 'Low Stock' });
-    const outOfStockCount = await InventoryItem.countDocuments({ status: 'Out of Stock' });
-
-    return res.status(200).json({
-      success: true,
-      data: {
-        ordersReceived,
-        ordersPendingDelivery,
-        deliveryNotesCount,
-        deliveryNotesPending,
-        completedDeliveries,
-        totalInventoryItems,
-        lowStockCount,
-        outOfStockCount
-      }
-    });
+    const data = await getSupportDashboardMetrics({ month: req.query.month });
+    return res.status(200).json({ success: true, data });
   } catch (error) {
     console.error('[Get Support Stats Error]:', error);
-    return res.status(500).json({ success: false, message: 'Server error fetching support stats.' });
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.statusCode ? error.message : 'Server error fetching support stats.'
+    });
   }
 };
 
@@ -6837,6 +6785,7 @@ module.exports = {
   getMyDeliveryNotes,
   createMyDeliveryNote,
   updateMyDeliveryNote,
+  updateDeliveryNoteExpiry,
   deleteMyDeliveryNote,
   getMyInvoices,
   createMyInvoice,
