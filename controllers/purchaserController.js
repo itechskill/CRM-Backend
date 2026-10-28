@@ -17,6 +17,7 @@ const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
 const { getInventoryMatches } = require('../utils/inventoryMatching');
 const { activeReservations, inventoryStatusStage } = require('../utils/inventoryReservations');
 const { getPurchaserDashboardMetrics } = require('../utils/departmentDashboardMetrics');
+const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -234,7 +235,8 @@ exports.getSupplierPOs = async (req, res) => {
       .populate('supportVerifiedGrn', 'grnNumber createdAt')
       .populate('goodsReceiptRecordedBy', 'fullName name')
       .sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, count: pos.length, data: pos, pos });
+    const visiblePOs = serializeMonetaryVisibility(pos, req.user, 'supplier-pos');
+    return res.status(200).json({ success: true, count: pos.length, data: visiblePOs, pos: visiblePOs });
   } catch (error) {
     console.error('Get Supplier POs Error:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching purchase orders.' });
