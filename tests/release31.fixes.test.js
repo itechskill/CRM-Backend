@@ -149,8 +149,8 @@ test('concurrent Sales Order creation atomically allocates unique SO numbers and
   await Counter.updateOne({ _id: getCounterKey('sales-order-number') }, { $set: { sequence: 21 } });
 });
 
-test('Issue Local PO routes the order to Support awaiting goods and retains the second-PO guard', async () => {
-  const order = await createOrder();
+test('Issue Local PO stays with Local Purchase awaiting supplier goods and retains the second-PO guard', async () => {
+  const order = await createOrder({ inventoryCheckStatus: 'Shortage' });
   const payload = {
     poType: 'Local',
     salesOrderId: order._id,
@@ -162,10 +162,10 @@ test('Issue Local PO routes the order to Support awaiting goods and retains the 
   assert.equal(issued.response.status, 201, JSON.stringify(issued.data));
 
   const saved = await SalesOrder.findById(order._id).lean();
-  assert.equal(saved.currentDepartment, 'Support');
-  assert.equal(saved.departmentResponsible, 'Support');
-  assert.equal(saved.workflowStatus, 'Local Supplier PO Issued');
-  assert.equal(saved.status, 'Local Supplier PO Issued');
+  assert.equal(saved.currentDepartment, 'Local Purchaser');
+  assert.equal(saved.departmentResponsible, 'Local Purchaser');
+  assert.equal(saved.workflowStatus, 'Local PO Issued / Awaiting Supplier Goods');
+  assert.equal(saved.status, 'Local PO Issued / Awaiting Supplier Goods');
   assert.equal(saved.goodsReceivedInOffice.received, false);
   assert.equal(saved.inventoryReceived, false);
   assert.ok(await LocalPayable.exists({ salesOrderId: order._id }));
@@ -175,22 +175,14 @@ test('Issue Local PO routes the order to Support awaiting goods and retains the 
   assert.match(duplicate.data.message, /already has active Local Supplier PO/i);
 });
 
-test('Procure via Local PO rejects orders fulfilled from stock and orders already with Support', async () => {
-  const fulfilled = await createOrder({ inventoryFulfilledFromExistingStock: true });
-  const fulfilledResult = await request(purchaser, `/api/purchaser/orders/${fulfilled._id}/complete-procurement`, {
+test('the duplicate Procure via Local PO endpoint is removed', async () => {
+  const order = await createOrder({ inventoryCheckStatus: 'Shortage' });
+  const response = await fetch(`${baseUrl}/api/purchaser/orders/${order._id}/complete-procurement`, {
     method: 'POST',
-    body: JSON.stringify({})
+    headers: { Authorization: `Bearer ${tokenFor(purchaser)}`, 'Content-Type': 'application/json' },
+    body: '{}'
   });
-  assert.equal(fulfilledResult.response.status, 409);
-  assert.match(fulfilledResult.data.message, /already fulfilled from existing stock/i);
-
-  const inSupport = await createOrder({ currentDepartment: 'Support', departmentResponsible: 'Support' });
-  const supportResult = await request(purchaser, `/api/purchaser/orders/${inSupport._id}/complete-procurement`, {
-    method: 'POST',
-    body: JSON.stringify({})
-  });
-  assert.equal(supportResult.response.status, 409);
-  assert.match(supportResult.data.message, /already with Support/i);
+  assert.equal(response.status, 404);
 });
 
 test('In Stock to Support returns a conflict when the order has a shortage', async () => {

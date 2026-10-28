@@ -2931,6 +2931,7 @@ const getGoodsReceivingPreview = async (req, res) => {
     if (!canAccessDepartmentOrder(order, req.user, 'support')) return ownershipDenied(res, 'Support queue sales orders');
 
     const inventoryItems = await InventoryItem.find({}).sort({ name: 1 });
+    const supplierPO = await getSupplierPOForOrder(order);
     const receivedTotals = getReceivedQuantityByOrderItem(order);
     const orderItems = order.items && order.items.length ? order.items : [
       { _id: 'product-summary', description: order.productSummary || 'Product Scope Items', quantity: 1, quantityAssumed: true }
@@ -2972,6 +2973,18 @@ const getGoodsReceivingPreview = async (req, res) => {
         orderNumber: order.orderNumber || order.orderReference,
         fileType: order.fileType,
         inventoryReceived: order.inventoryReceived === true,
+        supplierPO: supplierPO ? {
+          _id: supplierPO._id,
+          poNumber: supplierPO.poNumber,
+          supplierName: supplierPO.supplierName,
+          goodsReceiptReference: supplierPO.goodsReceiptReference || '',
+          goodsReceiptDate: supplierPO.goodsReceiptDate || null,
+          items: (supplierPO.items || []).map(item => ({
+            productName: item.productName,
+            description: item.description || '',
+            orderedQty: Number(item.quantity) || 0
+          }))
+        } : null,
         items,
         inventoryOptions: inventoryItems.map(item => ({
           _id: item._id,
@@ -5414,8 +5427,12 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         salesOrder: order._id,
         salesOrderId: order._id,
         salesOrderNumber: order.orderNumber || order.orderReference || '',
-        supplierBillNumber: order.fileType === 'Green' ? String(req.body.referenceNumber || '').trim() : '',
-        supplierBillDate: order.fileType === 'Green' && req.body.referenceDate ? new Date(req.body.referenceDate) : null,
+        supplierBillNumber: order.fileType === 'Green'
+          ? String(supplierPO?.goodsReceiptReference || req.body.referenceNumber || '').trim()
+          : '',
+        supplierBillDate: order.fileType === 'Green'
+          ? (supplierPO?.goodsReceiptDate || (req.body.referenceDate ? new Date(req.body.referenceDate) : null))
+          : null,
         grnDate: receivedAt,
         items: receiptItems.map(item => ({
           productId: String(item.inventoryItem || ''),
@@ -5432,6 +5449,14 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         createdBy: req.user._id,
         createdByName: req.user.fullName
       }], { session });
+
+      if (order.fileType === 'Green' && supplierPO) {
+        await SupplierPO.updateOne(
+          { _id: supplierPO._id },
+          { $set: { supportVerifiedGrn: createdGrns[0]._id, supportVerifiedAt: new Date() } },
+          { session }
+        );
+      }
 
       const submittedExpenses = Array.isArray(req.body.expenses) ? req.body.expenses : [];
       if (submittedExpenses.length && !supplierPO) {
@@ -5607,6 +5632,12 @@ const issueSupplierPO = async (req, res) => {
 
     const type = poType || (order.fileType === 'Blue' ? 'International' : 'Local');
     const isBlue = type === 'International' || order.fileType === 'Blue';
+    if (!isBlue) {
+      return res.status(409).json({
+        success: false,
+        message: 'Local Supplier POs are issued only from Local Purchase → Pending Sales Orders after Check Inventory confirms a shortage.'
+      });
+    }
     const issuingCompany = resolvePOCompany({
       poType: isBlue ? 'Global' : 'Local',
       requestedCompanyCode: req.body.issuingCompanyCode,
