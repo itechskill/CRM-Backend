@@ -49,8 +49,6 @@ const {
   releaseOrderReservations,
   releaseDeliveryNoteReservations
 } = require('../utils/inventoryReservations');
-const { appendExpenseLines } = require('../utils/purchaseExpenses');
-const { ensureCategoryAvailable, canAccessPO } = require('./purchaseExpenseController');
 const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 
 // ─────────────────────────────────────────────
@@ -5200,6 +5198,9 @@ const recordGoodsReceivedInOffice = async (req, res) => {
       if (order.inventoryFulfilledFromExistingStock === true) {
         throw createHttpError(409, 'This order is using existing warehouse stock. Do not record another Inventory IN; create the Delivery Note when ready.');
       }
+      if (Array.isArray(req.body.expenses) && req.body.expenses.length) {
+        throw createHttpError(403, 'Supplier purchase expenses can only be recorded by Finance or Admin.');
+      }
 
       if (order.fileType === 'Blue') {
         const shipment = await Shipment.findOne({ salesOrder: order._id }).session(session);
@@ -5456,26 +5457,6 @@ const recordGoodsReceivedInOffice = async (req, res) => {
           { $set: { supportVerifiedGrn: createdGrns[0]._id, supportVerifiedAt: new Date() } },
           { session }
         );
-      }
-
-      const submittedExpenses = Array.isArray(req.body.expenses) ? req.body.expenses : [];
-      if (submittedExpenses.length && !supplierPO) {
-        throw createHttpError(409, 'Expenses cannot be recorded because this order is not linked to a Supplier PO.');
-      }
-      if (submittedExpenses.length) {
-        if (!canAccessPO(req.user, supplierPO, 'add')) {
-          throw createHttpError(403, 'You cannot add costs to this Supplier PO.');
-        }
-        for (const expense of submittedExpenses) {
-          expense.category = await ensureCategoryAvailable(expense.category, req.user, session);
-        }
-        await appendExpenseLines({
-          po: supplierPO,
-          inputs: submittedExpenses,
-          user: req.user,
-          grn: createdGrns[0],
-          session
-        });
       }
 
       if (order.fileType === 'Green' && supplierPO) {

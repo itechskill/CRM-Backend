@@ -34,6 +34,7 @@ const {
   updateExpenseCategory,
   getSupplierPOExpenses,
   addSupplierPOExpense,
+  updateSupplierPOCostingStatus,
   updateSupplierPOExpense,
   removeSupplierPOExpense
 } = require('../controllers/purchaseExpenseController');
@@ -45,8 +46,8 @@ const purchaserAccess = authorize('purchaser', 'admin', 'ceo');
 const inventoryManagementAccess = authorize('admin', 'ceo');
 const financialChargesAccess = authorize('finance', 'accountant', 'admin', 'ceo');
 const supplierPOListAccess = authorize('support', 'finance', 'purchaser', 'admin', 'ceo');
-const expenseReadAccess = authorize('support', 'finance', 'admin', 'ceo');
-const expenseAddAccess = authorize('support', 'finance', 'admin');
+const expenseReadAccess = authorize('finance', 'admin', 'ceo');
+const expenseAddAccess = authorize('finance', 'admin');
 const expenseEditAccess = authorize('finance', 'admin');
 
 const requirePurchaserSubDept = (requiredSubDept) => (req, res, next) => {
@@ -263,6 +264,7 @@ router.post('/expense-categories', expenseAddAccess, createExpenseCategory);
 router.patch('/expense-categories/:key', authorize('admin'), updateExpenseCategory);
 router.get('/pos/:id/expenses', expenseReadAccess, getSupplierPOExpenses);
 router.post('/pos/:id/expenses', expenseAddAccess, addSupplierPOExpense);
+router.patch('/pos/:id/expenses/costing-status', expenseEditAccess, updateSupplierPOCostingStatus);
 router.patch('/pos/:id/expenses/:expenseId', expenseEditAccess, updateSupplierPOExpense);
 router.delete('/pos/:id/expenses/:expenseId', expenseEditAccess, removeSupplierPOExpense);
 router.patch('/pos/:id', purchaserAccess, requireSupplierPOOwnership, updateSupplierPO);

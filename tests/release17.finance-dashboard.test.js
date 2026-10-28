@@ -212,7 +212,7 @@ after(async () => {
   await mongoose.disconnect();
 });
 
-test('Finance dashboard returns all ten tiles with Local/Global splits, PKR cents and missing-rate count', async () => {
+test('Finance dashboard returns all eleven tiles with Local/Global splits, PKR cents and missing-rate count', async () => {
   const result = await request(users.finance, `/api/finance/dashboard-stats?month=${selectedMonth}`);
   assert.equal(result.response.status, 200, JSON.stringify(result.data));
   const tiles = result.data.data.tiles;
@@ -222,6 +222,8 @@ test('Finance dashboard returns all ten tiles with Local/Global splits, PKR cent
   assert.deepEqual(tiles.localGrnInput, { count: 1 });
   assert.deepEqual(tiles.globalGrnInput, { count: 2 });
   assert.deepEqual(tiles.deliveryNote, { count: 2 });
+  assert.deepEqual(tiles.invoiced, { count: 2, amountCents: 90000 });
+  assert.deepEqual(tiles.invoicesAllocated, { count: 1, amountCents: 80000 });
   assert.equal(Object.hasOwn(tiles.localGrnInput, 'amountCents'), false);
   assert.equal(Object.hasOwn(tiles.globalGrnInput, 'amountCents'), false);
   assert.equal(Object.hasOwn(tiles.deliveryNote, 'amountCents'), false);
@@ -235,6 +237,13 @@ test('Finance aging reuses Sales boundaries and excludes draft, cancelled and fu
   assert.deepEqual(tiles.overdue45Plus, { count: 1, amountCents: 30000 });
 });
 
+test('Total Invoices Allocated includes only fully paid finalized invoices in the selected month', async () => {
+  const result = await request(users.finance, `/api/finance/dashboard-stats?month=${selectedMonth}`);
+  const tiles = result.data.data.tiles;
+  assert.deepEqual(tiles.invoicesAllocated, { count: 1, amountCents: 80000 });
+  assert.equal(tiles.invoiced.count, 2);
+});
+
 test('Finance invoice and aging totals equal the sum of both salespeople dashboards', async () => {
   const [finance, salesA, salesB] = await Promise.all([
     request(users.finance, `/api/finance/dashboard-stats?month=${selectedMonth}`),
@@ -245,6 +254,7 @@ test('Finance invoice and aging totals equal the sum of both salespeople dashboa
   const salesTiles = [salesA.data.data.dashboardTiles, salesB.data.data.dashboardTiles];
   for (const [financeKey, salesKey] of [
     ['invoiced', 'invoiced'],
+    ['invoicesAllocated', 'allocated'],
     ['receivable1To30', 'safeReceivable'],
     ['overdueGrace31To45', 'dueReceivable'],
     ['overdue45Plus', 'above45Days']

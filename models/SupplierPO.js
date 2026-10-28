@@ -25,6 +25,16 @@ const expenseHistorySchema = new mongoose.Schema({
   newValues: { type: mongoose.Schema.Types.Mixed, default: null }
 }, { _id: false });
 
+const costingHistorySchema = new mongoose.Schema({
+  action: { type: String, enum: ['Completed', 'Reopened'], required: true },
+  previousStatus: { type: String, enum: ['Incomplete', 'Completed'], required: true },
+  newStatus: { type: String, enum: ['Incomplete', 'Completed'], required: true },
+  reason: { type: String, default: '', trim: true },
+  changedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  changedByName: { type: String, default: '' },
+  changedAt: { type: Date, default: Date.now }
+}, { _id: false });
+
 const purchaseExpenseSchema = new mongoose.Schema({
   grn: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaserGRN', default: null },
   grnNumber: { type: String, default: '', trim: true },
@@ -164,6 +174,8 @@ const supplierPOSchema = new mongoose.Schema(
     goodsReceiptRecordedAt: { type: Date, default: null },
     supportVerifiedGrn: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaserGRN', default: null },
     supportVerifiedAt: { type: Date, default: null },
+    costingStatus: { type: String, enum: ['Incomplete', 'Completed'], default: 'Incomplete' },
+    costingHistory: { type: [costingHistorySchema], default: [] },
     expenses: { type: [purchaseExpenseSchema], default: [] }
   },
   { timestamps: true }

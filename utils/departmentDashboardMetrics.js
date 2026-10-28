@@ -461,6 +461,7 @@ const getFinanceDashboardMetrics = async ({ month, now = new Date() }) => {
       globalGrnInput: { count: grnCounts.global },
       deliveryNote: { count: deliveryNotes.length },
       invoiced: invoiceTile(salesMetrics.tiles.invoiced),
+      invoicesAllocated: invoiceTile(salesMetrics.tiles.allocated),
       receivable1To30: invoiceTile(salesMetrics.tiles.safeReceivable),
       overdueGrace31To45: invoiceTile(salesMetrics.tiles.dueReceivable),
       overdue45Plus: invoiceTile(salesMetrics.tiles.above45Days)
