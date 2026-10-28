@@ -305,8 +305,11 @@ test('DN creation uses Sales Order prices, partial confirmation preserves the re
     })
   });
   assert.equal(secondCreated.response.status, 201, JSON.stringify(secondCreated.data));
-  assert.equal(secondCreated.data.data.items[0].unitPrice, 100);
-  assert.equal(secondCreated.data.data.grandTotal, 285);
+  assert.equal(secondCreated.data.data.items[0].unitPrice, undefined);
+  assert.equal(secondCreated.data.data.grandTotal, undefined);
+  const storedSecondDn = await DeliveryNote.findById(secondCreated.data.data._id).lean();
+  assert.equal(storedSecondDn.items[0].unitPrice, 100);
+  assert.equal(storedSecondDn.grandTotal, 285);
 
   const completed = await request(support, `/api/sales-employee/delivery-notes/${secondCreated.data.data._id}/confirm`, {
     method: 'POST',

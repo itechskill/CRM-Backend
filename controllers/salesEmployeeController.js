@@ -50,6 +50,7 @@ const {
   releaseDeliveryNoteReservations
 } = require('../utils/inventoryReservations');
 const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
+const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -1137,10 +1138,10 @@ const getMyInvoices = async (req, res) => {
     return res.status(200).json({
       success: true,
       count: invoices.length,
-      data: invoices,
+      data: serializeMonetaryVisibility(invoices, req.user, 'invoices'),
       eligibleWonSales: {
-        deals: eligibleDeals,
-        orders: eligibleOrders
+        deals: serializeMonetaryVisibility(eligibleDeals, req.user, 'deals'),
+        orders: serializeMonetaryVisibility(eligibleOrders, req.user, 'sales-orders')
       }
     });
   } catch (error) {
@@ -1412,7 +1413,7 @@ const checkCustomerOverdueApi = async (req, res) => {
   try {
     const { clientName } = req.query;
     const result = await calculateCustomerOverdue(clientName);
-    return res.status(200).json({ success: true, ...result });
+    return res.status(200).json({ success: true, ...serializeMonetaryVisibility(result, req.user, 'overdue') });
   } catch (error) {
     console.error('[Check Customer Overdue Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error checking customer overdue status.' });
@@ -2316,7 +2317,7 @@ const getMyOrders = async (req, res) => {
       }));
     }
 
-    return res.status(200).json({ success: true, count: orders.length, data: responseOrders });
+    return res.status(200).json({ success: true, count: orders.length, data: serializeMonetaryVisibility(responseOrders, req.user, 'sales-orders') });
   } catch (error) {
     console.error('[Get Orders Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching orders.' });
@@ -3041,7 +3042,7 @@ const getAvailableOrdersForDelivery = async (req, res) => {
     }));
     const orders = eligible.filter(Boolean);
 
-    return res.status(200).json({ success: true, count: orders.length, data: orders });
+    return res.status(200).json({ success: true, count: orders.length, data: serializeMonetaryVisibility(orders, req.user, 'sales-orders') });
   } catch (error) {
     console.error('[Get Available Orders Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching available orders.' });
@@ -3066,7 +3067,7 @@ const getMyDeliveryNotes = async (req, res) => {
     const notes = await DeliveryNote.find(filter)
       .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount discount tax items clientEmail clientPhone clientAddress fileNo fileType salePerson')
       .sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, count: notes.length, data: notes });
+    return res.status(200).json({ success: true, count: notes.length, data: serializeMonetaryVisibility(notes, req.user, 'delivery-notes') });
   } catch (error) {
     console.error('[Get Delivery Notes Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching delivery notes.' });
@@ -3277,7 +3278,7 @@ const createMyDeliveryNote = async (req, res) => {
       sender: req.user._id
     });
 
-    return res.status(201).json({ success: true, message: 'Delivery note created successfully.', data: deliveryNote });
+    return res.status(201).json({ success: true, message: 'Delivery note created successfully.', data: serializeMonetaryVisibility(deliveryNote, req.user, 'delivery-note') });
   } catch (error) {
     console.error('[Create Delivery Note Error]:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error creating delivery note.' });
@@ -3990,7 +3991,7 @@ const updateMyDeliveryNote = async (req, res) => {
       }
       savedDeliveryNote = await currentDeliveryNote.save({ session });
     });
-    return res.status(200).json({ success: true, message: 'Delivery note updated.', data: savedDeliveryNote });
+    return res.status(200).json({ success: true, message: 'Delivery note updated.', data: serializeMonetaryVisibility(savedDeliveryNote, req.user, 'delivery-note') });
   } catch (error) {
     console.error('[Update Delivery Note Error]:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error updating delivery note.' });
@@ -4015,7 +4016,7 @@ const updateDeliveryNoteExpiry = async (req, res) => {
       { new: true, runValidators: true }
     );
     if (!deliveryNote) return res.status(404).json({ success: false, message: 'Delivery note not found.' });
-    return res.status(200).json({ success: true, message: 'Delivery Note expiry date updated.', data: deliveryNote });
+    return res.status(200).json({ success: true, message: 'Delivery Note expiry date updated.', data: serializeMonetaryVisibility(deliveryNote, req.user, 'delivery-note') });
   } catch (error) {
     console.error('[Update Delivery Note Expiry Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error updating Delivery Note expiry date.' });
@@ -5264,6 +5265,9 @@ const recordGoodsReceivedInOffice = async (req, res) => {
               throw createHttpError(409, `Inventory already contains ${duplicate.name}${duplicate.sku ? ` (${duplicate.sku})` : ''}. Select that existing row instead of creating another product.`);
             }
 
+            const supplierPOLine = (supplierPO?.items || []).find(line =>
+              normalizeInventoryName(line.productName || line.description) === normalizeInventoryName(orderItem.description)
+            );
             const created = await InventoryItem.create([{
               name: newName,
               sku: newSku,
@@ -5272,7 +5276,9 @@ const recordGoodsReceivedInOffice = async (req, res) => {
               quantityOnHand: 0,
               reservedQuantity: 0,
               minStockLevel: Number(newProduct.minStockLevel) || 5,
-              unitPrice: Number(newProduct.unitPrice) || Number(orderItem.unitPrice) || 0,
+              // Support cannot supply valuation. If the linked Supplier PO has an exact normalized line,
+              // preserve that authoritative purchase price internally without returning it to Support.
+              unitPrice: Number(supplierPOLine?.unitPrice) || 0,
               location: String(newProduct.location || 'WH/Stock').trim(),
               description: String(newProduct.description || orderItem.description || '').trim(),
               supplierName,
@@ -5783,7 +5789,7 @@ const getInventoryItems = async (req, res) => {
       query.$or = [{ name: regex }, { sku: regex }, { category: regex }, { location: regex }];
     }
     const items = await InventoryItem.find(query).sort({ updatedAt: -1 });
-    return res.status(200).json({ success: true, count: items.length, data: items });
+    return res.status(200).json({ success: true, count: items.length, data: serializeMonetaryVisibility(items, req.user, 'inventory-items') });
   } catch (error) {
     console.error('[Get Inventory Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching inventory.' });
@@ -5810,19 +5816,23 @@ const createOrUpdateInventoryItem = async (req, res) => {
     }
 
     let item;
+    const maySetPrice = req.user.role === 'admin';
     if (id) {
+      const update = { name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, location, description };
+      if (maySetPrice) update.unitPrice = Number(unitPrice) || 0;
       item = await InventoryItem.findByIdAndUpdate(
         id,
-        { name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, unitPrice: Number(unitPrice) || 0, location, description },
+        update,
         { new: true, runValidators: true }
       );
     } else {
       item = await InventoryItem.create({
-        name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, unitPrice: Number(unitPrice) || 0, location, description
+        name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5,
+        unitPrice: maySetPrice ? (Number(unitPrice) || 0) : 0, location, description
       });
     }
 
-    return res.status(200).json({ success: true, data: item });
+    return res.status(200).json({ success: true, data: serializeMonetaryVisibility(item, req.user, 'inventory-item') });
   } catch (error) {
     console.error('[Save Inventory Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error saving inventory item.' });
@@ -5943,7 +5953,7 @@ const addInventoryStock = async (req, res) => {
       }
     });
 
-    return res.status(200).json({ success: true, message: `${quantity} ${savedItem.unit || 'pcs'} added to ${savedItem.name}. GRN ${grnNumber} created.`, data: savedItem, grnNumber });
+    return res.status(200).json({ success: true, message: `${quantity} ${savedItem.unit || 'pcs'} added to ${savedItem.name}. GRN ${grnNumber} created.`, data: serializeMonetaryVisibility(savedItem, req.user, 'inventory-item'), grnNumber });
   } catch (error) {
     console.error('[Inventory IN Error]:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error adding inventory stock.' });
@@ -6088,7 +6098,7 @@ const confirmDeliveryNoteWithInventory = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: `Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} confirmed and stock updated.`,
-      data: deliveryNote
+      data: serializeMonetaryVisibility(deliveryNote, req.user, 'delivery-note')
     });
   } catch (error) {
     console.error('[Confirm Delivery Note Error]:', error);
@@ -6252,7 +6262,7 @@ const confirmDeliveryNoteWithInventoryR7 = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: `Delivery Note ${confirmedDeliveryNote.deliveryNumber || confirmedDeliveryNote.deliveryNoteNumber} confirmed and stock updated.`,
-      data: confirmedDeliveryNote
+      data: serializeMonetaryVisibility(confirmedDeliveryNote, req.user, 'delivery-note')
     });
   } catch (error) {
     console.error('[Confirm Delivery Note R7 Error]:', error);
@@ -6740,7 +6750,7 @@ const getOrderDocumentPackage = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      data: {
+      data: serializeMonetaryVisibility({
         order,
         invoice,
         deliveryNote,
@@ -6750,7 +6760,7 @@ const getOrderDocumentPackage = async (req, res) => {
           isComplete,
           missingDocuments
         }
-      }
+      }, req.user, 'document-package')
     });
   } catch (error) {
     console.error('Get Order Document Package Error:', error);

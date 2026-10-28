@@ -23,6 +23,7 @@ const JobPosting = require('../models/JobPosting');
 const JobApplication = require('../models/JobApplication');
 const AuditLog = require('../models/AuditLog');
 const { createNotificationHelper } = require('./notificationController');
+const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const logAudit = require('../utils/auditLogger');
 const { ownerScope } = require('../utils/salesOwnership');
 
@@ -1204,7 +1205,7 @@ const getDirectoryUsers = async (req, res) => {
     return res.status(200).json({
       success: true,
       count: users.length,
-      data: users
+      data: serializeMonetaryVisibility(users, req.user, 'users')
     });
   } catch (error) {
     console.error('[Get Directory Users Error]:', error);
@@ -1232,7 +1233,7 @@ const getUserProfileDetails = async (req, res) => {
     return res.status(200).json({
       success: true,
       data: {
-        user,
+        user: serializeMonetaryVisibility(user, req.user, 'users'),
         tasks,
         attendance,
         leaves,

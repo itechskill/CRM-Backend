@@ -6,6 +6,7 @@ const User = require('../models/User');
 const InventoryItem = require('../models/InventoryItem');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
 const { getLogisticsDashboardMetrics } = require('../utils/departmentDashboardMetrics');
+const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 
 /**
  * @desc    Get real Logistics Dashboard statistics
@@ -128,7 +129,7 @@ const getShipments = async (req, res) => {
     return res.status(200).json({
       success: true,
       count: shipments.length,
-      data: shipments
+      data: serializeMonetaryVisibility(shipments, req.user, 'shipments')
     });
   } catch (error) {
     console.error('[Get Shipments Error]:', error);
@@ -162,7 +163,7 @@ const getShipmentById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Shipment not found.' });
     }
 
-    return res.status(200).json({ success: true, data: shipment });
+    return res.status(200).json({ success: true, data: serializeMonetaryVisibility(shipment, req.user, 'shipment') });
   } catch (error) {
     console.error('[Get Shipment By Id Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error loading shipment.' });
@@ -291,7 +292,7 @@ const createShipment = async (req, res) => {
     return res.status(201).json({
       success: true,
       message: `Shipment ${shipment.shipmentId} successfully created.`,
-      data: shipment
+      data: serializeMonetaryVisibility(shipment, req.user, 'shipment')
     });
   } catch (error) {
     console.error('[Create Shipment Error]:', error);
@@ -350,7 +351,7 @@ const updateShipmentTracking = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Confirm Picked Up before marking this shipment In Transit.' });
     }
     if (shipment.fileType === 'Blue' && status === 'Picked Up' && ['In Transit', 'Arrived', 'Received in Office'].includes(previousStatus)) {
-      return res.status(200).json({ success: true, message: 'Picked Up is already complete for this shipment.', data: shipment });
+      return res.status(200).json({ success: true, message: 'Picked Up is already complete for this shipment.', data: serializeMonetaryVisibility(shipment, req.user, 'shipment') });
     }
 
     if (etd !== undefined) shipment.etd = etd ? new Date(etd) : null;
@@ -428,7 +429,7 @@ const updateShipmentTracking = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: `Shipment ${shipment.shipmentId} tracking information updated.`,
-      data: shipment
+      data: serializeMonetaryVisibility(shipment, req.user, 'shipment')
     });
   } catch (error) {
     console.error('[Update Shipment Tracking Error]:', error);
@@ -469,13 +470,13 @@ const updateCustomsClearance = async (req, res) => {
         return res.status(400).json({ success: false, message: 'GD filing has already been completed for this shipment.' });
       }
       if (currentState === 'GD Not Filed') {
-        return res.status(200).json({ success: true, message: 'GD Not Filed is already recorded.', data: shipment });
+        return res.status(200).json({ success: true, message: 'GD Not Filed is already recorded.', data: serializeMonetaryVisibility(shipment, req.user, 'shipment') });
       }
     } else {
       const currentIndex = orderedStates.indexOf(currentState);
       const requestedIndex = orderedStates.indexOf(state);
       if (requestedIndex <= currentIndex) {
-        return res.status(200).json({ success: true, message: `${state} is already complete.`, data: shipment });
+        return res.status(200).json({ success: true, message: `${state} is already complete.`, data: serializeMonetaryVisibility(shipment, req.user, 'shipment') });
       }
       if (requestedIndex !== currentIndex + 1) {
         return res.status(400).json({ success: false, message: `Complete ${orderedStates[currentIndex + 1]} before ${state}.` });
@@ -498,7 +499,7 @@ const updateCustomsClearance = async (req, res) => {
       message: state === 'GD Not Filed'
         ? 'GD Not Filed recorded. Assessment remains locked until GD is filed.'
         : `${state} recorded successfully.`,
-      data: shipment
+      data: serializeMonetaryVisibility(shipment, req.user, 'shipment')
     });
   } catch (error) {
     console.error('[Update Customs Clearance Error]:', error);
@@ -618,7 +619,7 @@ const receiveShipmentInOffice = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: `Shipment ${shipment.shipmentId} confirmed as received in office and moved to Support.`,
-      data: shipment
+      data: serializeMonetaryVisibility(shipment, req.user, 'shipment')
     });
   } catch (error) {
     console.error('[Receive Shipment in Office Error]:', error);
@@ -649,7 +650,7 @@ const getIncomingOrders = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    return res.status(200).json({ success: true, count: orders.length, data: orders });
+    return res.status(200).json({ success: true, count: orders.length, data: serializeMonetaryVisibility(orders, req.user, 'sales-orders') });
   } catch (error) {
     console.error('[Get Incoming Orders Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error loading incoming orders.' });
@@ -674,7 +675,7 @@ const getLogisticsDeliveryNotes = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    return res.status(200).json({ success: true, count: deliveryNotes.length, data: deliveryNotes });
+    return res.status(200).json({ success: true, count: deliveryNotes.length, data: serializeMonetaryVisibility(deliveryNotes, req.user, 'delivery-notes') });
   } catch (error) {
     console.error('[Get Logistics Delivery Notes Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error loading delivery notes.' });
@@ -728,7 +729,8 @@ const getPendingGRNs = async (req, res) => {
       workflowStatus: 'Pending Logistics GRN'
     }).populate('salesPerson', 'fullName email').sort({ createdAt: -1 }).lean();
 
-    return res.status(200).json({ success: true, count: orders.length, data: orders, orders });
+    const visibleOrders = serializeMonetaryVisibility(orders, req.user, 'sales-orders');
+    return res.status(200).json({ success: true, count: orders.length, data: visibleOrders, orders: visibleOrders });
   } catch (error) {
     console.error('[Get Pending GRNs Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error loading pending GRNs.' });
@@ -887,9 +889,7 @@ const getImportInventory = async (req, res) => {
     const totalValue = items.reduce((sum, i) => sum + ((i.quantityOnHand || 0) * (i.unitPrice || 0)), 0);
     const lowStockCount = items.filter(i => i.status === 'Low Stock' || i.status === 'Out of Stock').length;
 
-    return res.status(200).json({
-      success: true,
-      count: items.length,
+    const visibleInventory = serializeMonetaryVisibility({
       stats: {
         totalItems: items.length,
         totalQuantityOnHand: totalQty,
@@ -897,6 +897,12 @@ const getImportInventory = async (req, res) => {
         lowStockItems: lowStockCount
       },
       data: items
+    }, req.user, 'import-inventory');
+    return res.status(200).json({
+      success: true,
+      count: items.length,
+      stats: visibleInventory.stats,
+      data: visibleInventory.data
     });
   } catch (error) {
     console.error('[Get Import Inventory Error]:', error);
@@ -956,7 +962,7 @@ const createImportInventoryItem = async (req, res) => {
     return res.status(201).json({
       success: true,
       message: `Import inventory item "${item.name}" created successfully.`,
-      data: item
+      data: serializeMonetaryVisibility(item, req.user, 'inventory-item')
     });
   } catch (error) {
     console.error('[Create Import Inventory Item Error]:', error);
@@ -1000,7 +1006,7 @@ const updateImportInventoryItem = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: `Import inventory item "${item.name}" updated successfully.`,
-      data: item
+      data: serializeMonetaryVisibility(item, req.user, 'inventory-item')
     });
   } catch (error) {
     console.error('[Update Import Inventory Item Error]:', error);

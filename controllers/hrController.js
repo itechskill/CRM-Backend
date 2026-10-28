@@ -3,6 +3,7 @@ const Attendance = require('../models/Attendance');
 const User = require('../models/User');
 const Performance = require('../models/Performance');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
+const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 
 const HR_ROLES = ['admin', 'hr_manager', 'administration'];
 const MANAGER_ROLES = [...HR_ROLES, 'ceo'];
@@ -47,7 +48,7 @@ const getEmployees = async (req, res) => {
       .select('-password')
       .sort({ createdAt: -1 });
 
-    return res.status(200).json({ success: true, count: employees.length, data: employees });
+    return res.status(200).json({ success: true, count: employees.length, data: serializeMonetaryVisibility(employees, req.user, 'users') });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error retrieving employees.' });
   }
@@ -664,7 +665,7 @@ const getHRReportData = async (req, res) => {
     return res.status(200).json({
       success: true,
       data: {
-        employees,
+        employees: serializeMonetaryVisibility(employees, req.user, 'users'),
         todayAttendance,
         recentAttendance,
         performanceReviews,
