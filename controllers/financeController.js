@@ -46,9 +46,16 @@ const getInvoices = async (req, res) => {
 
 const createInvoice = async (req, res) => {
   try {
-    const { clientName, dealId, dealTitle, amount, dueDate, description, status } = req.body;
+    const { clientName, dealId, dealTitle, amount, dueDate, description, status, poReference } = req.body;
     if (!clientName || !amount || !dueDate) {
       return res.status(400).json({ success: false, message: 'Client name, amount, and due date are required.' });
+    }
+    if (poReference !== undefined && typeof poReference !== 'string') {
+      return res.status(400).json({ success: false, message: 'PO Reference must be text.' });
+    }
+    const normalizedPoReference = String(poReference || '').trim();
+    if (normalizedPoReference.length > 60) {
+      return res.status(400).json({ success: false, message: 'PO Reference cannot exceed 60 characters.' });
     }
 
     const count = await Invoice.countDocuments();
@@ -63,6 +70,7 @@ const createInvoice = async (req, res) => {
       status: status || 'Draft',
       dueDate,
       description: description || '',
+      poReference: normalizedPoReference,
       createdBy: req.user._id
     });
 
@@ -80,10 +88,21 @@ const updateInvoice = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Invoice not found.' });
     }
 
+    if (req.body.poReference !== undefined && typeof req.body.poReference !== 'string') {
+      return res.status(400).json({ success: false, message: 'PO Reference must be text.' });
+    }
+    const updates = { ...req.body };
+    if (updates.poReference !== undefined) {
+      updates.poReference = updates.poReference.trim();
+      if (updates.poReference.length > 60) {
+        return res.status(400).json({ success: false, message: 'PO Reference cannot exceed 60 characters.' });
+      }
+    }
+
     const changes = {};
-    Object.keys(req.body).forEach(field => {
-      if (req.body[field] !== undefined && hasFieldValueChanged(invoice[field], req.body[field])) {
-        changes[field] = { old: invoice[field], new: req.body[field] };
+    Object.keys(updates).forEach(field => {
+      if (updates[field] !== undefined && hasFieldValueChanged(invoice[field], updates[field])) {
+        changes[field] = { old: invoice[field], new: updates[field] };
       }
     });
 
@@ -100,7 +119,7 @@ const updateInvoice = async (req, res) => {
       return res.status(403).json({ success: false, message: check.message });
     }
 
-    Object.assign(invoice, req.body);
+    Object.assign(invoice, updates);
     await invoice.save();
 
     return res.status(200).json({ success: true, message: 'Invoice updated successfully.', data: invoice });

@@ -1166,6 +1166,7 @@ const createMyInvoice = async (req, res) => {
       saleReference,
       salesOrderId,
       salesOrderNumber,
+      poReference,
       deliveryNoteId,
       deliveryNoteNumber,
       fileNumber,
@@ -1192,6 +1193,13 @@ const createMyInvoice = async (req, res) => {
     }
     if (!dueDate) {
       return res.status(400).json({ success: false, message: 'Due date is required.' });
+    }
+    if (poReference !== undefined && typeof poReference !== 'string') {
+      return res.status(400).json({ success: false, message: 'PO Reference must be text.' });
+    }
+    const normalizedPoReference = String(poReference || '').trim();
+    if (normalizedPoReference.length > 60) {
+      return res.status(400).json({ success: false, message: 'PO Reference cannot exceed 60 characters.' });
     }
 
     // Check if invoice already exists for this deal to prevent accidental duplicates
@@ -1269,6 +1277,7 @@ const createMyInvoice = async (req, res) => {
       saleReference: saleReference || '',
       salesOrderId: salesOrderId || null,
       salesOrderNumber: salesOrderNumber || '',
+      poReference: normalizedPoReference,
       deliveryNoteId: resolvedDeliveryNoteId,
       deliveryNoteNumber: resolvedDeliveryNoteNumber,
       fileNumber: fileNumber || '',
@@ -3819,10 +3828,19 @@ const updateMyInvoice = async (req, res) => {
     }
 
     const changes = {};
-    const allowedFields = ['clientName', 'customerEmail', 'customerPhone', 'customerAddress', 'items', 'subtotal', 'tax', 'taxRate', 'discount', 'amount', 'paymentTerms', 'issueDate', 'dueDate', 'description', 'notes', 'status', 'salesOrderId', 'deliveryNoteId', 'fileNumber', 'fileType', 'paidAmount', 'outstandingAmount'];
+    if (req.body.poReference !== undefined && typeof req.body.poReference !== 'string') {
+      return res.status(400).json({ success: false, message: 'PO Reference must be text.' });
+    }
+    const normalizedPoReference = req.body.poReference === undefined ? undefined : req.body.poReference.trim();
+    if (normalizedPoReference !== undefined && normalizedPoReference.length > 60) {
+      return res.status(400).json({ success: false, message: 'PO Reference cannot exceed 60 characters.' });
+    }
+
+    const allowedFields = ['clientName', 'customerEmail', 'customerPhone', 'customerAddress', 'items', 'subtotal', 'tax', 'taxRate', 'discount', 'amount', 'paymentTerms', 'issueDate', 'dueDate', 'description', 'notes', 'status', 'salesOrderId', 'deliveryNoteId', 'fileNumber', 'fileType', 'paidAmount', 'outstandingAmount', 'poReference'];
     allowedFields.forEach(field => {
-      if (req.body[field] !== undefined && hasFieldValueChanged(invoice[field], req.body[field])) {
-        changes[field] = { old: invoice[field], new: req.body[field] };
+      const newValue = field === 'poReference' ? normalizedPoReference : req.body[field];
+      if (newValue !== undefined && hasFieldValueChanged(invoice[field], newValue)) {
+        changes[field] = { old: invoice[field], new: newValue };
       }
     });
 
@@ -3840,7 +3858,8 @@ const updateMyInvoice = async (req, res) => {
     }
 
     allowedFields.forEach(field => {
-      if (req.body[field] !== undefined) invoice[field] = req.body[field];
+      const newValue = field === 'poReference' ? normalizedPoReference : req.body[field];
+      if (newValue !== undefined) invoice[field] = newValue;
     });
     if (req.body.status) invoice.status = req.body.status;
     await invoice.save();

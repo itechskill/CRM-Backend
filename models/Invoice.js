@@ -18,6 +18,7 @@ const InvoiceSchema = new mongoose.Schema({
   saleReference: { type: String, default: '' },
   salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
   salesOrderNumber: { type: String, default: '' },
+  poReference: { type: String, trim: true, maxlength: 60, default: '' },
   deliveryNoteId: { type: mongoose.Schema.Types.ObjectId, ref: 'DeliveryNote', default: null },
   deliveryNoteNumber: { type: String, default: '' },
   fileNumber: { type: String, default: '' },
