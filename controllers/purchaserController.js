@@ -226,7 +226,9 @@ exports.getSupplierPOs = async (req, res) => {
       ];
     }
     let poQuery = SupplierPO.find(filter);
-    if (req.user.role === 'purchaser') poQuery = poQuery.select('-expenses');
+    if (['support', 'purchaser'].includes(req.user.role)) {
+      poQuery = poQuery.select('-expenses -costingStatus -costingHistory');
+    }
     const pos = await poQuery
       .populate('supplier')
       .populate('supportVerifiedGrn', 'grnNumber createdAt')

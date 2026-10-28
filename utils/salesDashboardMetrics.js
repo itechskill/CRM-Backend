@@ -52,6 +52,7 @@ const getSalesDashboardMetrics = async ({ userId, isGlobal = false, month, now =
   const acceptedOrders = orders.filter(order => !/reject/i.test(String(order.status || '')));
   const finalizedInvoices = invoices.filter(isFinalizedInvoice);
   const monthFinalizedInvoices = finalizedInvoices.filter(invoice => inRange(invoiceDate(invoice), range));
+  const monthAllocatedInvoices = monthFinalizedInvoices.filter(invoice => invoiceRemaining(invoice) === 0);
   const receivableInvoices = finalizedInvoices.filter(invoice => invoice.status !== 'Paid' && invoiceRemaining(invoice) > 0);
   const overdueInvoices = receivableInvoices.filter(invoice => invoice.dueDate && new Date(invoice.dueDate) < now);
   const safeReceivables = receivableInvoices.filter(invoice => invoiceAgeDays(invoice, now) <= 30);
@@ -91,6 +92,10 @@ const getSalesDashboardMetrics = async ({ userId, isGlobal = false, month, now =
       invoiced: {
         count: monthFinalizedInvoices.length,
         amount: monthFinalizedInvoices.reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0)
+      },
+      allocated: {
+        count: monthAllocatedInvoices.length,
+        amount: monthAllocatedInvoices.reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0)
       },
       safeReceivable: {
         count: safeReceivables.length,

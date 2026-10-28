@@ -10,9 +10,10 @@ const {
   valuesForHistory
 } = require('../utils/purchaseExpenses');
 
-const ADD_ROLES = new Set(['support', 'finance', 'admin']);
+const ADD_ROLES = new Set(['finance', 'admin']);
 const EDIT_ROLES = new Set(['finance', 'admin']);
 const READ_ROLES = new Set([...ADD_ROLES, 'ceo']);
+const COSTING_LOCK_MESSAGE = 'Costing is Completed and locked. Admin must authorize a change.';
 
 const getPOType = po => {
   if (po?.poType === 'Global' || po?.supplierType === 'Global' || po?.fileType === 'Blue' || /^(GPO|IPO)-/i.test(po?.poNumber || '')) return 'Global';
@@ -25,6 +26,14 @@ const canAccessPO = (user, po, action = 'read') => {
   if (user.role !== 'purchaser') return true;
   const subDept = user.purchaserSubDept === 'Global' ? 'Global' : 'Local';
   return getPOType(po) === subDept;
+};
+
+const assertCostingEditable = (user, po) => {
+  if ((po.costingStatus || 'Incomplete') === 'Completed' && user?.role !== 'admin') {
+    const error = new Error(COSTING_LOCK_MESSAGE);
+    error.statusCode = 409;
+    throw error;
+  }
 };
 
 const categoryRows = async (session = null) => {
@@ -158,6 +167,7 @@ exports.addSupplierPOExpense = async (req, res) => {
       const po = await SupplierPO.findById(req.params.id).session(session);
       if (!po) { const error = new Error('Supplier PO not found.'); error.statusCode = 404; throw error; }
       if (!canAccessPO(req.user, po, 'add')) { const error = new Error('You cannot add costs to this Supplier PO.'); error.statusCode = 403; throw error; }
+      assertCostingEditable(req.user, po);
       const category = await ensureCategoryAvailable(req.body.category, req.user, session);
       const values = buildExpenseValues({ ...req.body, category }, po);
       po.expenses.push({
@@ -187,6 +197,7 @@ exports.updateSupplierPOExpense = async (req, res) => {
       const po = await SupplierPO.findById(req.params.id).session(session);
       if (!po) { const error = new Error('Supplier PO not found.'); error.statusCode = 404; throw error; }
       if (!canAccessPO(req.user, po, 'edit')) { const error = new Error('Only Finance and Admin can edit Supplier PO expenses.'); error.statusCode = 403; throw error; }
+      assertCostingEditable(req.user, po);
       const expense = po.expenses.id(req.params.expenseId);
       if (!expense || expense.isDeleted) { const error = new Error('Active expense not found.'); error.statusCode = 404; throw error; }
       const category = await ensureCategoryAvailable(req.body.category ?? expense.category, req.user, session);
@@ -212,6 +223,7 @@ exports.removeSupplierPOExpense = async (req, res) => {
       const po = await SupplierPO.findById(req.params.id).session(session);
       if (!po) { const error = new Error('Supplier PO not found.'); error.statusCode = 404; throw error; }
       if (!canAccessPO(req.user, po, 'edit')) { const error = new Error('Only Finance and Admin can remove Supplier PO expenses.'); error.statusCode = 403; throw error; }
+      assertCostingEditable(req.user, po);
       const expense = po.expenses.id(req.params.expenseId);
       if (!expense || expense.isDeleted) { const error = new Error('Active expense not found.'); error.statusCode = 404; throw error; }
       const oldValues = valuesForHistory(expense);
@@ -230,5 +242,47 @@ exports.removeSupplierPOExpense = async (req, res) => {
   } finally { await session.endSession(); }
 };
 
+exports.updateSupplierPOCostingStatus = async (req, res) => {
+  try {
+    const po = await SupplierPO.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, message: 'Supplier PO not found.' });
+    if (!canAccessPO(req.user, po, 'edit')) {
+      return res.status(403).json({ success: false, message: 'Only Finance and Admin can update costing status.' });
+    }
+
+    const currentStatus = po.costingStatus || 'Incomplete';
+    const nextStatus = String(req.body.status || '').trim();
+    if (!['Incomplete', 'Completed'].includes(nextStatus)) {
+      return res.status(400).json({ success: false, message: 'Costing status must be Incomplete or Completed.' });
+    }
+    if (nextStatus === currentStatus) return res.json({ success: true, data: poPayload(po) });
+
+    const reason = String(req.body.reason || '').trim();
+    if (nextStatus === 'Incomplete') {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ success: false, message: COSTING_LOCK_MESSAGE });
+      }
+      if (!reason) {
+        return res.status(400).json({ success: false, message: 'A short reason is required to re-open costing.' });
+      }
+    }
+
+    po.costingStatus = nextStatus;
+    po.costingHistory.push({
+      action: nextStatus === 'Completed' ? 'Completed' : 'Reopened',
+      previousStatus: currentStatus,
+      newStatus: nextStatus,
+      reason,
+      changedBy: req.user._id,
+      changedByName: req.user.fullName || ''
+    });
+    await po.save();
+    return res.json({ success: true, data: poPayload(po) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error updating costing status.' });
+  }
+};
+
 exports.canAccessPO = canAccessPO;
 exports.ensureCategoryAvailable = ensureCategoryAvailable;
+exports.COSTING_LOCK_MESSAGE = COSTING_LOCK_MESSAGE;
