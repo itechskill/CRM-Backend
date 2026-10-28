@@ -13,6 +13,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const SUPPORT_WORKFLOW_STATUSES = [
   'Finance Approved',
   'Local Supplier PO Issued',
+  'Goods Arrived / Awaiting Support Verification',
   'Shipment Received in Office',
   'Goods Received in Office',
   'Inventory & BL Verified',

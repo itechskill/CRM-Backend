@@ -158,6 +158,12 @@ const supplierPOSchema = new mongoose.Schema(
       type: String,
       default: ''
     },
+    goodsReceiptReference: { type: String, default: '', trim: true },
+    goodsReceiptDate: { type: Date, default: null },
+    goodsReceiptRecordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    goodsReceiptRecordedAt: { type: Date, default: null },
+    supportVerifiedGrn: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaserGRN', default: null },
+    supportVerifiedAt: { type: Date, default: null },
     expenses: { type: [purchaseExpenseSchema], default: [] }
   },
   { timestamps: true }

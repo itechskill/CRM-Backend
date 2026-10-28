@@ -227,7 +227,11 @@ exports.getSupplierPOs = async (req, res) => {
     }
     let poQuery = SupplierPO.find(filter);
     if (req.user.role === 'purchaser') poQuery = poQuery.select('-expenses');
-    const pos = await poQuery.populate('supplier').sort({ createdAt: -1 });
+    const pos = await poQuery
+      .populate('supplier')
+      .populate('supportVerifiedGrn', 'grnNumber createdAt')
+      .populate('goodsReceiptRecordedBy', 'fullName name')
+      .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: pos.length, data: pos, pos });
   } catch (error) {
     console.error('Get Supplier POs Error:', error);
@@ -243,6 +247,26 @@ exports.createSupplierPO = async (req, res) => {
     let linkedOrder = salesOrderId && mongoose.Types.ObjectId.isValid(salesOrderId)
       ? await SalesOrder.findById(salesOrderId)
       : null;
+    if (type === 'Local' && !linkedOrder) {
+      return res.status(400).json({
+        success: false,
+        message: 'A Local Supplier PO must be issued from Pending Sales Orders for a valid Sales Order.'
+      });
+    }
+    if (type === 'Local' && linkedOrder.inventoryCheckStatus !== 'Shortage') {
+      return res.status(409).json({
+        success: false,
+        message: 'Issue a Local Supplier PO only after Check Inventory confirms a shortage.'
+      });
+    }
+    if (type === 'Local' && [linkedOrder.currentDepartment, linkedOrder.departmentResponsible].some(value =>
+      ['Support', 'Logistics', 'Accounts', 'Completed'].includes(value)
+    )) {
+      return res.status(409).json({
+        success: false,
+        message: 'A Local Supplier PO can only be issued while the order is in the Local Purchase queue.'
+      });
+    }
     const issuingCompany = resolvePOCompany({
       poType: type,
       requestedCompanyCode: req.body.issuingCompanyCode,
@@ -393,16 +417,16 @@ exports.createSupplierPO = async (req, res) => {
             };
             linkedOrder.supplierPoNumber = poNumber;
             const previousWorkflowStatus = linkedOrder.workflowStatus || 'Pending Local Procurement';
-            linkedOrder.workflowStatus = 'Local Supplier PO Issued';
-            linkedOrder.status = 'Local Supplier PO Issued';
+            linkedOrder.workflowStatus = 'Local PO Issued / Awaiting Supplier Goods';
+            linkedOrder.status = 'Local PO Issued / Awaiting Supplier Goods';
             linkedOrder.previousDepartment = linkedOrder.currentDepartment || 'Local Purchaser';
             linkedOrder.previousStatus = previousWorkflowStatus;
-            linkedOrder.currentDepartment = 'Support';
-            linkedOrder.departmentResponsible = 'Support';
-            linkedOrder.currentStatus = 'AWAITING_GOODS_IN_SUPPORT';
+            linkedOrder.currentDepartment = 'Local Purchaser';
+            linkedOrder.departmentResponsible = 'Local Purchaser';
+            linkedOrder.currentStatus = 'AWAITING_SUPPLIER_GOODS';
             linkedOrder.goodsReceivedInOffice.received = false;
             linkedOrder.inventoryReceived = false;
-            linkedOrder.lastAction = `Supplier PO ${poNumber} created for ${finalSupplierName} - awaiting goods in Support`;
+            linkedOrder.lastAction = `Supplier PO ${poNumber} created for ${finalSupplierName} - awaiting supplier goods`;
             linkedOrder.lastActionBy = req.user._id;
             linkedOrder.lastActionByName = req.user.fullName;
             linkedOrder.lastActionAt = new Date();
@@ -412,9 +436,9 @@ exports.createSupplierPO = async (req, res) => {
               department: 'Local Purchaser',
               action: 'Local Supplier PO Issued',
               previousStatus: previousWorkflowStatus,
-              newStatus: 'Local Supplier PO Issued',
+              newStatus: 'Local PO Issued / Awaiting Supplier Goods',
               timestamp: new Date(),
-              notes: `Local Supplier PO ${poNumber} issued. Order routed to Support awaiting Receive Goods / Inventory IN.`
+              notes: `Local Supplier PO ${poNumber} issued. Order remains with Local Purchase awaiting supplier goods.`
             });
             await linkedOrder.save({ session });
           }
@@ -492,6 +516,128 @@ exports.createSupplierPO = async (req, res) => {
 };
 
 // ── DIRECT EDIT SUPPLIER PO (Category A - Purchaser Direct Edit) ───────────────
+exports.recordLocalSupplierGoodsReceipt = async (req, res) => {
+  const reference = String(req.body.goodsReceiptReference || '').trim();
+  const receiptDate = new Date(req.body.goodsReceiptDate);
+  if (!reference) return res.status(400).json({ success: false, message: 'GRN reference number is required.' });
+  if (!req.body.goodsReceiptDate || Number.isNaN(receiptDate.getTime())) {
+    return res.status(400).json({ success: false, message: 'A valid receipt date is required.' });
+  }
+
+  const session = await mongoose.startSession();
+  let recordedPO = null;
+  let wasExisting = false;
+  let linkedOrder = null;
+  try {
+    await session.withTransaction(async () => {
+      const po = await SupplierPO.findOne({ _id: req.params.id, poType: 'Local', status: { $ne: 'Cancelled' } }).session(session);
+      if (!po || !po.salesOrderId) {
+        const error = new Error('A valid order-linked Local Supplier PO is required.');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      if (po.goodsReceiptReference) {
+        const sameReference = po.goodsReceiptReference.toLowerCase() === reference.toLowerCase();
+        const sameDate = po.goodsReceiptDate && po.goodsReceiptDate.toISOString().slice(0, 10) === receiptDate.toISOString().slice(0, 10);
+        if (!sameReference || !sameDate) {
+          const error = new Error(`Goods receipt has already been recorded for Supplier PO ${po.poNumber}.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        recordedPO = po;
+        wasExisting = true;
+        return;
+      }
+
+      const now = new Date();
+      recordedPO = await SupplierPO.findOneAndUpdate(
+        {
+          _id: po._id,
+          poType: 'Local',
+          $or: [{ goodsReceiptReference: '' }, { goodsReceiptReference: null }, { goodsReceiptReference: { $exists: false } }]
+        },
+        { $set: {
+          goodsReceiptReference: reference,
+          goodsReceiptDate: receiptDate,
+          goodsReceiptRecordedBy: req.user._id,
+          goodsReceiptRecordedAt: now
+        } },
+        { new: true, session }
+      );
+      if (!recordedPO) {
+        const latest = await SupplierPO.findById(po._id).session(session);
+        const sameReference = latest?.goodsReceiptReference?.toLowerCase() === reference.toLowerCase();
+        const sameDate = latest?.goodsReceiptDate && latest.goodsReceiptDate.toISOString().slice(0, 10) === receiptDate.toISOString().slice(0, 10);
+        if (sameReference && sameDate) {
+          recordedPO = latest;
+          wasExisting = true;
+          return;
+        }
+        const error = new Error(`Goods receipt has already been recorded for Supplier PO ${po.poNumber}.`);
+        error.statusCode = 409;
+        throw error;
+      }
+
+      linkedOrder = await SalesOrder.findById(recordedPO.salesOrderId).session(session);
+      if (!linkedOrder) {
+        const error = new Error('The Sales Order linked to this Supplier PO was not found.');
+        error.statusCode = 404;
+        throw error;
+      }
+      const previousStatus = linkedOrder.workflowStatus || linkedOrder.status || 'Local PO Issued / Awaiting Supplier Goods';
+      linkedOrder.previousDepartment = linkedOrder.currentDepartment || 'Local Purchaser';
+      linkedOrder.previousStatus = previousStatus;
+      linkedOrder.currentDepartment = 'Support';
+      linkedOrder.departmentResponsible = 'Support';
+      linkedOrder.currentStatus = 'AWAITING_SUPPORT_VERIFICATION';
+      linkedOrder.workflowStatus = 'Goods Arrived / Awaiting Support Verification';
+      linkedOrder.status = 'Goods Arrived / Awaiting Support Verification';
+      linkedOrder.goodsReceivedInOffice.received = false;
+      linkedOrder.inventoryReceived = false;
+      linkedOrder.lastAction = `Supplier goods recorded under reference ${reference}; awaiting Support verification`;
+      linkedOrder.lastActionBy = req.user._id;
+      linkedOrder.lastActionByName = req.user.fullName;
+      linkedOrder.lastActionAt = now;
+      linkedOrder.workflowHistory.push({
+        user: req.user._id,
+        userName: req.user.fullName,
+        department: 'Local Purchaser',
+        action: 'Supplier Goods Receipt Recorded',
+        previousStatus,
+        newStatus: 'Goods Arrived / Awaiting Support Verification',
+        timestamp: now,
+        notes: `Supplier GRN reference ${reference} recorded for Local Supplier PO ${recordedPO.poNumber}. No inventory was changed.`
+      });
+      await linkedOrder.save({ session });
+    });
+
+    if (!wasExisting) {
+      await notifyRoleHelper(['support'], {
+        type: 'order',
+        title: 'Local Goods Arrived - Verification Required',
+        message: `Goods for ${recordedPO.salesOrderNumber || linkedOrder?.orderNumber || 'a Local order'} arrived under supplier GRN ${reference}. Verify them against Supplier PO ${recordedPO.poNumber} and record Inventory IN.`,
+        link: '/support/orders',
+        sender: req.user._id
+      });
+    }
+    await recordedPO.populate('supportVerifiedGrn', 'grnNumber createdAt');
+    return res.status(wasExisting ? 200 : 201).json({
+      success: true,
+      message: wasExisting ? 'This goods receipt was already recorded.' : 'Goods receipt recorded. The order was sent to Support for verification.',
+      data: recordedPO,
+      existing: wasExisting
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.statusCode ? error.message : 'Server error recording supplier goods receipt.'
+    });
+  } finally {
+    await session.endSession();
+  }
+};
+
 exports.updateSupplierPO = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1218,7 +1364,7 @@ exports.getPendingPurchaserOrders = async (req, res) => {
     const deptRole = subDept === 'Global' ? 'Global Purchaser' : 'Local Purchaser';
     const statusQuery = subDept === 'Global'
       ? ['Pending Global Procurement']
-      : ['Pending Local Procurement', 'Local Supplier PO Issued'];
+      : ['Pending Local Procurement', 'Local PO Issued / Awaiting Supplier Goods'];
     const approvedFileFallback = subDept === 'Global'
       ? {
           fileType: 'Blue',
@@ -1229,7 +1375,8 @@ exports.getPendingPurchaserOrders = async (req, res) => {
       : {
           fileType: 'Green',
           financeApprovedBy: { $ne: null },
-          workflowStatus: { $nin: ['Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'] }
+          currentDepartment: { $nin: ['Support', 'Accounts', 'Completed'] },
+          workflowStatus: { $nin: ['Goods Arrived / Awaiting Support Verification', 'Pending Delivery Note', 'Draft Invoice Created', 'Invoice Finalized', 'Completed'] }
         };
 
     const orders = await SalesOrder.find({
@@ -1262,6 +1409,16 @@ exports.performInventoryCheck = async (req, res) => {
     }
 
     const moveToSupport = Boolean(req.body?.moveToSupport || req.body?.isFullyInStock);
+    if (moveToSupport) {
+      const activeLocalPO = await SupplierPO.exists({ salesOrderId: order._id, poType: 'Local', status: { $ne: 'Cancelled' } }).session(session);
+      if (activeLocalPO) {
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: 'This order already has a Local Supplier PO. Record supplier goods arrival from GRN (Goods Received) instead of using the stock route.'
+        });
+      }
+    }
     if (moveToSupport && activeReservations(order).length) {
       await session.commitTransaction();
       return res.status(200).json({

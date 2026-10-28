@@ -11,7 +11,7 @@ const {
   updateSupplierPO,
   deleteSupplierPO,
   getPurchaserGRNs,
-  createPurchaserGRN,
+  recordLocalSupplierGoodsReceipt,
   getLocalPayables,
   createLocalPayable,
   recordLocalPayablePayment,
@@ -21,7 +21,6 @@ const {
   getPendingPurchaserOrders,
   performInventoryCheck,
   linkOrderLineToInventory,
-  completeProcurementAndSendToSupport,
   globalProcurementSendToLogistics,
   updateGlobalProcurementCheckpoint,
   sendGlobalOrderToLogistics,
@@ -67,6 +66,7 @@ const requirePurchaserSubDept = (requiredSubDept) => (req, res, next) => {
 };
 
 const localPurchaserAccess = [purchaserAccess, requirePurchaserSubDept('Local')];
+const localGoodsReceiptWriteAccess = [authorize('purchaser', 'admin'), requirePurchaserSubDept('Local')];
 const globalPurchaserAccess = [purchaserAccess, requirePurchaserSubDept('Global')];
 const localPayablesReadAccess = [
   authorize('purchaser', 'finance', 'accountant', 'admin', 'ceo'),
@@ -240,7 +240,6 @@ const requireSupplierPOOwnership = async (req, res, next) => {
 router.get('/pending-orders', purchaserAccess, scopePurchaserQuery(['subDept', 'type']), getPendingPurchaserOrders);
 router.post('/orders/:id/inventory-check', localPurchaserAccess, performInventoryCheck);
 router.post('/orders/:id/inventory-link', localPurchaserAccess, linkOrderLineToInventory);
-router.post('/orders/:id/complete-procurement', localPurchaserAccess, completeProcurementAndSendToSupport);
 router.post('/orders/:id/global-po', globalPurchaserAccess, globalProcurementSendToLogistics);
 router.post('/orders/:id/global-checkpoint', globalPurchaserAccess, updateGlobalProcurementCheckpoint);
 router.post('/orders/:id/send-to-logistics', globalPurchaserAccess, sendGlobalOrderToLogistics);
@@ -258,6 +257,7 @@ router.post('/suppliers', purchaserAccess, scopePurchaserBody(['supplierType', '
 // Supplier POs
 router.get('/pos', supplierPOListAccess, scopePurchaserList('po', ['poType', 'subType', 'type']), getSupplierPOs);
 router.post('/pos', purchaserAccess, scopePurchaserBody(['poType', 'subType', 'type'], 'poType'), createSupplierPO);
+router.post('/pos/:id/goods-received', localGoodsReceiptWriteAccess, recordLocalSupplierGoodsReceipt);
 router.get('/expense-categories', expenseReadAccess, listExpenseCategories);
 router.post('/expense-categories', expenseAddAccess, createExpenseCategory);
 router.patch('/expense-categories/:key', authorize('admin'), updateExpenseCategory);
@@ -271,7 +271,6 @@ router.delete('/pos/:id', purchaserAccess, requireSupplierPOOwnership, deleteSup
 
 // GRNs
 router.get('/grns', localPurchaserAccess, getPurchaserGRNs);
-router.post('/grns', localPurchaserAccess, createPurchaserGRN);
 
 // Local Payables
 router.get('/payables', localPayablesReadAccess, getLocalPayables);

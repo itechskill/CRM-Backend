@@ -90,7 +90,8 @@ const salesAndSupportGuard = [protect, authorize('employee', 'sales_member', 'sa
 const salesAccountsGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'accountant', 'admin', 'ceo')];
 const paymentGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'accountant', 'finance', 'admin', 'ceo')];
 const accountsGuard = [protect, authorize('accountant', 'admin', 'ceo')];
-const supportInventoryGuard = [protect, authorize('support', 'admin', 'ceo')];
+const supportInventoryReadGuard = [protect, authorize('support', 'admin', 'ceo')];
+const supportInventoryWriteGuard = [protect, authorize('support', 'admin')];
 const financeReviewGuard = [protect, authorize('finance', 'admin', 'ceo')];
 
 // Dashboard stats
@@ -138,22 +139,22 @@ router.delete('/quotations/:id', salesGuard, deleteMyQuotation);
 router.get('/orders', departmentReadGuard, getMyOrders);
 router.get('/orders/available-for-delivery', salesAndSupportGuard, getAvailableOrdersForDelivery);
 router.get('/orders/:id/stock-check', salesAndSupportGuard, checkOrderStock);
-router.get('/orders/:id/receiving-preview', supportInventoryGuard, getGoodsReceivingPreview);
+router.get('/orders/:id/receiving-preview', supportInventoryReadGuard, getGoodsReceivingPreview);
 router.post('/orders', salesGuard, createMyOrder);
 router.post('/orders/:id/send-to-support', salesGuard, sendOrderToSupport);
 router.post('/orders/:id/send-to-finance', salesGuard, sendSalesOrderToFinance);
 router.post('/orders/:id/finance-review', financeReviewGuard, financeReviewSalesOrder);
-router.post('/orders/:id/goods-received', supportInventoryGuard, recordGoodsReceivedInOffice);
-router.post('/orders/:id/bl-input', supportInventoryGuard, recordBLInput);
+router.post('/orders/:id/goods-received', supportInventoryWriteGuard, recordGoodsReceivedInOffice);
+router.post('/orders/:id/bl-input', supportInventoryWriteGuard, recordBLInput);
 router.post('/orders/:id/issue-supplier-po', salesGuard, issueSupplierPO);
 router.patch('/orders/:id', salesGuard, updateMyOrder);
 router.delete('/orders/:id', salesGuard, deleteMyOrder);
 
 // Support & Inventory Department Routes
-router.get('/support/stats', supportInventoryGuard, getSupportStats);
+router.get('/support/stats', supportInventoryReadGuard, getSupportStats);
 router.get('/inventory', departmentReadGuard, getInventoryItems);
-router.post('/inventory', supportInventoryGuard, createOrUpdateInventoryItem);
-router.post('/inventory/:id/in', supportInventoryGuard, addInventoryStock);
+router.post('/inventory', supportInventoryWriteGuard, createOrUpdateInventoryItem);
+router.post('/inventory/:id/in', supportInventoryWriteGuard, addInventoryStock);
 
 // Proforma Invoices
 router.get('/proforma-invoices', salesGuard, getMyProformaInvoices);
@@ -164,9 +165,9 @@ router.delete('/proforma-invoices/:id', salesGuard, deleteMyProformaInvoice);
 // Delivery Notes & Accounts Handoff
 router.get('/delivery-notes', departmentReadGuard, getMyDeliveryNotes);
 router.post('/delivery-notes', salesAndSupportGuard, createMyDeliveryNote);
-router.get('/delivery-notes/:id/stock-check', supportInventoryGuard, checkDeliveryNoteStock);
-router.post('/delivery-notes/:id/confirm', supportInventoryGuard, confirmDeliveryNoteWithInventory);
-router.patch('/delivery-notes/:id/expiry', supportInventoryGuard, updateDeliveryNoteExpiry);
+router.get('/delivery-notes/:id/stock-check', supportInventoryReadGuard, checkDeliveryNoteStock);
+router.post('/delivery-notes/:id/confirm', supportInventoryWriteGuard, confirmDeliveryNoteWithInventory);
+router.patch('/delivery-notes/:id/expiry', supportInventoryWriteGuard, updateDeliveryNoteExpiry);
 router.patch('/delivery-notes/:id', salesAndSupportGuard, updateMyDeliveryNote);
 router.delete('/delivery-notes/:id', salesAndSupportGuard, deleteMyDeliveryNote);
 
