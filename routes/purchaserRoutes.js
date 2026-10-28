@@ -9,6 +9,7 @@ const {
   getSupplierPOs,
   createSupplierPO,
   updateSupplierPO,
+  correctSupplierPOExchangeRate,
   deleteSupplierPO,
   getPurchaserGRNs,
   recordLocalSupplierGoodsReceipt,
@@ -269,6 +270,7 @@ router.patch('/pos/:id/expenses/:expenseId', expenseEditAccess, updateSupplierPO
 router.delete('/pos/:id/expenses/:expenseId', expenseEditAccess, removeSupplierPOExpense);
 router.patch('/pos/:id', purchaserAccess, requireSupplierPOOwnership, updateSupplierPO);
 router.put('/pos/:id', purchaserAccess, requireSupplierPOOwnership, updateSupplierPO);
+router.patch('/pos/:id/exchange-rate', authorize('admin'), correctSupplierPOExchangeRate);
 router.delete('/pos/:id', purchaserAccess, requireSupplierPOOwnership, deleteSupplierPO);
 
 // GRNs

@@ -51,6 +51,7 @@ const {
 } = require('../utils/inventoryReservations');
 const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
+const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -1927,7 +1928,6 @@ const getMyQuotations = async (req, res) => {
 const createMyQuotation = async (req, res) => {
   try {
     const {
-      quotationCode,
       clientName,
       productSummary,
       clientEmail,
@@ -1967,7 +1967,6 @@ const createMyQuotation = async (req, res) => {
     });
 
     const quotation = await Quotation.create({
-      quotationCode,
       clientName: clientName.trim(),
       salePerson: req.user.fullName || '',
       fileNo: assignedFileNumber,
@@ -5649,6 +5648,7 @@ const issueSupplierPO = async (req, res) => {
       requestedCompanyCode: req.body.issuingCompanyCode,
       order
     });
+    const exchangeRate = await getEffectiveExchangeRate(req.body.currency || 'PKR');
     const poNum = isBlue
       ? await allocateGlobalPoNumber()
       : (req.body.poNumber || `LPO-${Date.now().toString().slice(-6)}`);
@@ -5688,6 +5688,8 @@ const issueSupplierPO = async (req, res) => {
       vatAmount,
       totalAmount: poTotal,
       total: poTotal,
+      currency: exchangeRate.currency,
+      exchangeRateToPKR: exchangeRate.rateToPKR,
       salesOrderId: order._id,
       salesOrderNumber: order.orderNumber || order.orderReference || '',
       status: 'Issued',
@@ -5718,7 +5720,8 @@ const issueSupplierPO = async (req, res) => {
       vatAmount,
       total: poTotal,
       totalAmount: poTotal,
-      currency: 'PKR',
+      currency: exchangeRate.currency,
+      exchangeRateToPKR: exchangeRate.rateToPKR,
       notes: notes || '',
       issuingCompany,
       issuedBy: req.user._id,
