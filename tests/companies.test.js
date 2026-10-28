@@ -63,7 +63,7 @@ test('shared company validation enforces allowed document types', () => {
     'FORTLINE_ENTERPRISES', 'FORTLINE_PRIVATE_LIMITED', 'HIGH_CLOUD_TRADING_LLC', 'WWTS'
   ].sort());
   assert.deepEqual(codesFor(DOCUMENT_TYPES.LOCAL_PO), [
-    'FORTLINE_ENTERPRISES', 'FORTLINE_PRIVATE_LIMITED', 'WWTS'
+    'FORTLINE_ENTERPRISES', 'FORTLINE_PRIVATE_LIMITED', 'HIGH_CLOUD_TRADING_LLC', 'WWTS'
   ].sort());
   assert.deepEqual(codesFor(DOCUMENT_TYPES.GLOBAL_PO), [
     'FORTLINE_ENTERPRISES', 'FORTLINE_PRIVATE_LIMITED', 'HIGH_CLOUD_TRADING_LLC', 'WWTS'
@@ -88,9 +88,9 @@ test('shared company validation enforces allowed document types', () => {
     resolvePOCompany({ poType: 'Local', requestedCompanyCode: 'WWTS' }).code,
     'WWTS'
   );
-  assert.throws(
-    () => resolvePOCompany({ poType: 'Local', requestedCompanyCode: 'HIGH_CLOUD_TRADING_LLC' }),
-    /not allowed/
+  assert.equal(
+    resolvePOCompany({ poType: 'Local', requestedCompanyCode: 'HIGH_CLOUD_TRADING_LLC' }).code,
+    'HIGH_CLOUD_TRADING_LLC'
   );
   assert.throws(
     () => resolvePOCompany({ poType: 'Local' }),
@@ -125,21 +125,29 @@ test('quotation snapshot is inherited by its sales order and valid PO type', asy
   );
 });
 
-test('an inherited company that is invalid for Local PO requires an explicit replacement', () => {
-  const globalOnlyOrder = {
+test('every issuing company is valid for inherited Local and Global Supplier POs', () => {
+  const highCloudOrder = {
     issuingCompany: getCompanySnapshot('HIGH_CLOUD_TRADING_LLC', DOCUMENT_TYPES.QUOTATION)
   };
 
-  assert.throws(
-    () => resolvePOCompany({ poType: 'Local', order: globalOnlyOrder }),
-    /Select an allowed issuing company/
+  assert.equal(
+    resolvePOCompany({ poType: 'Local', order: highCloudOrder }).code,
+    'HIGH_CLOUD_TRADING_LLC'
   );
   assert.equal(
-    resolvePOCompany({
-      poType: 'Local',
-      order: globalOnlyOrder,
-      requestedCompanyCode: 'WWTS'
-    }).code,
-    'WWTS'
+    resolvePOCompany({ poType: 'Global', order: highCloudOrder }).code,
+    'HIGH_CLOUD_TRADING_LLC'
   );
+});
+
+test('all four companies are selectable for quotations, Local POs and Global POs', () => {
+  const expected = COMPANIES.map(company => company.code).sort();
+  for (const type of Object.values(DOCUMENT_TYPES)) {
+    const actual = COMPANIES
+      .filter(company => company.allowedDocumentTypes.includes(type))
+      .map(company => company.code)
+      .sort();
+    assert.deepEqual(actual, expected, `${type} must offer all four issuing companies`);
+    for (const code of expected) assert.equal(getCompanySnapshot(code, type).code, code);
+  }
 });

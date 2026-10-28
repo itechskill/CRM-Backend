@@ -27,7 +27,7 @@ const COMPANIES = Object.freeze([
     address: '',
     taxId: '',
     phone: '',
-    allowedDocumentTypes: Object.freeze([DOCUMENT_TYPES.QUOTATION, DOCUMENT_TYPES.GLOBAL_PO])
+    allowedDocumentTypes: Object.freeze([DOCUMENT_TYPES.QUOTATION, DOCUMENT_TYPES.LOCAL_PO, DOCUMENT_TYPES.GLOBAL_PO])
   }),
   Object.freeze({
     code: 'WWTS',
