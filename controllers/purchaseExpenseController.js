@@ -10,7 +10,7 @@ const {
   valuesForHistory
 } = require('../utils/purchaseExpenses');
 
-const ADD_ROLES = new Set(['support', 'finance', 'admin', 'purchaser']);
+const ADD_ROLES = new Set(['support', 'finance', 'admin']);
 const EDIT_ROLES = new Set(['finance', 'admin']);
 const READ_ROLES = new Set([...ADD_ROLES, 'ceo']);
 

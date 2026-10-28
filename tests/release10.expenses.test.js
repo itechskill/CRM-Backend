@@ -154,13 +154,15 @@ test('Finance can add/edit/soft-delete expenses, history is retained, and Admin 
   assert.equal(await Notification.countDocuments({ recipient: admin._id, 'data.supplierPOId': localPO._id, link: '/admin/supplier-po-expenses' }), 3);
 });
 
-test('role matrix allows Support and matching purchasers to add, but only Finance and Admin may edit or delete', async () => {
+test('role matrix keeps Support receipt entry, blocks purchasers, and limits editing to Finance and Admin', async () => {
   assert.equal(canAccessPO(support, localPO, 'add'), true);
   assert.equal(canAccessPO(support, localPO, 'edit'), false);
-  assert.equal(canAccessPO(localPurchaser, localPO, 'add'), true);
+  assert.equal(canAccessPO(localPurchaser, localPO, 'read'), false);
+  assert.equal(canAccessPO(localPurchaser, localPO, 'add'), false);
   assert.equal(canAccessPO(localPurchaser, localPO, 'edit'), false);
+  assert.equal(canAccessPO(globalPurchaser, globalPO, 'read'), false);
   assert.equal(canAccessPO(globalPurchaser, localPO, 'add'), false);
-  assert.equal(canAccessPO(globalPurchaser, globalPO, 'add'), true);
+  assert.equal(canAccessPO(globalPurchaser, globalPO, 'add'), false);
   assert.equal(canAccessPO(globalPurchaser, globalPO, 'edit'), false);
   assert.equal(canAccessPO(finance, localPO, 'edit'), true);
   assert.equal(canAccessPO(admin, localPO, 'edit'), true);
@@ -174,19 +176,28 @@ test('role matrix allows Support and matching purchasers to add, but only Financ
   assert.equal((await request(support, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'PATCH', { amount: 51 })).status, 403);
   assert.equal((await request(support, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'DELETE')).status, 403);
 
-  const localAdd = await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'GST', amount: 20 });
-  assert.equal(localAdd.status, 201, JSON.stringify(localAdd.body));
-  const localExpense = localAdd.body.data.expenses.find(item => item.addedBy === String(localPurchaser._id) && !item.isDeleted);
-  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses/${localExpense._id}`, 'PATCH', { amount: 21 })).status, 403);
-  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses/${localExpense._id}`, 'DELETE')).status, 403);
+  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses`)).status, 403);
+  assert.equal((await request(localPurchaser, '/api/purchaser/expense-categories')).status, 403);
+  assert.equal((await request(localPurchaser, '/api/purchaser/expense-categories', 'POST', { name: 'Purchaser-only fee' })).status, 403);
+  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'GST', amount: 20 })).status, 403);
+  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'PATCH', { amount: 21 })).status, 403);
+  assert.equal((await request(localPurchaser, `/api/purchaser/pos/${localPO._id}/expenses/${supportExpense._id}`, 'DELETE')).status, 403);
 
+  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses`)).status, 403);
+  assert.equal((await request(globalPurchaser, '/api/purchaser/expense-categories')).status, 403);
+  assert.equal((await request(globalPurchaser, '/api/purchaser/expense-categories', 'POST', { name: 'Global-only fee' })).status, 403);
   assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Other', amount: 1 })).status, 403);
-  const globalAdd = await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses`, 'POST', { category: 'Freight', amount: 10, currency: 'USD', exchangeRateToPKR: 280 });
-  assert.equal(globalAdd.status, 201, JSON.stringify(globalAdd.body));
-  const globalExpense = globalAdd.body.data.expenses.find(item => !item.isDeleted);
-  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses/${globalExpense._id}`, 'PATCH', { amount: 11 })).status, 403);
-  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses/${globalExpense._id}`, 'DELETE')).status, 403);
+  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses`, 'POST', { category: 'Freight', amount: 10, currency: 'USD', exchangeRateToPKR: 280 })).status, 403);
+  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses/${supportExpense._id}`, 'PATCH', { amount: 11 })).status, 403);
+  assert.equal((await request(globalPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses/${supportExpense._id}`, 'DELETE')).status, 403);
   assert.equal((await request(localPurchaser, `/api/purchaser/pos/${globalPO._id}/expenses`, 'POST', { category: 'Other', amount: 1 })).status, 403);
+
+  const purchaserPOList = await request(localPurchaser, '/api/purchaser/pos');
+  assert.equal(purchaserPOList.status, 200, JSON.stringify(purchaserPOList.body));
+  assert.ok(purchaserPOList.body.data.every(po => po.expenses === undefined));
+  const purchaserPOUpdate = await request(localPurchaser, `/api/purchaser/pos/${localPO._id}`, 'PATCH', { notes: 'Purchaser-visible note' });
+  assert.equal(purchaserPOUpdate.status, 200, JSON.stringify(purchaserPOUpdate.body));
+  assert.equal(purchaserPOUpdate.body.data.expenses, undefined);
 
   const adminAdd = await request(admin, `/api/purchaser/pos/${localPO._id}/expenses`, 'POST', { category: 'Miscellaneous', amount: 5 });
   assert.equal(adminAdd.status, 201, JSON.stringify(adminAdd.body));
@@ -229,6 +240,11 @@ test('Support Inventory IN records the expense on the canonical PO and links it 
   assert.equal(String(receiptExpense.grn), String(grn._id));
   assert.equal(receiptExpense.grnNumber, grn.grnNumber);
   assert.equal(receiptExpense.amountPKRCents, 2500);
+  const purchaserGRNs = await request(localPurchaser, '/api/purchaser/grns');
+  assert.equal(purchaserGRNs.status, 200, JSON.stringify(purchaserGRNs.body));
+  const purchaserGRN = purchaserGRNs.body.data.find(item => item._id === String(grn._id));
+  assert.ok(purchaserGRN);
+  assert.equal(purchaserGRN.supplierPO.expenses, undefined);
   assert.ok(await SalesActivity.findOne({ type: 'Inventory IN', performedBy: support._id, relatedId: order._id }));
 });
 
@@ -275,9 +291,9 @@ test('custom categories are case-insensitively de-duplicated and Admin can renam
 test('totalCostPKR accepts SupplierPO or SalesOrder shape, excludes soft-deleted lines, and old POs remain empty', async () => {
   const po = await SupplierPO.findById(localPO._id);
   const summary = summarizeExpenses(po);
-  assert.equal(summary.totalExpensesPKRCents, 9500);
-  assert.equal(await totalCostPKR(po), 1275);
-  assert.equal(await totalCostPKR({ _id: new mongoose.Types.ObjectId(), supplierPoId: po._id }), 1275);
+  assert.equal(summary.totalExpensesPKRCents, 7500);
+  assert.equal(await totalCostPKR(po), 1255);
+  assert.equal(await totalCostPKR({ _id: new mongoose.Types.ObjectId(), supplierPoId: po._id }), 1255);
   const oldPO = await SupplierPO.create({
     poNumber: `LPO-OLD-${runId}`, supplierName: 'Old supplier', poType: 'Local',
     items: [{ productName: 'Old', quantity: 1, unitPrice: 500, totalAmount: 500 }], totalAmount: 500,
