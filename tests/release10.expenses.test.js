@@ -37,6 +37,7 @@ const InventoryItem = require('../models/InventoryItem');
 const PurchaserGRN = require('../models/PurchaserGRN');
 const Counter = require('../models/Counter');
 const SalesActivity = require('../models/SalesActivity');
+const ExchangeRate = require('../models/ExchangeRate');
 const { getCounterKey } = require('../utils/counterKey');
 const { buildExpenseValues, summarizeExpenses, totalCostPKR } = require('../utils/purchaseExpenses');
 const { canAccessPO } = require('../controllers/purchaseExpenseController');
@@ -80,6 +81,10 @@ before(async () => {
     { fullName: 'R10 Sales', email: `r10.sales.${runId}@example.com`, password, role: 'sales_person', status: 'active', isApproved: true },
     { fullName: 'R10 Other Sales', email: `r10.other.sales.${runId}@example.com`, password, role: 'sales_person', status: 'active', isApproved: true }
   ]);
+  await ExchangeRate.create({
+    currency: 'USD', rateToPKR: 280, lastChangedBy: admin._id,
+    lastChangedByName: admin.fullName, lastChangedAt: new Date()
+  });
   const supplier = await Supplier.create({ name: 'R10 Supplier', supplierType: 'Local', country: 'Pakistan', createdBy: localPurchaser._id });
   const globalSupplier = await Supplier.create({ name: 'R10 Global Supplier', supplierType: 'Global', country: 'United States', createdBy: globalPurchaser._id });
   localPO = await SupplierPO.create({

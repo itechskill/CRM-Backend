@@ -14,6 +14,7 @@ const QuotationSchema = new mongoose.Schema(
     quotationSerial: { type: Number, min: 1, default: undefined },
     quotationSerialCreator: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: undefined },
     quotationCode: { type: String, trim: true, uppercase: true, default: '' },
+    quotationNumberFormat: { type: String, enum: ['global-v1'], default: undefined },
     clientName: { type: String, required: [true, 'Client name is required'], trim: true },
     clientEmail: { type: String, trim: true, lowercase: true, default: '' },
     clientPhone: { type: String, trim: true, default: '' },
@@ -84,18 +85,22 @@ QuotationSchema.index(
     }
   }
 );
+QuotationSchema.index(
+  { quotationSerial: 1 },
+  {
+    unique: true,
+    name: 'unique_global_quotation_serial_v1',
+    partialFilterExpression: { quotationNumberFormat: 'global-v1' }
+  }
+);
 
 QuotationSchema.pre('save', async function (next) {
   if (this.isNew && this.createdBy) {
-    const allocated = await allocateQuotationNumber({
-      creatorId: this.createdBy,
-      code: this.quotationCode,
-      fullName: this.salePerson,
-      session: this.$session()
-    });
+    const allocated = await allocateQuotationNumber({ session: this.$session() });
     this.quotationSerial = allocated.serial;
-    this.quotationSerialCreator = this.createdBy;
-    this.quotationCode = allocated.code;
+    this.quotationSerialCreator = undefined;
+    this.quotationCode = '';
+    this.quotationNumberFormat = 'global-v1';
     this.orderReference = allocated.reference;
     this.quotationNumber = allocated.reference;
   } else if (!this.quotationNumber && this.orderReference) {

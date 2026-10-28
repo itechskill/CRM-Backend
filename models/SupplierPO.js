@@ -35,6 +35,16 @@ const costingHistorySchema = new mongoose.Schema({
   changedAt: { type: Date, default: Date.now }
 }, { _id: false });
 
+const exchangeRateHistorySchema = new mongoose.Schema({
+  changedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  changedByName: { type: String, default: '' },
+  changedAt: { type: Date, default: Date.now },
+  currency: { type: String, required: true, trim: true, uppercase: true },
+  oldRate: { type: Number, default: null },
+  newRate: { type: Number, required: true, min: 0.000001 },
+  note: { type: String, default: '', trim: true, maxlength: 500 }
+}, { _id: false });
+
 const purchaseExpenseSchema = new mongoose.Schema({
   grn: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaserGRN', default: null },
   grnNumber: { type: String, default: '', trim: true },
@@ -149,6 +159,7 @@ const supplierPOSchema = new mongoose.Schema(
       default: null,
       min: 0.000001
     },
+    exchangeRateHistory: { type: [exchangeRateHistorySchema], default: [] },
     status: {
       type: String,
       enum: ['Draft', 'Issued', 'In Transit', 'In Logistics', 'Shipped', 'Partially Received', 'Fully Received', 'Completed', 'Cancelled', 'Payment Blocked – Customer Advance Required', 'Payment Blocked – Awaiting Customer Advance', 'Payment Eligible'],

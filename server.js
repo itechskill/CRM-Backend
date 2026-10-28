@@ -25,6 +25,7 @@ const editPermissionRoutes = require('./routes/editPermissionRoutes');
 const priceRequestRoutes = require('./routes/priceRequestRoutes');
 const targetPerformanceRoutes = require('./routes/targetPerformanceRoutes');
 const supportTicketRoutes = require('./routes/supportTicketRoutes');
+const exchangeRateRoutes = require('./routes/exchangeRateRoutes');
 
 // Load environment variables
 dotenv.config();
@@ -112,6 +113,7 @@ app.use('/api/edit-permissions', editPermissionRoutes);
 app.use('/api/price-requests', priceRequestRoutes);
 app.use('/api/target-performance', targetPerformanceRoutes);
 app.use('/api/support-tickets', supportTicketRoutes);
+app.use('/api/exchange-rates', exchangeRateRoutes);
 
 // Root Fallback Route
 app.get('/', (req, res) => {

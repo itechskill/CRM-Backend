@@ -108,55 +108,56 @@ after(async () => {
   await mongoose.disconnect();
 });
 
-test('quotation sequences are independent per salesperson and caller references are ignored', async () => {
+test('quotation sequence is global across salespeople, uses six digits, and ignores caller references and codes', async () => {
   const firstA = await createQuotation(salespersonA, { quotationCode: 'k.r!' });
   const firstB = await createQuotation(salespersonB, { quotationCode: 'k.r!' });
 
-  assert.equal(firstA.orderReference, 'QO-0001-KR');
-  assert.equal(firstB.orderReference, 'QO-0001-KR');
+  assert.equal(firstA.orderReference, 'QO-000001');
+  assert.equal(firstB.orderReference, 'QO-000002');
   assert.equal(firstA.quotationSerial, 1);
-  assert.equal(firstB.quotationSerial, 1);
-  assert.equal(String(firstA.quotationSerialCreator), String(salespersonA._id));
-  assert.equal(String(firstB.quotationSerialCreator), String(salespersonB._id));
+  assert.equal(firstB.quotationSerial, 2);
+  assert.equal(firstA.quotationSerialCreator, undefined);
+  assert.equal(firstB.quotationSerialCreator, undefined);
+  assert.equal(firstA.quotationCode, '');
+  assert.equal(firstA.quotationNumberFormat, 'global-v1');
   assert.equal(firstA.fileNo, '4001');
   assert.equal(firstA.taxPercentage, 18);
   assert.equal(firstA.tax, 36);
   assert.equal(firstA.netAmount, 236);
 });
 
-test('concurrent quotation creation allocates unique serials for one salesperson', async () => {
+test('concurrent quotation creation across salespeople allocates globally unique serials', async () => {
   const created = await Promise.all(Array.from({ length: 16 }, (_, index) => (
-    createQuotation(salespersonA, { quotationCode: `A-${index}` })
+    createQuotation(index % 2 ? salespersonA : salespersonB, { quotationCode: `A-${index}` })
   )));
   const serials = created.map(quotation => quotation.quotationSerial);
+  const references = created.map(quotation => quotation.orderReference);
   assert.equal(new Set(serials).size, serials.length);
-  assert.deepEqual([...serials].sort((a, b) => a - b), Array.from({ length: 16 }, (_, index) => index + 2));
+  assert.equal(new Set(references).size, references.length);
+  assert.deepEqual([...serials].sort((a, b) => a - b), Array.from({ length: 16 }, (_, index) => index + 3));
+  references.forEach(reference => assert.match(reference, /^QO-\d{6,}$/));
 });
 
-test('partial unique index applies only when creator and serial exist', async () => {
+test('global partial unique index applies only to the new number format', async () => {
   const indexes = Quotation.schema.indexes();
-  const serialIndex = indexes.find(([, options]) => options.name === 'unique_quotation_serial_per_creator');
+  const serialIndex = indexes.find(([, options]) => options.name === 'unique_global_quotation_serial_v1');
   assert.ok(serialIndex);
   assert.equal(serialIndex[1].unique, true);
-  assert.deepEqual(serialIndex[1].partialFilterExpression, {
-    quotationSerialCreator: { $type: 'objectId' },
-    quotationSerial: { $type: 'number' }
-  });
+  assert.deepEqual(serialIndex[1].partialFilterExpression, { quotationNumberFormat: 'global-v1' });
 
   await Quotation.collection.insertMany([
-    { orderReference: 'S01724', quotationNumber: 'S01724', clientName: 'Legacy one' },
-    { orderReference: '1022', quotationNumber: '1022', clientName: 'Legacy two' }
+    { orderReference: 'S01724', quotationNumber: 'S01724', clientName: 'Legacy one', owner: salespersonA._id, createdBy: salespersonA._id },
+    { orderReference: '1022', quotationNumber: '1022', clientName: 'Legacy two', owner: salespersonA._id, createdBy: salespersonA._id }
   ]);
 
-  const creator = new mongoose.Types.ObjectId();
   await Quotation.collection.insertOne({
-    orderReference: 'QO-9999-X', quotationNumber: 'QO-9999-X', clientName: 'Indexed one',
-    quotationSerialCreator: creator, quotationSerial: 9999
+    orderReference: 'QO-999999', quotationNumber: 'QO-999999', clientName: 'Indexed one',
+    quotationSerial: 999999, quotationNumberFormat: 'global-v1'
   });
   await assert.rejects(
     Quotation.collection.insertOne({
-      orderReference: 'QO-9999-Y', quotationNumber: 'QO-9999-Y', clientName: 'Indexed duplicate',
-      quotationSerialCreator: creator, quotationSerial: 9999
+      orderReference: 'QO-999999', quotationNumber: 'QO-999999', clientName: 'Indexed duplicate',
+      quotationSerial: 999999, quotationNumberFormat: 'global-v1'
     }),
     error => error?.code === 11000
   );
@@ -175,4 +176,13 @@ test('saving a legacy quotation leaves its old reference and serial fields uncha
   assert.equal(saved.quotationNumber, 'S01724');
   assert.equal(saved.quotationSerial, undefined);
   assert.equal(saved.quotationSerialCreator, undefined);
+  assert.equal(saved.quotationNumberFormat, undefined);
+
+  const response = await fetch(`${baseUrl}/api/sales-employee/quotations?status=all&search=S01724`, {
+    headers: { Authorization: `Bearer ${tokenFor(salespersonA)}` }
+  });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.data.length, 1);
+  assert.equal(body.data[0].quotationNumber, 'S01724');
 });

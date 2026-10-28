@@ -18,6 +18,7 @@ const { getInventoryMatches } = require('../utils/inventoryMatching');
 const { activeReservations, inventoryStatusStage } = require('../utils/inventoryReservations');
 const { getPurchaserDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
+const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -276,6 +277,7 @@ exports.createSupplierPO = async (req, res) => {
       requestedCompanyCode: req.body.issuingCompanyCode,
       order: linkedOrder
     });
+    const exchangeRate = await getEffectiveExchangeRate(req.body.currency || 'PKR');
     const poNumber = type === 'Local'
       ? `LPO-${Date.now().toString().slice(-6)}`
       : await allocateGlobalPoNumber();
@@ -367,7 +369,8 @@ exports.createSupplierPO = async (req, res) => {
       vatAmount,
       total: totalAmount,
       totalAmount,
-      currency: 'PKR',
+      currency: exchangeRate.currency,
+      exchangeRateToPKR: exchangeRate.rateToPKR,
       status: initialStatus,
       notes: notes || remarks || '',
       issuingCompany,
@@ -412,7 +415,8 @@ exports.createSupplierPO = async (req, res) => {
               gstAmount,
               total: totalAmount,
               totalAmount,
-              currency: 'PKR',
+              currency: exchangeRate.currency,
+              exchangeRateToPKR: exchangeRate.rateToPKR,
               notes: notes || remarks || '',
               issuingCompany,
               issuedBy: req.user._id,
@@ -472,7 +476,8 @@ exports.createSupplierPO = async (req, res) => {
         vatAmount,
         total: totalAmount,
         totalAmount,
-        currency: 'PKR',
+        currency: exchangeRate.currency,
+        exchangeRateToPKR: exchangeRate.rateToPKR,
         notes: notes || remarks || '',
         issuingCompany,
         issuedBy: req.user._id,
@@ -783,6 +788,44 @@ exports.updateSupplierPO = async (req, res) => {
   } catch (error) {
     console.error('Update Supplier PO Error:', error);
     return res.status(500).json({ success: false, message: 'Server error updating purchase order.' });
+  }
+};
+
+exports.correctSupplierPOExchangeRate = async (req, res) => {
+  try {
+    const po = await SupplierPO.findById(req.params.id);
+    if (!po) return res.status(404).json({ success: false, message: 'Supplier Purchase Order not found.' });
+    const currency = String(po.currency || 'PKR').trim().toUpperCase();
+    if (currency === 'PKR') {
+      return res.status(400).json({ success: false, message: 'PKR Supplier POs always use an exchange rate of 1.' });
+    }
+    const newRate = Number(req.body.exchangeRateToPKR);
+    if (!Number.isFinite(newRate) || newRate <= 0) {
+      return res.status(400).json({ success: false, message: 'Enter a positive exchange rate to PKR.' });
+    }
+    const note = String(req.body.note || '').trim();
+    if (note.length > 500) return res.status(400).json({ success: false, message: 'Note cannot exceed 500 characters.' });
+    const oldRate = Number(po.exchangeRateToPKR) > 0 ? Number(po.exchangeRateToPKR) : null;
+    po.exchangeRateToPKR = newRate;
+    po.exchangeRateHistory.push({
+      changedBy: req.user._id,
+      changedByName: req.user.fullName || '',
+      changedAt: new Date(),
+      currency,
+      oldRate,
+      newRate,
+      note
+    });
+    await po.save();
+    if (po.salesOrderId) {
+      await SalesOrder.updateOne(
+        { _id: po.salesOrderId, supplierPoId: po._id },
+        { $set: { 'supplierPO.exchangeRateToPKR': newRate, 'supplierPO.currency': currency } }
+      );
+    }
+    return res.json({ success: true, message: `Exchange rate corrected for ${po.poNumber}.`, data: po });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error correcting Supplier PO exchange rate.' });
   }
 };
 
@@ -1897,6 +1940,7 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       requestedCompanyCode: req.body.issuingCompanyCode,
       order
     });
+    const exchangeRate = await getEffectiveExchangeRate(req.body.currency || 'PKR');
 
     const poNum = await allocateGlobalPoNumber();
     let subtotal = 0;
@@ -1930,7 +1974,8 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       vatAmount,
       total: totalAmount,
       totalAmount,
-      currency: 'PKR',
+      currency: exchangeRate.currency,
+      exchangeRateToPKR: exchangeRate.rateToPKR,
       notes: remarks || `Global Supplier PO issued with ${paymentTerms || 'LC'} terms`,
       issuingCompany,
       issuedBy: req.user._id,
@@ -1963,7 +2008,8 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
         vatAmount,
         total: totalAmount,
         totalAmount,
-        currency: 'PKR',
+        currency: exchangeRate.currency,
+        exchangeRateToPKR: exchangeRate.rateToPKR,
         status: 'Issued',
         salesOrderId: order._id,
         salesOrderNumber: order.orderNumber || order.orderReference,

@@ -9,11 +9,37 @@ const {
   notifyAdminsOfExpense,
   valuesForHistory
 } = require('../utils/purchaseExpenses');
+const { assertSupportedCurrency } = require('../config/currencies');
+const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 
 const ADD_ROLES = new Set(['finance', 'admin']);
 const EDIT_ROLES = new Set(['finance', 'admin']);
 const READ_ROLES = new Set([...ADD_ROLES, 'ceo']);
 const COSTING_LOCK_MESSAGE = 'Costing is Completed and locked. Admin must authorize a change.';
+
+const expenseInputWithStoredRate = async ({ input, existing = null, user, session = null }) => {
+  const calculationType = input?.calculationType === 'Percentage' ? 'Percentage' : 'Fixed';
+  if (calculationType === 'Percentage') return { ...input, currency: 'PKR', exchangeRateToPKR: 1 };
+  const currency = assertSupportedCurrency(input?.currency || existing?.currency || 'PKR');
+  if (currency === 'PKR') return { ...input, currency, exchangeRateToPKR: 1 };
+
+  const existingCurrency = String(existing?.currency || '').trim().toUpperCase();
+  if (existing && existingCurrency === currency) {
+    if (user?.role === 'admin' && input?.exchangeRateToPKR !== undefined) {
+      const correctedRate = Number(input.exchangeRateToPKR);
+      if (!Number.isFinite(correctedRate) || correctedRate <= 0) {
+        const error = new Error('Enter a positive exchange rate to PKR.');
+        error.statusCode = 400;
+        throw error;
+      }
+      return { ...input, currency, exchangeRateToPKR: correctedRate };
+    }
+    return { ...input, currency, exchangeRateToPKR: Number(existing.exchangeRateToPKR) };
+  }
+
+  const current = await getEffectiveExchangeRate(currency, { session });
+  return { ...input, currency, exchangeRateToPKR: current.rateToPKR };
+};
 
 const getPOType = po => {
   if (po?.poType === 'Global' || po?.supplierType === 'Global' || po?.fileType === 'Blue' || /^(GPO|IPO)-/i.test(po?.poNumber || '')) return 'Global';
@@ -169,7 +195,8 @@ exports.addSupplierPOExpense = async (req, res) => {
       if (!canAccessPO(req.user, po, 'add')) { const error = new Error('You cannot add costs to this Supplier PO.'); error.statusCode = 403; throw error; }
       assertCostingEditable(req.user, po);
       const category = await ensureCategoryAvailable(req.body.category, req.user, session);
-      const values = buildExpenseValues({ ...req.body, category }, po);
+      const ratedInput = await expenseInputWithStoredRate({ input: { ...req.body, category }, user: req.user, session });
+      const values = buildExpenseValues(ratedInput, po);
       po.expenses.push({
         ...values,
         grn: mongoose.Types.ObjectId.isValid(req.body.grn) ? req.body.grn : null,
@@ -202,7 +229,9 @@ exports.updateSupplierPOExpense = async (req, res) => {
       if (!expense || expense.isDeleted) { const error = new Error('Active expense not found.'); error.statusCode = 404; throw error; }
       const category = await ensureCategoryAvailable(req.body.category ?? expense.category, req.user, session);
       const oldValues = valuesForHistory(expense);
-      const values = buildExpenseValues({ ...oldValues, ...req.body, category, attachments: req.body.attachments ?? expense.attachments }, po);
+      const mergedInput = { ...oldValues, ...req.body, category, attachments: req.body.attachments ?? expense.attachments };
+      const ratedInput = await expenseInputWithStoredRate({ input: mergedInput, existing: expense, user: req.user, session });
+      const values = buildExpenseValues(ratedInput, po);
       Object.assign(expense, values);
       expense.editHistory.push({ action: 'Edited', changedBy: req.user._id, changedByName: req.user.fullName || '', oldValues, newValues: valuesForHistory(values) });
       await po.save({ session });
