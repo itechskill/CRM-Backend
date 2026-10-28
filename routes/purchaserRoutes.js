@@ -45,8 +45,9 @@ router.use(protect);
 const purchaserAccess = authorize('purchaser', 'admin', 'ceo');
 const inventoryManagementAccess = authorize('admin', 'ceo');
 const financialChargesAccess = authorize('finance', 'accountant', 'admin', 'ceo');
-const expenseReadAccess = authorize('support', 'finance', 'purchaser', 'admin', 'ceo');
-const expenseAddAccess = authorize('support', 'finance', 'purchaser', 'admin');
+const supplierPOListAccess = authorize('support', 'finance', 'purchaser', 'admin', 'ceo');
+const expenseReadAccess = authorize('support', 'finance', 'admin', 'ceo');
+const expenseAddAccess = authorize('support', 'finance', 'admin');
 const expenseEditAccess = authorize('finance', 'admin');
 
 const requirePurchaserSubDept = (requiredSubDept) => (req, res, next) => {
@@ -255,7 +256,7 @@ router.get('/suppliers', purchaserAccess, scopePurchaserList('supplier', ['suppl
 router.post('/suppliers', purchaserAccess, scopePurchaserBody(['supplierType', 'type'], 'supplierType'), createSupplier);
 
 // Supplier POs
-router.get('/pos', expenseReadAccess, scopePurchaserList('po', ['poType', 'subType', 'type']), getSupplierPOs);
+router.get('/pos', supplierPOListAccess, scopePurchaserList('po', ['poType', 'subType', 'type']), getSupplierPOs);
 router.post('/pos', purchaserAccess, scopePurchaserBody(['poType', 'subType', 'type'], 'poType'), createSupplierPO);
 router.get('/expense-categories', expenseReadAccess, listExpenseCategories);
 router.post('/expense-categories', expenseAddAccess, createExpenseCategory);

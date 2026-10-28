@@ -225,7 +225,9 @@ exports.getSupplierPOs = async (req, res) => {
         { supplierName: { $regex: search, $options: 'i' } }
       ];
     }
-    const pos = await SupplierPO.find(filter).populate('supplier').sort({ createdAt: -1 });
+    let poQuery = SupplierPO.find(filter);
+    if (req.user.role === 'purchaser') poQuery = poQuery.select('-expenses');
+    const pos = await poQuery.populate('supplier').sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: pos.length, data: pos, pos });
   } catch (error) {
     console.error('Get Supplier POs Error:', error);
@@ -624,7 +626,10 @@ exports.updateSupplierPO = async (req, res) => {
       console.warn('EditAuditLog creation notice for Supplier PO:', auditErr.message);
     }
 
-    return res.status(200).json({ success: true, message: `Supplier PO ${po.poNumber} updated successfully.`, data: po });
+    const responsePO = req.user.role === 'purchaser'
+      ? await SupplierPO.findById(po._id).select('-expenses')
+      : po;
+    return res.status(200).json({ success: true, message: `Supplier PO ${po.poNumber} updated successfully.`, data: responsePO });
   } catch (error) {
     console.error('Update Supplier PO Error:', error);
     return res.status(500).json({ success: false, message: 'Server error updating purchase order.' });
@@ -672,7 +677,13 @@ exports.getPurchaserGRNs = async (req, res) => {
         { supplierName: { $regex: search, $options: 'i' } }
       ];
     }
-    const grns = await PurchaserGRN.find(filter).populate('supplierPO supplier salesOrder').sort({ createdAt: -1 });
+    const supplierPOPopulate = req.user.role === 'purchaser'
+      ? { path: 'supplierPO', select: '-expenses' }
+      : { path: 'supplierPO' };
+    const grns = await PurchaserGRN.find(filter)
+      .populate(supplierPOPopulate)
+      .populate('supplier salesOrder')
+      .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: grns.length, data: grns, grns });
   } catch (error) {
     console.error('Get GRNs Error:', error);
@@ -831,7 +842,14 @@ exports.getLocalPayables = async (req, res) => {
         { salesOrderNumber: { $regex: search, $options: 'i' } }
       ];
     }
-    const records = await LocalPayable.find(filter).populate('supplier supplierPO grn grns').sort({ createdAt: -1 }).lean();
+    const supplierPOPopulate = req.user.role === 'purchaser'
+      ? { path: 'supplierPO', select: '-expenses' }
+      : { path: 'supplierPO' };
+    const records = await LocalPayable.find(filter)
+      .populate('supplier grn grns')
+      .populate(supplierPOPopulate)
+      .sort({ createdAt: -1 })
+      .lean();
     const payables = records.map(payable => ({ ...payable, ...getPayableBalances(payable) }));
     return res.status(200).json({ success: true, count: payables.length, data: payables, payables });
   } catch (error) {
