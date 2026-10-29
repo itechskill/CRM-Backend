@@ -53,6 +53,7 @@ const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 const { calculateDocumentFinancials, normalizePartNumber } = require('../utils/documentFinancials');
+const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -1139,10 +1140,13 @@ const getMyInvoices = async (req, res) => {
       }).select('orderNumber clientName contactEmail contactPhone netAmount items status createdAt').sort({ createdAt: -1 })
     ]);
 
+    const responseInvoices = ['finance', 'admin', 'ceo'].includes(req.user.role)
+      ? await addFinanceCostingToInvoices(invoices)
+      : invoices;
     return res.status(200).json({
       success: true,
       count: invoices.length,
-      data: serializeMonetaryVisibility(invoices, req.user, 'invoices'),
+      data: serializeMonetaryVisibility(responseInvoices, req.user, 'invoices'),
       eligibleWonSales: {
         deals: serializeMonetaryVisibility(eligibleDeals, req.user, 'deals'),
         orders: serializeMonetaryVisibility(eligibleOrders, req.user, 'sales-orders')
@@ -2352,6 +2356,21 @@ const getMyOrders = async (req, res) => {
       .sort({ creationDate: -1, createdAt: -1 });
 
     let responseOrders = orders;
+    if (['finance', 'admin', 'ceo'].includes(req.user.role) && orders.length) {
+      const linkedPOs = await SupplierPO.find({ salesOrderId: { $in: orders.map(order => order._id) } })
+        .sort({ createdAt: -1 })
+        .select('salesOrderId costingStatus')
+        .lean();
+      const costingByOrder = new Map();
+      for (const linkedPO of linkedPOs) {
+        const orderId = String(linkedPO.salesOrderId || '');
+        if (!costingByOrder.has(orderId)) costingByOrder.set(orderId, linkedPO.costingStatus || 'Incomplete');
+      }
+      responseOrders = orders.map(order => ({
+        ...order.toObject(),
+        supplierPOCostingStatus: costingByOrder.get(String(order._id)) || 'Incomplete'
+      }));
+    }
     const isSupportUser = req.user.role === 'support' || (req.user.department || '').toLowerCase().includes('support');
     if (isSupportUser) {
       const shipments = await Shipment.find({
