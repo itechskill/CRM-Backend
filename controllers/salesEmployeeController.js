@@ -1124,6 +1124,7 @@ const getMyInvoices = async (req, res) => {
     const [invoices, eligibleDeals, eligibleOrders] = await Promise.all([
       Invoice.find(query)
         .populate('dealId', 'title value stage clientName contactEmail contactPhone')
+        .populate('salesOrderId', 'orderNumber orderReference issuingCompany')
         .populate('createdBy', 'fullName email position role')
         .populate('reviewedBy', 'fullName email position role')
         .populate('salesPerson', 'fullName email position role')
@@ -3115,7 +3116,7 @@ const getMyDeliveryNotes = async (req, res) => {
         : { $or: [{ createdBy: req.user._id }, { salesPerson: req.user._id }] };
     }
     const notes = await DeliveryNote.find(filter)
-      .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount discount tax items clientEmail clientPhone clientAddress fileNo fileType salePerson')
+      .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount discount tax items clientEmail clientPhone clientAddress fileNo fileType salePerson issuingCompany')
       .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: notes.length, data: serializeMonetaryVisibility(notes, req.user, 'delivery-notes') });
   } catch (error) {
@@ -4483,11 +4484,22 @@ const getMyPayments = async (req, res) => {
       .populate('createdBy', 'fullName email position role department')
       .populate('salesPerson', 'fullName email')
       .sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, count: payments.length, data: payments });
+    const responsePayments = payments.map(payment => paymentForRole(payment, req.user.role));
+    return res.status(200).json({ success: true, count: responsePayments.length, data: responsePayments });
   } catch (error) {
     console.error('[Get Payments Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching payments.' });
   }
+};
+
+const paymentForRole = (payment, role) => {
+  const value = payment?.toObject ? payment.toObject() : { ...payment };
+  if (!['finance', 'accountant', 'admin', 'ceo'].includes(role)) {
+    delete value.receiptVoucherNumber;
+    delete value.issuingCompany;
+    delete value.receiptRequestId;
+  }
+  return value;
 };
 
 const toMoneyCents = (value) => {
@@ -4568,8 +4580,24 @@ const syncInvoiceAndOrderBalances = async (invoiceId, salesOrderId) => {
 };
 
 const createMyPayment = async (req, res) => {
+  const receiptRequestId = String(req.body.receiptRequestId || '').trim();
   try {
-    let { customerName, salesOrderId, salesOrderNumber, invoiceId, invoiceNumber, paymentDate, amount, paymentType, paymentMethod, notes } = req.body;
+    let { customerName, salesOrderId, salesOrderNumber, invoiceId, invoiceNumber, paymentDate, amount, paymentType, paymentMethod, notes, reference } = req.body;
+    if (receiptRequestId.length > 120) {
+      return res.status(400).json({ success: false, message: 'Payment request identifier is too long.' });
+    }
+    if (reference !== undefined && typeof reference !== 'string') {
+      return res.status(400).json({ success: false, message: 'Payment reference must be text.' });
+    }
+    if (String(reference || '').trim().length > 120) {
+      return res.status(400).json({ success: false, message: 'Payment reference cannot exceed 120 characters.' });
+    }
+    if (receiptRequestId) {
+      const existingPayment = await Payment.findOne({ receiptRequestId });
+      if (existingPayment) {
+        return res.status(200).json({ success: true, message: 'Payment was already recorded.', data: paymentForRole(existingPayment, req.user.role) });
+      }
+    }
     if (!customerName || !customerName.trim()) {
       return res.status(400).json({ success: false, message: 'Customer name is required.' });
     }
@@ -4581,6 +4609,7 @@ const createMyPayment = async (req, res) => {
     const allocatedInvoiceIds = new Set();
     let resolvedSalesPersonId = null;
     let resolvedSalePerson = '';
+    let resolvedIssuingCompany;
 
     if (requestedAllocations) {
       for (const requested of requestedAllocations) {
@@ -4657,11 +4686,12 @@ const createMyPayment = async (req, res) => {
       }
     }
 
-    if (salesOrderId && (!resolvedSalesPersonId || !resolvedSalePerson)) {
-      const parentSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
+    if (salesOrderId && (!resolvedSalesPersonId || !resolvedSalePerson || !resolvedIssuingCompany)) {
+      const parentSo = await SalesOrder.findById(salesOrderId?._id || salesOrderId).populate('salesPerson');
       if (parentSo) {
         resolvedSalesPersonId = resolvedSalesPersonId || parentSo.salesPerson?._id || parentSo.salesPerson || parentSo.createdBy || null;
         resolvedSalePerson = resolvedSalePerson || parentSo.salePerson || parentSo.salesPerson?.fullName || '';
+        resolvedIssuingCompany = parentSo.issuingCompany?.toObject?.() || parentSo.issuingCompany || undefined;
       }
     }
 
@@ -4677,6 +4707,9 @@ const createMyPayment = async (req, res) => {
       paymentType: paymentType || 'Partial',
       paymentMethod: paymentMethod || 'Bank Transfer',
       notes: notes || '',
+      reference: String(reference || '').trim(),
+      receiptRequestId: receiptRequestId || undefined,
+      issuingCompany: resolvedIssuingCompany,
       salesPerson: resolvedSalesPersonId || (req.user.department === 'Sales' ? req.user._id : null),
       salePerson: resolvedSalePerson || (req.user.department === 'Sales' ? req.user.fullName : ''),
       createdBy: req.user._id
@@ -4726,10 +4759,32 @@ const createMyPayment = async (req, res) => {
       link: '/sales/payments'
     });
 
-    return res.status(201).json({ success: true, message: 'Payment recorded successfully.', data: payment });
+    const responsePayment = paymentForRole(payment, req.user.role);
+    return res.status(201).json({ success: true, message: 'Payment recorded successfully.', data: responsePayment });
   } catch (error) {
+    if (error?.code === 11000 && receiptRequestId) {
+      const existingPayment = await Payment.findOne({ receiptRequestId });
+      if (existingPayment) {
+        return res.status(200).json({ success: true, message: 'Payment was already recorded.', data: paymentForRole(existingPayment, req.user.role) });
+      }
+    }
     console.error('[Create Payment Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error recording payment.' });
+  }
+};
+
+const getReceiptVoucher = async (req, res) => {
+  try {
+    const payment = await Payment.findById(req.params.id)
+      .populate('createdBy', 'fullName email role department');
+    if (!payment) return res.status(404).json({ success: false, message: 'Payment not found.' });
+    if (!payment.receiptVoucherNumber) {
+      return res.status(404).json({ success: false, message: 'This legacy payment does not have a Receipt Voucher.' });
+    }
+    return res.status(200).json({ success: true, data: payment });
+  } catch (error) {
+    console.error('[Get Receipt Voucher Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error loading the Receipt Voucher.' });
   }
 };
 
@@ -6932,6 +6987,7 @@ module.exports = {
   updateMyProductFile,
   deleteMyProductFile,
   getMyPayments,
+  getReceiptVoucher,
   createMyPayment,
   updateMyPayment,
   deleteMyPayment,

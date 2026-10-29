@@ -1,4 +1,6 @@
 const mongoose = require('mongoose');
+const companySnapshotDefinition = require('./schemas/companySnapshot');
+const { allocateReceiptVoucherNumber } = require('../utils/receiptVoucherNumber');
 
 const PaymentAllocationSchema = new mongoose.Schema({
   invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: true },
@@ -11,6 +13,10 @@ const PaymentAllocationSchema = new mongoose.Schema({
 const PaymentSchema = new mongoose.Schema(
   {
     paymentRefNumber: { type: String, trim: true, default: '' },
+    receiptVoucherNumber: { type: String, trim: true, default: '', index: { unique: true, sparse: true } },
+    receiptRequestId: { type: String, trim: true, default: undefined, index: { unique: true, sparse: true } },
+    reference: { type: String, trim: true, maxlength: 120, default: '' },
+    issuingCompany: companySnapshotDefinition(),
     customerName: { type: String, required: [true, 'Customer name is required'], trim: true },
     salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
     salesOrderNumber: { type: String, trim: true, default: '' },
@@ -39,6 +45,9 @@ const PaymentSchema = new mongoose.Schema(
 
 // Auto-generate payment reference number before save
 PaymentSchema.pre('save', async function (next) {
+  if (this.isNew && !this.receiptVoucherNumber) {
+    this.receiptVoucherNumber = await allocateReceiptVoucherNumber(this.$session());
+  }
   if (!this.paymentRefNumber) {
     const allPayments = await mongoose.model('Payment').find().select('paymentRefNumber').lean();
     let maxNum = 35;

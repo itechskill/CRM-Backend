@@ -36,6 +36,7 @@ const getInvoices = async (req, res) => {
       ];
     }
     const invoices = await Invoice.find(query)
+      .populate('salesOrderId', 'orderNumber orderReference issuingCompany')
       .populate('salesPerson', 'fullName email')
       .populate('createdBy', 'fullName email department')
       .sort({ createdAt: -1 });
