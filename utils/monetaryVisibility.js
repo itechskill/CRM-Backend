@@ -53,7 +53,7 @@ const stripSupplierPO = po => {
 function stripSalesOrder(order) {
   if (!order || typeof order !== 'object') return order;
   const result = omit(order, [
-    'totalAmount', 'discount', 'tax', 'netAmount', 'totalPaid', 'outstandingBalance',
+    'totalAmount', 'discount', 'tax', 'taxRate', 'netAmount', 'totalPaid', 'outstandingBalance',
     'customerOverdueAtCreation', 'shortageAmount', 'advancePercentage', 'advanceRequiredAmount',
     'advanceReceivedAmount', 'orderTotalAmount'
   ]);

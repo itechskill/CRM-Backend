@@ -274,7 +274,7 @@ router.patch('/pos/:id/exchange-rate', authorize('admin'), correctSupplierPOExch
 router.delete('/pos/:id', purchaserAccess, requireSupplierPOOwnership, deleteSupplierPO);
 
 // GRNs
-router.get('/grns', localPurchaserAccess, getPurchaserGRNs);
+router.get('/grns', purchaserAccess, scopePurchaserQuery(['purchaserSubDept', 'subDept', 'type']), getPurchaserGRNs);
 
 // Local Payables
 router.get('/payables', localPayablesReadAccess, getLocalPayables);

@@ -12,6 +12,18 @@ const CustomerPOSchema = new mongoose.Schema(
     productFileId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductFile', default: null },
     salesOrderId: { type: mongoose.Schema.Types.ObjectId, ref: 'SalesOrder', default: null },
     amount: { type: Number, default: 0 },
+    items: [{
+      partNumber: { type: String, trim: true, default: '' },
+      sku: { type: String, trim: true, default: '' },
+      description: { type: String, default: '' },
+      quantity: { type: Number, default: 1 },
+      unitPrice: { type: Number, default: 0 },
+      total: { type: Number, default: 0 }
+    }],
+    subtotal: { type: Number, default: 0 },
+    discount: { type: Number, default: 0 },
+    taxRate: { type: Number, default: 0 },
+    tax: { type: Number, default: 0 },
     notes: { type: String, default: '' },
     uploadedDocument: { type: String, default: '' },
     documentName: { type: String, default: '' },

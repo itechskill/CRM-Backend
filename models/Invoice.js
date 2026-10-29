@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
+const { calculateDocumentFinancials } = require('../utils/documentFinancials');
 
 const InvoiceItemSchema = new mongoose.Schema({
+  partNumber: { type: String, trim: true, default: '' },
   description: { type: String, required: true, trim: true },
   quantity: { type: Number, required: true, min: 1, default: 1 },
   unitPrice: { type: Number, required: true, min: 0, default: 0 },
@@ -28,6 +30,7 @@ const InvoiceSchema = new mongoose.Schema({
   tax: { type: Number, default: 0, min: 0 },
   taxRate: { type: Number, default: 0, min: 0 },
   discount: { type: Number, default: 0, min: 0 },
+  taxableAmount: { type: Number, default: 0, min: 0 },
   amount: { type: Number, required: true, min: 0 },
   paidAmount: { type: Number, default: 0, min: 0 },
   outstandingAmount: { type: Number, default: 0, min: 0 },
@@ -61,6 +64,21 @@ const InvoiceSchema = new mongoose.Schema({
 });
 
 InvoiceSchema.pre('validate', async function (next) {
+  if (this.items?.length && (this.isNew || this.isModified('items') || this.isModified('discount') || this.isModified('taxRate'))) {
+    const financials = calculateDocumentFinancials({
+      items: this.items,
+      discount: this.discount,
+      taxRate: this.taxRate
+    });
+    this.items = financials.items;
+    this.subtotal = financials.subtotal;
+    this.discount = financials.discount;
+    this.taxRate = financials.taxRate;
+    this.tax = financials.tax;
+    this.taxableAmount = financials.taxableAmount;
+    this.amount = financials.grandTotal;
+    this.outstandingAmount = Math.max(0, financials.grandTotal - (Number(this.paidAmount) || 0));
+  }
   if (!this.invoiceNumber) {
     const allInvoices = await mongoose.model('Invoice').find().select('invoiceNumber').lean();
     let maxNum = 80;

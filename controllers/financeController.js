@@ -6,6 +6,7 @@ const MaintenanceCharge = require('../models/MaintenanceCharge');
 const InventoryItem = require('../models/InventoryItem');
 const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const { getFinanceDashboardMetrics } = require('../utils/departmentDashboardMetrics');
+const { calculateDocumentFinancials } = require('../utils/documentFinancials');
 
 const getFinanceDashboardStats = async (req, res) => {
   try {
@@ -92,6 +93,12 @@ const updateInvoice = async (req, res) => {
       return res.status(400).json({ success: false, message: 'PO Reference must be text.' });
     }
     const updates = { ...req.body };
+    // Financial totals are server-derived from the line items, discount and tax rate.
+    delete updates.subtotal;
+    delete updates.tax;
+    delete updates.taxableAmount;
+    delete updates.amount;
+    delete updates.outstandingAmount;
     if (updates.poReference !== undefined) {
       updates.poReference = updates.poReference.trim();
       if (updates.poReference.length > 60) {
@@ -120,6 +127,23 @@ const updateInvoice = async (req, res) => {
     }
 
     Object.assign(invoice, updates);
+    if (updates.items || updates.discount !== undefined || updates.taxRate !== undefined) {
+      const financials = calculateDocumentFinancials({
+        items: invoice.items,
+        discount: invoice.discount,
+        taxRate: invoice.taxRate
+      });
+      Object.assign(invoice, {
+        items: financials.items,
+        subtotal: financials.subtotal,
+        discount: financials.discount,
+        taxableAmount: financials.taxableAmount,
+        taxRate: financials.taxRate,
+        tax: financials.tax,
+        amount: financials.grandTotal,
+        outstandingAmount: Math.max(0, financials.grandTotal - (Number(invoice.paidAmount) || 0))
+      });
+    }
     await invoice.save();
 
     return res.status(200).json({ success: true, message: 'Invoice updated successfully.', data: invoice });

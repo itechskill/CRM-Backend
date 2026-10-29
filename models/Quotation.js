@@ -23,6 +23,7 @@ const QuotationSchema = new mongoose.Schema(
       {
         inventoryItem: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
         sku: { type: String, trim: true, default: '' },
+        partNumber: { type: String, trim: true, default: '' },
         description: { type: String, default: '' },
         quantity: { type: Number, default: 1 },
         unitPrice: { type: Number, default: 0 },

@@ -25,6 +25,7 @@ const DeliveryNoteSchema = new mongoose.Schema(
       {
         product: { type: String, default: '' },
         description: { type: String, default: '' },
+        partNumber: { type: String, trim: true, default: '' },
         demand: { type: Number, default: 1 },
         quantity: { type: Number, default: 1 },
         unit: { type: String, default: 'Units' },
@@ -90,6 +91,7 @@ DeliveryNoteSchema.pre('save', async function () {
           deliveryItem.orderItemId && String(item._id) === String(deliveryItem.orderItemId)
         ) || order.items[Number(deliveryItem.orderItemIndex)] || order.items[deliveryIndex];
         const unitPrice = Number(sourceItem?.unitPrice) || 0;
+        deliveryItem.partNumber = String(sourceItem?.partNumber || sourceItem?.sku || sourceItem?.productCode || '').trim();
         deliveryItem.unitPrice = unitPrice;
         deliveryItem.lineTotal = (Number(deliveryItem.quantity) || Number(deliveryItem.demand) || 0) * unitPrice;
       });

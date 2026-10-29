@@ -14,7 +14,11 @@ const ProductFileSchema = new mongoose.Schema(
     products: [
       {
         name: { type: String, default: '' },
+        partNumber: { type: String, trim: true, default: '' },
+        sku: { type: String, trim: true, default: '' },
         quantity: { type: Number, default: 1 },
+        unitPrice: { type: Number, default: 0 },
+        total: { type: Number, default: 0 },
         unit: { type: String, default: '' },
         description: { type: String, default: '' }
       }

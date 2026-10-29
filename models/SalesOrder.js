@@ -20,6 +20,7 @@ const SalesOrderSchema = new mongoose.Schema(
         description: { type: String, default: '' },
         sku: { type: String, default: '' },
         productCode: { type: String, default: '' },
+        partNumber: { type: String, trim: true, default: '' },
         quantity: { type: Number, default: 1 },
         unitPrice: { type: Number, default: 0 },
         total: { type: Number, default: 0 }
@@ -28,6 +29,7 @@ const SalesOrderSchema = new mongoose.Schema(
     totalAmount: { type: Number, default: 0 },
     discount: { type: Number, default: 0 },
     tax: { type: Number, default: 0 },
+    taxRate: { type: Number, default: 0 },
     netAmount: { type: Number, default: 0 },
     status: { type: String, default: 'Sales Order' },
     orderDate: { type: Date, default: Date.now },
@@ -94,6 +96,7 @@ const SalesOrderSchema = new mongoose.Schema(
       items: [
         {
           description: { type: String, default: '' },
+          partNumber: { type: String, trim: true, default: '' },
           quantity: { type: Number, default: 1 },
           unitPrice: { type: Number, default: 0 },
           total: { type: Number, default: 0 }
@@ -148,6 +151,7 @@ const SalesOrderSchema = new mongoose.Schema(
           {
             orderItemId: { type: String, default: '' },
             productName: { type: String, default: '' },
+            partNumber: { type: String, trim: true, default: '' },
             sku: { type: String, default: '' },
             orderedQty: { type: Number, default: 0 },
             receivedQty: { type: Number, default: 0 },
