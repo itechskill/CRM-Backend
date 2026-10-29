@@ -902,6 +902,7 @@ router.get('/invoices', managerGuard, async (req, res) => {
 
     const invoices = await Invoice.find(query)
       .populate('createdBy', 'fullName email profileImage position department')
+      .populate('salesOrderId', 'orderNumber orderReference issuingCompany')
       .populate('reviewedBy', 'fullName email')
       .populate('dealId', 'title value stage clientName contactEmail contactPhone')
       .sort({ createdAt: -1 });
@@ -923,6 +924,7 @@ router.get('/invoices/:id', managerGuard, async (req, res) => {
     const scope = await getSalesManagerScope(req.user);
     const invoice = await Invoice.findById(req.params.id)
       .populate('createdBy', 'fullName email profileImage position department phone')
+      .populate('salesOrderId', 'orderNumber orderReference issuingCompany')
       .populate('reviewedBy', 'fullName email position')
       .populate('dealId');
 

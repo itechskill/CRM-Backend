@@ -672,7 +672,7 @@ const getLogisticsDeliveryNotes = async (req, res) => {
     })
       .populate('salesPerson', 'fullName email')
       .populate('shipmentId')
-      .populate('salesOrder', 'orderReference orderNumber')
+      .populate('salesOrder', 'orderReference orderNumber issuingCompany')
       .sort({ createdAt: -1 })
       .lean();
 

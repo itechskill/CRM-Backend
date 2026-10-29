@@ -61,6 +61,7 @@ const {
   updateMyProductFile,
   deleteMyProductFile,
   getMyPayments,
+  getReceiptVoucher,
   createMyPayment,
   updateMyPayment,
   deleteMyPayment,
@@ -89,6 +90,7 @@ const departmentReadGuard = [protect, authorize('employee', 'sales_member', 'sal
 const salesAndSupportGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'support', 'admin', 'ceo')];
 const salesAccountsGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'accountant', 'admin', 'ceo')];
 const paymentGuard = [protect, authorize('employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager', 'accountant', 'finance', 'admin', 'ceo')];
+const receiptVoucherGuard = [protect, authorize('accountant', 'finance', 'admin', 'ceo')];
 const accountsGuard = [protect, authorize('accountant', 'admin', 'ceo')];
 const supportInventoryReadGuard = [protect, authorize('support', 'admin', 'ceo')];
 const supportInventoryWriteGuard = [protect, authorize('support', 'admin')];
@@ -201,6 +203,7 @@ router.delete('/product-files/:id', salesGuard, deleteMyProductFile);
 
 // Payments
 router.get('/payments', paymentGuard, getMyPayments);
+router.get('/payments/:id/receipt-voucher', receiptVoucherGuard, getReceiptVoucher);
 router.post('/payments', paymentGuard, createMyPayment);
 router.patch('/payments/:id', paymentGuard, updateMyPayment);
 router.delete('/payments/:id', paymentGuard, deleteMyPayment);
