@@ -7,6 +7,7 @@ const InventoryItem = require('../models/InventoryItem');
 const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../utils/editPermissionHelper');
 const { getFinanceDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { calculateDocumentFinancials } = require('../utils/documentFinancials');
+const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
 
 const getFinanceDashboardStats = async (req, res) => {
   try {
@@ -40,7 +41,10 @@ const getInvoices = async (req, res) => {
       .populate('salesPerson', 'fullName email')
       .populate('createdBy', 'fullName email department')
       .sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, count: invoices.length, data: invoices });
+    const data = ['finance', 'admin', 'ceo'].includes(req.user.role)
+      ? await addFinanceCostingToInvoices(invoices)
+      : invoices;
+    return res.status(200).json({ success: true, count: invoices.length, data });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error retrieving invoices.' });
   }

@@ -1,5 +1,6 @@
 const QUANTITY_ONLY_ROLES = new Set(['support', 'logistics']);
 const SALARY_RESTRICTED_ROLES = new Set(['hr_manager', 'hr', 'administration']);
+const FINANCE_COSTING_ROLES = new Set(['finance', 'admin', 'ceo']);
 
 const plain = value => {
   if (value == null) return value;
@@ -122,6 +123,12 @@ const serializeMonetaryVisibility = (value, user, context) => {
   if (context === 'users') {
     return SALARY_RESTRICTED_ROLES.has(role) ? map(value, stripSalary) : value;
   }
+  if (context === 'invoice' || context === 'invoices') {
+    const costingSafeValue = FINANCE_COSTING_ROLES.has(role)
+      ? value
+      : map(value, invoice => omit(invoice, ['financeCosting']));
+    return QUANTITY_ONLY_ROLES.has(role) ? map(costingSafeValue, stripInvoice) : costingSafeValue;
+  }
   if (!QUANTITY_ONLY_ROLES.has(role)) return value;
 
   switch (context) {
@@ -129,8 +136,6 @@ const serializeMonetaryVisibility = (value, user, context) => {
     case 'sales-orders': return map(value, stripSalesOrder);
     case 'delivery-note':
     case 'delivery-notes': return map(value, stripDeliveryNote);
-    case 'invoice':
-    case 'invoices': return map(value, stripInvoice);
     case 'deal':
     case 'deals': return map(value, stripDeal);
     case 'inventory-item':

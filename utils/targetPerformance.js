@@ -199,6 +199,84 @@ const loadPerformanceForUsers = async ({ users, month, asOf = new Date() }) => {
   });
 };
 
+const addFinanceCostingToInvoices = async invoices => {
+  const plainInvoices = (invoices || []).map(invoice => (
+    typeof invoice?.toObject === 'function' ? invoice.toObject() : invoice
+  ));
+  const orderIds = [...new Set(plainInvoices.map(invoice => idString(invoice?.salesOrderId)).filter(Boolean))];
+  if (!orderIds.length) {
+    return plainInvoices.map(invoice => ({
+      ...invoice,
+      financeCosting: {
+        invoiceAmountExcludingTaxCents: invoiceRevenueExcludingTaxCents(invoice),
+        cogsCents: null,
+        grossProfitCents: null,
+        costingStatus: 'Incomplete',
+        provisional: true,
+        issue: 'Cost not recorded',
+        review: false,
+        reviewReason: ''
+      }
+    }));
+  }
+
+  const [orders, supplierPOs, invoiceCounts] = await Promise.all([
+    SalesOrder.find({ _id: { $in: orderIds } }).lean(),
+    SupplierPO.find({ salesOrderId: { $in: orderIds } }).sort({ createdAt: -1 }).lean(),
+    Invoice.aggregate([
+      { $match: { salesOrderId: { $in: orderIds.map(id => require('mongoose').Types.ObjectId.createFromHexString(id)) }, status: { $nin: ['Cancelled', 'Rejected'] } } },
+      { $group: { _id: '$salesOrderId', count: { $sum: 1 } } }
+    ])
+  ]);
+  const orderMap = new Map(orders.map(order => [idString(order._id), order]));
+  const poMap = new Map();
+  const poCounts = new Map();
+  for (const po of supplierPOs) {
+    const orderId = idString(po.salesOrderId);
+    poCounts.set(orderId, (poCounts.get(orderId) || 0) + 1);
+    if (!poMap.has(orderId)) poMap.set(orderId, po);
+  }
+  const invoiceCountMap = new Map(invoiceCounts.map(row => [idString(row._id), row.count]));
+
+  return Promise.all(plainInvoices.map(async invoice => {
+    const orderId = idString(invoice.salesOrderId);
+    const order = orderMap.get(orderId) || null;
+    const supplierPO = poMap.get(orderId) || null;
+    const invoiceAmountExcludingTaxCents = invoiceRevenueExcludingTaxCents(invoice);
+    let issue = '';
+    let cogsCents = null;
+    if (!order || !supplierPO) {
+      issue = 'Cost not recorded';
+    } else if (String(supplierPO.currency || 'PKR').toUpperCase() !== 'PKR' && !(Number(supplierPO.exchangeRateToPKR) > 0)) {
+      issue = 'Rate missing';
+    } else {
+      const cost = await totalCostPKR(supplierPO);
+      cogsCents = cost === null ? null : moneyToCents(cost);
+      if (cogsCents === null) issue = 'Cost not recorded';
+    }
+    const multiplePOs = (poCounts.get(orderId) || 0) > 1;
+    const multipleInvoices = (invoiceCountMap.get(orderId) || 0) > 1;
+    const review = multiplePOs || multipleInvoices;
+    const reasons = [];
+    if (multiplePOs) reasons.push('the newest Supplier PO is used');
+    if (multipleInvoices) reasons.push('the full order cost applies to each invoice');
+    return {
+      ...invoice,
+      financeCosting: {
+        invoiceAmountExcludingTaxCents,
+        cogsCents,
+        grossProfitCents: cogsCents === null ? null : invoiceAmountExcludingTaxCents - cogsCents,
+        costingStatus: supplierPO?.costingStatus || 'Incomplete',
+        provisional: (supplierPO?.costingStatus || 'Incomplete') !== 'Completed',
+        issue,
+        review,
+        reviewReason: review ? `Review: ${reasons.join('; ')}.` : '',
+        supplierPONumber: supplierPO?.poNumber || ''
+      }
+    };
+  }));
+};
+
 module.exports = {
   SALES_ROLES,
   addCalendarDays,
@@ -209,5 +287,6 @@ module.exports = {
   invoiceRevenueExcludingTaxCents,
   paymentAmountForInvoiceCents,
   analyzeInvoicePerformance,
+  addFinanceCostingToInvoices,
   loadPerformanceForUsers
 };
