@@ -4,6 +4,7 @@ const companySnapshotDefinition = require('./schemas/companySnapshot');
 const poItemSchema = new mongoose.Schema({
   productName: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
+  partNumber: { type: String, trim: true, default: '' },
   quantity: { type: Number, required: true, min: 1 },
   unitPrice: { type: Number, required: true, min: 0 },
   totalAmount: { type: Number, required: true, min: 0 }

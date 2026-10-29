@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const grnItemSchema = new mongoose.Schema({
   productId: { type: String, default: '' },
   productName: { type: String, default: 'Item', trim: true },
+  partNumber: { type: String, trim: true, default: '' },
   orderedQty: { type: Number, default: 1, min: 0 },
   previouslyReceivedQty: { type: Number, default: 0 },
   receivedQty: { type: Number, default: 1, min: 0 },

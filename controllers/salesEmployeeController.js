@@ -52,6 +52,7 @@ const {
 const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
+const { calculateDocumentFinancials, normalizePartNumber } = require('../utils/documentFinancials');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -491,6 +492,7 @@ const normalizeQuotationItems = ({ items, productSummary, totalAmount, netAmount
     return {
       inventoryItem,
       sku: String(item.sku || '').trim(),
+      partNumber: normalizePartNumber(item),
       description: String(item.description || item.productName || '').trim(),
       quantity,
       unitPrice,
@@ -1173,8 +1175,6 @@ const createMyInvoice = async (req, res) => {
       fileNumber,
       fileType,
       items,
-      subtotal,
-      tax,
       taxRate,
       discount,
       amount,
@@ -1188,9 +1188,6 @@ const createMyInvoice = async (req, res) => {
 
     if (!clientName || !clientName.trim()) {
       return res.status(400).json({ success: false, message: 'Customer/Client name is required.' });
-    }
-    if (!amount || Number(amount) <= 0) {
-      return res.status(400).json({ success: false, message: 'A valid total invoice amount is required.' });
     }
     if (!dueDate) {
       return res.status(400).json({ success: false, message: 'Due date is required.' });
@@ -1221,6 +1218,7 @@ const createMyInvoice = async (req, res) => {
     let processedItems = [];
     if (Array.isArray(items) && items.length > 0) {
       processedItems = items.map(item => ({
+        partNumber: normalizePartNumber(item),
         description: item.description || 'Sales Item',
         quantity: Number(item.quantity) || 1,
         unitPrice: Number(item.unitPrice) || 0,
@@ -1228,6 +1226,7 @@ const createMyInvoice = async (req, res) => {
       }));
     } else {
       processedItems = [{
+        partNumber: '',
         description: dealTitle || 'Professional Sales / Project Services',
         quantity: 1,
         unitPrice: Number(amount),
@@ -1240,11 +1239,13 @@ const createMyInvoice = async (req, res) => {
 
     let resolvedSalePerson = req.body.salePerson || '';
     let resolvedSalesPersonId = null;
+    let resolvedSalesOrderId = salesOrderId || null;
+    let resolvedSalesOrderNumber = salesOrderNumber || '';
     let resolvedDeliveryNoteId = deliveryNoteId || null;
     let resolvedDeliveryNoteNumber = deliveryNoteNumber || '';
 
-    if (salesOrderId) {
-      const linkedSo = await SalesOrder.findById(salesOrderId).populate('salesPerson');
+    if (resolvedSalesOrderId) {
+      const linkedSo = await SalesOrder.findById(resolvedSalesOrderId).populate('salesPerson');
       if (linkedSo) {
         resolvedSalePerson = resolvedSalePerson || linkedSo.salePerson || (linkedSo.salesPerson && linkedSo.salesPerson.fullName) || '';
         resolvedSalesPersonId = linkedSo.salesPerson?._id || linkedSo.salesPerson || linkedSo.createdBy || null;
@@ -1258,13 +1259,18 @@ const createMyInvoice = async (req, res) => {
     if (resolvedDeliveryNoteId && (!resolvedSalesPersonId || !resolvedSalePerson)) {
       const linkedDn = await DeliveryNote.findById(resolvedDeliveryNoteId).populate('salesOrder');
       if (linkedDn) {
-        if (!salesOrderId && linkedDn.salesOrder) {
-          salesOrderId = linkedDn.salesOrder._id || linkedDn.salesOrder;
-          salesOrderNumber = linkedDn.salesOrderNumber || linkedDn.salesOrder.orderNumber || linkedDn.salesOrder.orderReference || '';
+        if (!resolvedSalesOrderId && linkedDn.salesOrder) {
+          resolvedSalesOrderId = linkedDn.salesOrder._id || linkedDn.salesOrder;
+          resolvedSalesOrderNumber = linkedDn.salesOrderNumber || linkedDn.salesOrder.orderNumber || linkedDn.salesOrder.orderReference || '';
         }
         resolvedSalePerson = resolvedSalePerson || linkedDn.salePerson || (linkedDn.salesOrder && (linkedDn.salesOrder.salePerson || (linkedDn.salesOrder.salesPerson && linkedDn.salesOrder.salesPerson.fullName))) || '';
         resolvedSalesPersonId = resolvedSalesPersonId || linkedDn.salesPerson || (linkedDn.salesOrder && (linkedDn.salesOrder.salesPerson?._id || linkedDn.salesOrder.salesPerson)) || null;
       }
+    }
+
+    const financials = calculateDocumentFinancials({ items: processedItems, discount, taxRate });
+    if (financials.grandTotal <= 0) {
+      return res.status(400).json({ success: false, message: 'A valid total invoice amount is required.' });
     }
 
     const invoice = await Invoice.create({
@@ -1276,21 +1282,22 @@ const createMyInvoice = async (req, res) => {
       dealId: dealId || null,
       dealTitle: dealTitle || '',
       saleReference: saleReference || '',
-      salesOrderId: salesOrderId || null,
-      salesOrderNumber: salesOrderNumber || '',
+      salesOrderId: resolvedSalesOrderId,
+      salesOrderNumber: resolvedSalesOrderNumber,
       poReference: normalizedPoReference,
       deliveryNoteId: resolvedDeliveryNoteId,
       deliveryNoteNumber: resolvedDeliveryNoteNumber,
       fileNumber: fileNumber || '',
       fileType: fileType || '',
-      items: processedItems,
-      subtotal: Number(subtotal) || Number(amount),
-      tax: Number(tax) || 0,
-      taxRate: Number(taxRate) || 0,
-      discount: Number(discount) || 0,
-      amount: Number(amount),
+      items: financials.items,
+      subtotal: financials.subtotal,
+      tax: financials.tax,
+      taxRate: financials.taxRate,
+      discount: financials.discount,
+      taxableAmount: financials.taxableAmount,
+      amount: financials.grandTotal,
       paidAmount: 0,
-      outstandingAmount: Number(amount),
+      outstandingAmount: financials.grandTotal,
       status: initialStatus,
       isDraft: isDraft,
       invoiceType: req.body.invoiceType || 'Standard',
@@ -1457,6 +1464,11 @@ const convertQuotationToCustomerPO = async (req, res) => {
       fileNumber: quotation.fileNo || '',
       fileType: quotation.fileType || '',
       amount: netAmt,
+      items: quotation.items,
+      subtotal: Number(quotation.totalAmount) || 0,
+      discount: Number(quotation.discount) || 0,
+      taxRate: Number(quotation.taxPercentage) || 0,
+      tax: Number(quotation.tax) || 0,
       notes: notes || quotation.notes || '',
       uploadedDocument: uploadedDocument || '',
       documentName: documentName || '',
@@ -1520,7 +1532,11 @@ const convertCustomerPOToProductFile = async (req, res) => {
         if (linkedQuotation.items && linkedQuotation.items.length) {
           quoteItems = linkedQuotation.items.map(it => ({
             name: it.description || 'Item',
+            partNumber: normalizePartNumber(it),
+            sku: it.sku || '',
             quantity: it.quantity || 1,
+            unitPrice: Number(it.unitPrice) || 0,
+            total: Number(it.total) || ((Number(it.quantity) || 1) * (Number(it.unitPrice) || 0)),
             unit: 'pcs',
             description: it.description || ''
           }));
@@ -1539,7 +1555,11 @@ const convertCustomerPOToProductFile = async (req, res) => {
       quotationNumber: quotationNumber,
       customerPOId: po._id,
       customerPONumber: po.poNumber || '',
-      products: Array.isArray(products) && products.length > 0 ? products : quoteItems,
+      products: (Array.isArray(products) && products.length > 0 ? products : quoteItems).map(item => ({
+        ...item,
+        partNumber: normalizePartNumber(item),
+        sku: item.sku || ''
+      })),
       notes: notes || po.notes || '',
       status: 'Active',
       owner: effectiveOwnerId(po),
@@ -1617,12 +1637,28 @@ const convertProductFileToSalesOrder = async (req, res) => {
 
     if (orderItems.length === 0 && file.products && file.products.length) {
       orderItems = file.products.map(p => ({
+        partNumber: normalizePartNumber(p),
+        sku: p.sku || '',
         description: p.description || p.name,
         quantity: p.quantity || 1,
         unitPrice: netAmt / (p.quantity || 1) || 0,
         total: netAmt || 0
       }));
     }
+
+    orderItems = orderItems.map(item => {
+      const source = typeof item?.toObject === 'function' ? item.toObject() : item;
+      return { ...source, partNumber: normalizePartNumber(source) };
+    });
+    const inheritedDiscount = discount !== undefined ? Number(discount) || 0 : Number(quoteRef?.discount) || 0;
+    const inheritedTaxRate = req.body.taxRate !== undefined
+      ? Number(req.body.taxRate) || 0
+      : Number(quoteRef?.taxPercentage) || 0;
+    const inheritedFinancials = calculateDocumentFinancials({
+      items: orderItems,
+      discount: inheritedDiscount,
+      taxRate: inheritedTaxRate
+    });
 
     const order = await SalesOrder.create({
       orderReference: orderReference?.trim() || (quoteRef ? quoteRef.orderReference : '') || '',
@@ -1636,11 +1672,12 @@ const convertProductFileToSalesOrder = async (req, res) => {
       clientEmail: clientEmail || (quoteRef ? quoteRef.clientEmail : '') || '',
       clientPhone: clientPhone || (quoteRef ? quoteRef.clientPhone : '') || '',
       items: orderItems,
-      totalAmount: Number(totalAmount) || netAmt,
-      discount: Number(discount) || 0,
-      tax: Number(tax) || 0,
-      netAmount: netAmt,
-      outstandingBalance: netAmt,
+      totalAmount: inheritedFinancials.subtotal || Number(totalAmount) || netAmt,
+      discount: inheritedFinancials.discount,
+      taxRate: inheritedFinancials.taxRate,
+      tax: inheritedFinancials.tax,
+      netAmount: inheritedFinancials.grandTotal || netAmt,
+      outstandingBalance: inheritedFinancials.grandTotal || netAmt,
       totalPaid: 0,
       status: 'Sales Order',
       workflowStatus: 'Draft',
@@ -1786,6 +1823,7 @@ const convertQuotationToSalesOrder = async (req, res) => {
       }],
       totalAmount: Number(quotation.totalAmount) || netAmt,
       discount: Number(quotation.discount) || 0,
+      taxRate: Number(quotation.taxPercentage) || 0,
       tax: Number(quotation.tax) || 0,
       netAmount: netAmt,
       outstandingBalance: netAmt,
@@ -2351,6 +2389,7 @@ const createMyOrder = async (req, res) => {
       items,
       totalAmount,
       discount,
+      taxRate,
       tax,
       netAmount,
       status,
@@ -2393,7 +2432,9 @@ const createMyOrder = async (req, res) => {
     const overdueInfo = await calculateCustomerOverdue(clientName);
     const requiresApproval = overdueInfo.isOverdue;
 
-    const netAmt = Number(netAmount) || Number(totalAmount) || 0;
+    const sourceOrderItems = items || (productSummary ? [{ description: productSummary, quantity: 1, unitPrice: Number(totalAmount || netAmount) || 0 }] : []);
+    const orderFinancials = calculateDocumentFinancials({ items: sourceOrderItems, discount, taxRate });
+    const netAmt = orderFinancials.grandTotal || Number(netAmount) || Number(totalAmount) || 0;
     const order = await SalesOrder.create({
       orderReference: orderReference?.trim() || '',
       clientName: clientName.trim(),
@@ -2405,10 +2446,11 @@ const createMyOrder = async (req, res) => {
       productSummary: productSummary?.trim() || '',
       clientEmail: clientEmail?.trim() || '',
       clientPhone: clientPhone?.trim() || '',
-      items: items || (productSummary ? [{ description: productSummary, quantity: 1, unitPrice: netAmt, total: netAmt }] : []),
-      totalAmount: Number(totalAmount) || netAmt,
-      discount: Number(discount) || 0,
-      tax: Number(tax) || 0,
+      items: orderFinancials.items,
+      totalAmount: orderFinancials.subtotal || Number(totalAmount) || netAmt,
+      discount: orderFinancials.discount,
+      taxRate: orderFinancials.taxRate,
+      tax: orderFinancials.tax,
       netAmount: netAmt,
       outstandingBalance: netAmt,
       totalPaid: 0,
@@ -3155,7 +3197,7 @@ const createMyDeliveryNote = async (req, res) => {
         }
         const unitPrice = Number(sourceItem.unitPrice) || 0;
         return {
-          product: line.item || 'Delivered Product', description: line.item || '', demand: line.requiredQty,
+          product: line.item || 'Delivered Product', description: line.item || '', partNumber: normalizePartNumber(sourceItem), demand: line.requiredQty,
           quantity, unit: line.inventoryItem.unit || 'Units', availability: 'Available',
           totalOrderedQty: line.orderedQty, orderItemId: line.orderItemId, orderItemIndex: line.itemIndex,
           inventoryItem: line.inventoryItem._id, unitPrice, lineTotal: quantity * unitPrice,
@@ -3835,7 +3877,7 @@ const updateMyInvoice = async (req, res) => {
       return res.status(400).json({ success: false, message: 'PO Reference cannot exceed 60 characters.' });
     }
 
-    const allowedFields = ['clientName', 'customerEmail', 'customerPhone', 'customerAddress', 'items', 'subtotal', 'tax', 'taxRate', 'discount', 'amount', 'paymentTerms', 'issueDate', 'dueDate', 'description', 'notes', 'status', 'salesOrderId', 'deliveryNoteId', 'fileNumber', 'fileType', 'paidAmount', 'outstandingAmount', 'poReference'];
+    const allowedFields = ['clientName', 'customerEmail', 'customerPhone', 'customerAddress', 'items', 'taxRate', 'discount', 'paymentTerms', 'issueDate', 'dueDate', 'description', 'notes', 'status', 'salesOrderId', 'deliveryNoteId', 'fileNumber', 'fileType', 'paidAmount', 'poReference'];
     allowedFields.forEach(field => {
       const newValue = field === 'poReference' ? normalizedPoReference : req.body[field];
       if (newValue !== undefined && hasFieldValueChanged(invoice[field], newValue)) {
@@ -3860,6 +3902,21 @@ const updateMyInvoice = async (req, res) => {
       const newValue = field === 'poReference' ? normalizedPoReference : req.body[field];
       if (newValue !== undefined) invoice[field] = newValue;
     });
+    if (req.body.items || req.body.discount !== undefined || req.body.taxRate !== undefined) {
+      const financials = calculateDocumentFinancials({
+        items: invoice.items,
+        discount: invoice.discount,
+        taxRate: invoice.taxRate
+      });
+      invoice.items = financials.items;
+      invoice.subtotal = financials.subtotal;
+      invoice.discount = financials.discount;
+      invoice.taxRate = financials.taxRate;
+      invoice.tax = financials.tax;
+      invoice.taxableAmount = financials.taxableAmount;
+      invoice.amount = financials.grandTotal;
+      invoice.outstandingAmount = Math.max(0, financials.grandTotal - (Number(invoice.paidAmount) || 0));
+    }
     if (req.body.status) invoice.status = req.body.status;
     await invoice.save();
     return res.status(200).json({ success: true, message: 'Invoice updated successfully.', data: invoice });
@@ -4143,6 +4200,11 @@ const createMyCustomerPO = async (req, res) => {
       fileType: linkedQuotation?.fileType || '',
       poDate: poDate ? new Date(poDate) : new Date(),
       amount: Number(amount) || 0,
+      items: linkedQuotation?.items || [],
+      subtotal: Number(linkedQuotation?.totalAmount) || 0,
+      discount: Number(linkedQuotation?.discount) || 0,
+      taxRate: Number(linkedQuotation?.taxPercentage) || 0,
+      tax: Number(linkedQuotation?.tax) || 0,
       notes: notes || '',
       uploadedDocument: uploadedDocument || '',
       documentName: documentName || '',
@@ -4278,7 +4340,16 @@ const createMyProductFile = async (req, res) => {
       customerPONumber: customerPO.poNumber || customerPONumber || '',
       salesOrderId: safeSalesOrderId,
       salesOrderNumber: salesOrderNumber || '',
-      products: Array.isArray(products) ? products : [],
+      products: (Array.isArray(products) && products.length ? products : (linkedQuotation?.items || []).map(item => ({
+        name: item.description || 'Item',
+        description: item.description || '',
+        quantity: item.quantity || 1,
+        unit: 'pcs',
+        unitPrice: Number(item.unitPrice) || 0,
+        total: Number(item.total) || 0,
+        sku: item.sku || '',
+        partNumber: normalizePartNumber(item)
+      }))).map(item => ({ ...item, partNumber: normalizePartNumber(item) })),
       notes: notes || '',
       owner: effectiveOwnerId(customerPO),
       createdBy: req.user._id
@@ -4318,7 +4389,12 @@ const updateMyProductFile = async (req, res) => {
     }
 
     const allowedFields = ['customerName', 'quotationNumber', 'customerPONumber', 'salesOrderNumber', 'products', 'notes', 'status'];
-    allowedFields.forEach(field => { if (req.body[field] !== undefined) pf[field] = req.body[field]; });
+    allowedFields.forEach(field => {
+      if (req.body[field] === undefined) return;
+      pf[field] = field === 'products'
+        ? req.body.products.map(item => ({ ...item, partNumber: normalizePartNumber(item) }))
+        : req.body[field];
+    });
 
     if (req.body.quotationId !== undefined) {
       pf.quotationId = req.body.quotationId && mongoose.Types.ObjectId.isValid(req.body.quotationId) ? req.body.quotationId : null;
@@ -5353,6 +5429,7 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         receiptItems.push({
           orderItemId: String(orderItem._id),
           productName: orderItem.description || 'Item',
+          partNumber: normalizePartNumber(orderItem),
           sku: submitted.sku || '',
           orderedQty,
           receivedQty,
@@ -5462,6 +5539,7 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         items: receiptItems.map(item => ({
           productId: String(item.inventoryItem || ''),
           productName: item.productName,
+          partNumber: item.partNumber || '',
           orderedQty: item.orderedQty,
           receivedQty: item.receivedQty,
           quantity: item.receivedQty,
@@ -5657,6 +5735,7 @@ const issueSupplierPO = async (req, res) => {
       const unitPrice = Number(item.unitPrice) || 0;
       return {
         productName: item.productName || item.description || 'Product Item',
+        partNumber: normalizePartNumber(item),
         description: item.description || '',
         quantity,
         unitPrice,
@@ -5711,6 +5790,7 @@ const issueSupplierPO = async (req, res) => {
       status: 'Issued',
       items: poItems.map(item => ({
         description: item.description || item.productName,
+        partNumber: item.partNumber || '',
         quantity: item.quantity,
         unitPrice: item.unitPrice,
         total: item.totalAmount
@@ -5922,6 +6002,7 @@ const addInventoryStock = async (req, res) => {
         items: [{
           productId: String(savedItem._id),
           productName: savedItem.name,
+          partNumber: order?.items?.[0] ? normalizePartNumber(order.items[0]) : (savedItem.sku || ''),
           orderedQty: 0,
           receivedQty: quantity,
           quantity,
@@ -5950,6 +6031,7 @@ const addInventoryStock = async (req, res) => {
           items: [{
             orderItemId: '',
             productName: savedItem.name,
+            partNumber: order?.items?.[0] ? normalizePartNumber(order.items[0]) : (savedItem.sku || ''),
             sku: savedItem.sku || '',
             orderedQty: 0,
             receivedQty: quantity,

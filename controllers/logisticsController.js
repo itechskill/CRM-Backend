@@ -7,6 +7,7 @@ const InventoryItem = require('../models/InventoryItem');
 const { createNotificationHelper, notifyRoleHelper } = require('./notificationController');
 const { getLogisticsDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
+const { normalizePartNumber } = require('../utils/documentFinancials');
 
 /**
  * @desc    Get real Logistics Dashboard statistics
@@ -707,7 +708,11 @@ const getLogisticsGRNs = async (req, res) => {
         { grnType: 'Supplier' },
         { grnType: { $exists: false } }
       ]
-    }).sort({ createdAt: -1 }).lean();
+    })
+      .populate('supplierPO')
+      .populate('salesOrder', 'orderNumber orderReference fileType issuingCompany items')
+      .sort({ createdAt: -1 })
+      .lean();
     return res.status(200).json({ success: true, count: grns.length, grns, data: grns });
   } catch (error) {
     console.error('[Get Logistics GRNs Error]:', error);
@@ -769,6 +774,7 @@ const createLogisticsGRN = async (req, res) => {
 
     const formattedItems = (Array.isArray(items) ? items : []).map(it => ({
       productName: it.productName || it.description || 'General Item',
+      partNumber: normalizePartNumber(it),
       orderedQty: Number(it.orderedQty) || Number(it.quantity) || 1,
       receivedQty: Number(it.receivedQty || it.quantityReceived || it.quantity) || 1,
       quantity: Number(it.quantity || it.quantityReceived || it.receivedQty) || 1,

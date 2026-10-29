@@ -19,6 +19,7 @@ const { activeReservations, inventoryStatusStage } = require('../utils/inventory
 const { getPurchaserDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
+const { normalizePartNumber } = require('../utils/documentFinancials');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -322,6 +323,7 @@ exports.createSupplierPO = async (req, res) => {
       subtotal = roundMoney(subtotal + itemTotal);
       return {
         productName: item.productName || item.description || 'Product Item',
+        partNumber: normalizePartNumber(item),
         description: item.description || '',
         quantity: qty,
         unitPrice: price,
@@ -859,9 +861,13 @@ exports.deleteSupplierPO = async (req, res) => {
 exports.getPurchaserGRNs = async (req, res) => {
   try {
     const { grnType, search } = req.query;
-    const filter = { grnType: 'Supplier' };
-    if (grnType && grnType !== 'Supplier') {
-      return res.status(200).json({ success: true, count: 0, data: [], grns: [] });
+    const requestedType = req.query.subDept || req.query.type || (req.user.role === 'purchaser' ? (req.user.purchaserSubDept === 'Global' ? 'Global' : 'Local') : null);
+    const filter = {};
+    if (requestedType === 'Local' || requestedType === 'Global') {
+      const poIds = await SupplierPO.find({ poType: requestedType }).distinct('_id');
+      filter.$or = [{ supplierPO: { $in: poIds } }, { supplierPOId: { $in: poIds } }];
+    } else if (grnType) {
+      filter.grnType = grnType;
     }
     if (search) {
       filter.$or = [
@@ -875,7 +881,8 @@ exports.getPurchaserGRNs = async (req, res) => {
       : { path: 'supplierPO' };
     const grns = await PurchaserGRN.find(filter)
       .populate(supplierPOPopulate)
-      .populate('supplier salesOrder')
+      .populate('supplier')
+      .populate('salesOrder', 'orderNumber orderReference fileType issuingCompany items')
       .sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: grns.length, data: grns, grns });
   } catch (error) {
@@ -1786,6 +1793,7 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       calculatedTotal = roundMoney(calculatedTotal + totalAmount);
       return {
         productName: item.productName || item.description || 'Product Item',
+        partNumber: normalizePartNumber(item),
         description: item.description || '',
         quantity,
         unitPrice,
@@ -1848,6 +1856,7 @@ exports.completeProcurementAndSendToSupport = async (req, res) => {
       status: 'Issued',
       items: poItems.map(item => ({
         description: item.description || item.productName,
+        partNumber: item.partNumber || '',
         quantity: item.quantity,
         unitPrice: item.unitPrice,
         total: item.totalAmount
@@ -1951,6 +1960,7 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       subtotal = roundMoney(subtotal + totalAmount);
       return {
         productName: item.productName || item.description || 'Product Item',
+        partNumber: normalizePartNumber(item),
         description: item.description || '', quantity, unitPrice, totalAmount
       };
     });
@@ -1966,7 +1976,7 @@ exports.globalProcurementSendToLogistics = async (req, res) => {
       issueDate: new Date(),
       status: 'Issued',
       items: poItems.map(item => ({
-        description: item.description || item.productName, quantity: item.quantity,
+        description: item.description || item.productName, partNumber: item.partNumber || '', quantity: item.quantity,
         unitPrice: item.unitPrice, total: item.totalAmount
       })),
       subtotal,
