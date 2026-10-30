@@ -1,8 +1,9 @@
 const roundMoney = value => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
-const normalizePartNumber = item => String(
-  item?.partNumber || item?.sku || item?.productCode || ''
-).trim();
+// A SKU/product code is not a part number.  Keep the two identifiers distinct so
+// document lineage can recover a real part number without printing a misleading
+// SKU in the Part Number column.
+const normalizePartNumber = item => String(item?.partNumber || '').trim();
 
 const normalizeCommercialItems = (items = []) => (Array.isArray(items) ? items : []).map(item => {
   const source = typeof item?.toObject === 'function' ? item.toObject() : (item || {});

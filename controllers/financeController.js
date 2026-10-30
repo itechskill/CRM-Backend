@@ -8,6 +8,7 @@ const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../util
 const { getFinanceDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { calculateDocumentFinancials } = require('../utils/documentFinancials');
 const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
+const { resolveDocumentsPartNumbers } = require('../utils/documentPartNumbers');
 
 const getFinanceDashboardStats = async (req, res) => {
   try {
@@ -44,7 +45,8 @@ const getInvoices = async (req, res) => {
     const data = ['finance', 'admin', 'ceo'].includes(req.user.role)
       ? await addFinanceCostingToInvoices(invoices)
       : invoices;
-    return res.status(200).json({ success: true, count: invoices.length, data });
+    const resolvedData = await resolveDocumentsPartNumbers(data, 'invoice');
+    return res.status(200).json({ success: true, count: invoices.length, data: resolvedData });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error retrieving invoices.' });
   }

@@ -53,6 +53,7 @@ const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 const { calculateDocumentFinancials, normalizePartNumber, normalizeCommercialItems } = require('../utils/documentFinancials');
+const { resolveDocumentPartNumbers, resolveDocumentsPartNumbers } = require('../utils/documentPartNumbers');
 const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
 
 // ─────────────────────────────────────────────
@@ -1145,10 +1146,11 @@ const getMyInvoices = async (req, res) => {
     const responseInvoices = ['finance', 'admin', 'ceo'].includes(req.user.role)
       ? await addFinanceCostingToInvoices(invoices)
       : invoices;
+    const invoicesWithPartNumbers = await resolveDocumentsPartNumbers(responseInvoices, 'invoice');
     return res.status(200).json({
       success: true,
       count: invoices.length,
-      data: serializeMonetaryVisibility(responseInvoices, req.user, 'invoices'),
+      data: serializeMonetaryVisibility(invoicesWithPartNumbers, req.user, 'invoices'),
       eligibleWonSales: {
         deals: serializeMonetaryVisibility(eligibleDeals, req.user, 'deals'),
         orders: serializeMonetaryVisibility(eligibleOrders, req.user, 'sales-orders')
@@ -1221,26 +1223,6 @@ const createMyInvoice = async (req, res) => {
     const count = await Invoice.countDocuments();
     const invoiceNumber = `INV-${String(count + 1001).padStart(5, '0')}`;
 
-    // Process line items if provided
-    let processedItems = [];
-    if (Array.isArray(items) && items.length > 0) {
-      processedItems = items.map(item => ({
-        partNumber: normalizePartNumber(item),
-        description: item.description || 'Sales Item',
-        quantity: Number(item.quantity) || 1,
-        unitPrice: Number(item.unitPrice) || 0,
-        total: Number(item.total) || ((Number(item.quantity) || 1) * (Number(item.unitPrice) || 0))
-      }));
-    } else {
-      processedItems = [{
-        partNumber: '',
-        description: dealTitle || 'Professional Sales / Project Services',
-        quantity: 1,
-        unitPrice: Number(amount),
-        total: Number(amount)
-      }];
-    }
-
     const initialStatus = status || 'Draft';
     const isDraft = initialStatus === 'Draft' || initialStatus === 'Pending Finance Finalization' || req.body.isDraft !== false;
 
@@ -1250,10 +1232,13 @@ const createMyInvoice = async (req, res) => {
     let resolvedSalesOrderNumber = salesOrderNumber || '';
     let resolvedDeliveryNoteId = deliveryNoteId || null;
     let resolvedDeliveryNoteNumber = deliveryNoteNumber || '';
+    let linkedSalesOrder = null;
+    let linkedDeliveryNote = null;
 
     if (resolvedSalesOrderId) {
       const linkedSo = await SalesOrder.findById(resolvedSalesOrderId).populate('salesPerson');
       if (linkedSo) {
+        linkedSalesOrder = linkedSo;
         resolvedSalePerson = resolvedSalePerson || linkedSo.salePerson || (linkedSo.salesPerson && linkedSo.salesPerson.fullName) || '';
         resolvedSalesPersonId = linkedSo.salesPerson?._id || linkedSo.salesPerson || linkedSo.createdBy || null;
         if (!resolvedDeliveryNoteId && linkedSo.deliveryNoteId) {
@@ -1266,6 +1251,8 @@ const createMyInvoice = async (req, res) => {
     if (resolvedDeliveryNoteId && (!resolvedSalesPersonId || !resolvedSalePerson)) {
       const linkedDn = await DeliveryNote.findById(resolvedDeliveryNoteId).populate('salesOrder');
       if (linkedDn) {
+        linkedDeliveryNote = linkedDn;
+        if (linkedDn.salesOrder && typeof linkedDn.salesOrder === 'object') linkedSalesOrder = linkedDn.salesOrder;
         if (!resolvedSalesOrderId && linkedDn.salesOrder) {
           resolvedSalesOrderId = linkedDn.salesOrder._id || linkedDn.salesOrder;
           resolvedSalesOrderNumber = linkedDn.salesOrderNumber || linkedDn.salesOrder.orderNumber || linkedDn.salesOrder.orderReference || '';
@@ -1275,7 +1262,37 @@ const createMyInvoice = async (req, res) => {
       }
     }
 
-    const financials = calculateDocumentFinancials({ items: processedItems, discount, taxRate });
+    const submittedItems = Array.isArray(items) && items.length > 0
+      ? items
+      : (linkedDeliveryNote?.items?.length ? linkedDeliveryNote.items : linkedSalesOrder?.items);
+    const processedItems = Array.isArray(submittedItems) && submittedItems.length > 0
+      ? submittedItems.map((item, index) => {
+          const sourceItem = linkedSalesOrder?.items?.find(candidate =>
+            item.orderItemId && String(candidate._id) === String(item.orderItemId)
+          ) || linkedSalesOrder?.items?.[Number(item.orderItemIndex)] || linkedSalesOrder?.items?.[index];
+          return {
+            partNumber: normalizePartNumber(item) || normalizePartNumber(sourceItem),
+            description: item.description || item.product || sourceItem?.description || 'Sales Item',
+            quantity: Number(item.quantity) || Number(item.demand) || 1,
+            unitPrice: Number(item.unitPrice ?? sourceItem?.unitPrice) || 0,
+            total: Number(item.total ?? item.lineTotal) || ((Number(item.quantity || item.demand) || 1) * (Number(item.unitPrice ?? sourceItem?.unitPrice) || 0))
+          };
+        })
+      : [{
+          partNumber: '',
+          description: dealTitle || 'Professional Sales / Project Services',
+          quantity: 1,
+          unitPrice: Number(amount),
+          total: Number(amount)
+        }];
+    const sourceDiscount = linkedDeliveryNote?.discount ?? linkedSalesOrder?.discount ?? 0;
+    const effectiveDiscount = discount === undefined || discount === null || discount === '' ? sourceDiscount : discount;
+    const sourceTaxable = Math.max(0, Number(linkedDeliveryNote?.subtotal || linkedSalesOrder?.totalAmount) - Number(sourceDiscount || 0));
+    const sourceTaxRate = linkedSalesOrder?.taxRate ?? (sourceTaxable > 0 && linkedDeliveryNote?.tax
+      ? Number(linkedDeliveryNote.tax) / sourceTaxable * 100
+      : 0);
+    const effectiveTaxRate = taxRate === undefined || taxRate === null || taxRate === '' ? sourceTaxRate : taxRate;
+    const financials = calculateDocumentFinancials({ items: processedItems, discount: effectiveDiscount, taxRate: effectiveTaxRate });
     if (financials.grandTotal <= 0) {
       return res.status(400).json({ success: false, message: 'A valid total invoice amount is required.' });
     }
@@ -2375,6 +2392,7 @@ const getMyOrders = async (req, res) => {
       }));
     }
 
+    responseOrders = await resolveDocumentsPartNumbers(responseOrders, 'sales-order');
     return res.status(200).json({ success: true, count: orders.length, data: serializeMonetaryVisibility(responseOrders, req.user, 'sales-orders') });
   } catch (error) {
     console.error('[Get Orders Error]:', error);
@@ -3144,7 +3162,8 @@ const getMyDeliveryNotes = async (req, res) => {
     const notes = await DeliveryNote.find(filter)
       .populate('salesOrder', 'orderNumber orderReference clientName netAmount totalAmount discount tax items clientEmail clientPhone clientAddress fileNo fileType salePerson issuingCompany')
       .sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, count: notes.length, data: serializeMonetaryVisibility(notes, req.user, 'delivery-notes') });
+    const resolvedNotes = await resolveDocumentsPartNumbers(notes, 'delivery-note');
+    return res.status(200).json({ success: true, count: notes.length, data: serializeMonetaryVisibility(resolvedNotes, req.user, 'delivery-notes') });
   } catch (error) {
     console.error('[Get Delivery Notes Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching delivery notes.' });
@@ -5459,6 +5478,7 @@ const recordGoodsReceivedInOffice = async (req, res) => {
             const created = await InventoryItem.create([{
               name: newName,
               sku: newSku,
+              partNumber: normalizePartNumber(orderItem) || normalizePartNumber(supplierPOLine),
               category: String(newProduct.category || (order.fileType === 'Blue' ? 'Imported Goods' : 'General')).trim(),
               unit: String(newProduct.unit || 'pcs').trim(),
               quantityOnHand: 0,
@@ -5982,7 +6002,7 @@ const getInventoryItems = async (req, res) => {
     if (status && status !== 'all') query.status = status;
     if (search && search.trim()) {
       const regex = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      query.$or = [{ name: regex }, { sku: regex }, { category: regex }, { location: regex }];
+      query.$or = [{ name: regex }, { sku: regex }, { partNumber: regex }, { category: regex }, { location: regex }];
     }
     const items = await InventoryItem.find(query).sort({ updatedAt: -1 });
     return res.status(200).json({ success: true, count: items.length, data: serializeMonetaryVisibility(items, req.user, 'inventory-items') });
@@ -5994,7 +6014,7 @@ const getInventoryItems = async (req, res) => {
 
 const createOrUpdateInventoryItem = async (req, res) => {
   try {
-    const { id, name, sku, category, unit, quantityOnHand, minStockLevel, unitPrice, location, description } = req.body;
+    const { id, name, sku, partNumber, category, unit, quantityOnHand, minStockLevel, unitPrice, location, description } = req.body;
     if (!name) return res.status(400).json({ success: false, message: 'Product name is required.' });
 
     const inventoryItems = await InventoryItem.find(id ? { _id: { $ne: id } } : {});
@@ -6014,7 +6034,7 @@ const createOrUpdateInventoryItem = async (req, res) => {
     let item;
     const maySetPrice = req.user.role === 'admin';
     if (id) {
-      const update = { name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, location, description };
+      const update = { name, sku, partNumber: String(partNumber || '').trim(), category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, location, description };
       if (maySetPrice) update.unitPrice = Number(unitPrice) || 0;
       item = await InventoryItem.findByIdAndUpdate(
         id,
@@ -6023,7 +6043,7 @@ const createOrUpdateInventoryItem = async (req, res) => {
       );
     } else {
       item = await InventoryItem.create({
-        name, sku, category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5,
+        name, sku, partNumber: String(partNumber || '').trim(), category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5,
         unitPrice: maySetPrice ? (Number(unitPrice) || 0) : 0, location, description
       });
     }
@@ -6096,7 +6116,7 @@ const addInventoryStock = async (req, res) => {
         items: [{
           productId: String(savedItem._id),
           productName: savedItem.name,
-          partNumber: order?.items?.[0] ? normalizePartNumber(order.items[0]) : (savedItem.sku || ''),
+          partNumber: order?.items?.[0] ? normalizePartNumber(order.items[0]) : normalizePartNumber(savedItem),
           orderedQty: 0,
           receivedQty: quantity,
           quantity,
@@ -6125,7 +6145,7 @@ const addInventoryStock = async (req, res) => {
           items: [{
             orderItemId: '',
             productName: savedItem.name,
-            partNumber: order?.items?.[0] ? normalizePartNumber(order.items[0]) : (savedItem.sku || ''),
+            partNumber: order?.items?.[0] ? normalizePartNumber(order.items[0]) : normalizePartNumber(savedItem),
             sku: savedItem.sku || '',
             orderedQty: 0,
             receivedQty: quantity,
@@ -6487,7 +6507,7 @@ const getAccountsPendingDeliveryNotes = async (req, res) => {
     return res.status(200).json({
       success: true,
       count: deliveryNotes.length,
-      data: deliveryNotes
+      data: await resolveDocumentsPartNumbers(deliveryNotes, 'delivery-note')
     });
   } catch (error) {
     console.error('[Get Accounts Pending Delivery Notes Error]:', error);
@@ -6946,12 +6966,17 @@ const getOrderDocumentPackage = async (req, res) => {
 
     const isComplete = missingDocuments.length === 0;
 
+    const [resolvedOrder, resolvedInvoice, resolvedDeliveryNote] = await Promise.all([
+      resolveDocumentPartNumbers(order, 'sales-order'),
+      resolveDocumentPartNumbers(invoice, 'invoice'),
+      resolveDocumentPartNumbers(deliveryNote, 'delivery-note')
+    ]);
     return res.status(200).json({
       success: true,
       data: serializeMonetaryVisibility({
-        order,
-        invoice,
-        deliveryNote,
+        order: resolvedOrder,
+        invoice: resolvedInvoice,
+        deliveryNote: resolvedDeliveryNote,
         undertaking,
         goodsDeclaration,
         validation: {
