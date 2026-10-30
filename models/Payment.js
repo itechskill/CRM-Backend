@@ -44,6 +44,11 @@ const PaymentSchema = new mongoose.Schema(
 );
 
 // Auto-generate payment reference number before save
+PaymentSchema.index({ invoiceId: 1, paymentDate: 1 });
+PaymentSchema.index({ 'allocations.invoiceId': 1, paymentDate: 1 });
+PaymentSchema.index({ salesOrderId: 1, paymentDate: 1 });
+PaymentSchema.index({ 'allocations.salesOrderId': 1, paymentDate: 1 });
+
 PaymentSchema.pre('save', async function (next) {
   if (this.isNew && !this.receiptVoucherNumber) {
     this.receiptVoucherNumber = await allocateReceiptVoucherNumber(this.$session());

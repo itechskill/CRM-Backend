@@ -307,6 +307,10 @@ const SalesOrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+SalesOrderSchema.index({ owner: 1, createdAt: -1 });
+SalesOrderSchema.index({ createdBy: 1, createdAt: -1 });
+SalesOrderSchema.index({ currentDepartment: 1, workflowStatus: 1, updatedAt: -1 });
+
 SalesOrderSchema.pre('save', async function (next) {
   if (this.isNew) {
     const { allocateSalesOrderNumber } = require('../utils/salesOrderNumber');

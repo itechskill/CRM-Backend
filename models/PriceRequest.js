@@ -11,6 +11,23 @@ const PRICE_REQUEST_CATEGORIES = [
 const PRICE_REQUEST_CURRENCIES = ['PKR', 'USD', 'EUR', 'AED', 'GBP'];
 const PRICE_REQUEST_LEAD_SOURCES = ['WhatsApp', 'Email', 'Phone call', 'Other'];
 
+const priceRequestItemSchema = new mongoose.Schema({
+  brand: { type: String, required: true, trim: true, maxlength: 80 },
+  category: { type: String, enum: PRICE_REQUEST_CATEGORIES, required: true },
+  isBulk: { type: Boolean, default: false },
+  partNumber: { type: String, trim: true, maxlength: 160, default: '' },
+  requirement: { type: String, required: true, trim: true, maxlength: 4000 },
+  quantity: { type: Number, min: 1, required: true },
+  unitPriceCents: {
+    type: Number, min: 0, default: null,
+    validate: { validator: value => value == null || Number.isSafeInteger(value), message: 'Unit price must be stored as integer cents.' }
+  },
+  totalPriceCents: {
+    type: Number, min: 0, default: null,
+    validate: { validator: value => value == null || Number.isSafeInteger(value), message: 'Total price must be stored as integer cents.' }
+  }
+});
+
 const priceRequestEventSchema = new mongoose.Schema(
   {
     action: {
@@ -42,6 +59,11 @@ const priceRequestSchema = new mongoose.Schema(
     partNumber: { type: String, trim: true, maxlength: 160, default: '' },
     requirement: { type: String, required: true, trim: true, maxlength: 4000 },
     quantity: { type: Number, min: 1, default: 1 },
+    items: {
+      type: [priceRequestItemSchema],
+      default: undefined,
+      validate: { validator: items => items == null || (items.length >= 1 && items.length <= 50), message: 'A Price Request must contain between 1 and 50 items.' }
+    },
     status: { type: String, enum: PRICE_REQUEST_STATUSES, default: 'Pending', index: true },
     pendingNote: { type: String, trim: true, maxlength: 1000, default: '' },
     unitPriceCents: {
@@ -53,6 +75,8 @@ const priceRequestSchema = new mongoose.Schema(
       },
       default: null
     },
+    totalPriceCents: { type: Number, min: 0, default: null },
+    grandTotalCents: { type: Number, min: 0, default: null },
     currency: { type: String, enum: [...PRICE_REQUEST_CURRENCIES, null], default: null },
     validityDate: { type: Date, default: null },
     leadTime: { type: String, trim: true, maxlength: 200, default: '' },
@@ -66,6 +90,7 @@ const priceRequestSchema = new mongoose.Schema(
 
 priceRequestSchema.index({ status: 1, requestedFrom: 1, createdAt: -1 });
 priceRequestSchema.index({ status: 1, category: 1, createdAt: -1 });
+priceRequestSchema.index({ 'items.brand': 1, 'items.category': 1 });
 
 const PriceRequest = mongoose.model('PriceRequest', priceRequestSchema);
 

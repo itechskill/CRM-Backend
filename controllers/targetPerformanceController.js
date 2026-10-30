@@ -1,6 +1,6 @@
 const User = require('../models/User');
 const TargetPerformanceSetting = require('../models/TargetPerformanceSetting');
-const { SALES_ROLES, loadPerformanceForUsers, monthRange } = require('../utils/targetPerformance');
+const { SALES_ROLES, loadPerformanceForUsers, monthRange, invalidateTargetPerformanceCache } = require('../utils/targetPerformance');
 
 const getSetting = async () => {
   const setting = await TargetPerformanceSetting.findOne({ key: 'global' }).lean();
@@ -36,21 +36,25 @@ const getMyTargetPerformance = async (req, res) => {
 
 const getAdminTargetPerformance = async (req, res) => {
   try {
-    const users = await User.find({ role: { $in: SALES_ROLES }, status: 'active' })
-      .select('_id fullName email role monthlySalesSalaryCents')
-      .sort({ fullName: 1 })
-      .lean();
+    const [users, setting] = await Promise.all([
+      User.find({ role: { $in: SALES_ROLES }, status: 'active' })
+        .select('_id fullName email role monthlySalesSalaryCents')
+        .sort({ fullName: 1 })
+        .lean(),
+      getSetting()
+    ]);
     const rows = await loadPerformanceForUsers({ users, month: req.query.month });
     const salaryVisible = req.user.role === 'admin';
-    const data = salaryVisible ? rows : rows.map(row => ({
+    const presentationRows = rows.map(row => ({
       ...row,
-      salaryCents: null,
-      targetCents: null,
-      performancePercent: null
+      invoices: row.invoices.filter(invoice => invoice.needsFinance || invoice.costChangedAfterCredit)
+    }));
+    const data = salaryVisible ? presentationRows : presentationRows.map(row => ({
+      ...row, salaryCents: null, targetCents: null, performancePercent: null
     }));
     return res.status(200).json({
       success: true,
-      data: { setting: await getSetting(), salaryVisible, month: monthRange(req.query.month).key, salespeople: data }
+      data: { setting, salaryVisible, month: monthRange(req.query.month).key, salespeople: data }
     });
   } catch (error) {
     console.error('[Admin Target Performance Error]:', error);
@@ -70,6 +74,7 @@ const updateSalary = async (req, res) => {
       { new: true, runValidators: true }
     ).select('_id fullName email role monthlySalesSalaryCents');
     if (!user) return res.status(404).json({ success: false, message: 'Salesperson not found.' });
+    invalidateTargetPerformanceCache();
     return res.status(200).json({ success: true, data: user });
   } catch (error) {
     console.error('[Update Target Salary Error]:', error);
@@ -87,6 +92,7 @@ const updateVisibility = async (req, res) => {
       { $set: { showToSalespeople: req.body.showToSalespeople, updatedBy: req.user._id } },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
+    invalidateTargetPerformanceCache();
     return res.status(200).json({ success: true, data: setting });
   } catch (error) {
     console.error('[Update Target Performance Visibility Error]:', error);

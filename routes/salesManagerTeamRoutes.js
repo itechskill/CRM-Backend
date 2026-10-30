@@ -42,6 +42,7 @@ const logAudit = require('../utils/auditLogger');
 const { getSalesManagerScope, inferBranchOrCity } = require('../utils/salesManagerScope');
 const { ownerScope, ownsSalesRecord } = require('../utils/salesOwnership');
 const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
+const { loadSalesOrderWorkflow } = require('../utils/salesOrderActivity');
 
 const ownersScope = (memberIds) => ({
   $or: [
@@ -1220,7 +1221,12 @@ router.get('/all-orders', managerGuard, async (req, res) => {
       .populate('customerPOId')
       .populate('productFileId')
       .sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, count: orders.length, data: orders });
+    const workflowByOrder = await loadSalesOrderWorkflow(orders);
+    const data = orders.map(order => ({
+      ...order.toObject(),
+      workflowSummary: workflowByOrder.get(String(order._id)) || null
+    }));
+    return res.status(200).json({ success: true, count: data.length, data });
   } catch (error) {
     console.error('[Sales Manager Get All Orders Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error retrieving orders.' });

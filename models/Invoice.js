@@ -63,6 +63,9 @@ const InvoiceSchema = new mongoose.Schema({
   timestamps: true
 });
 
+InvoiceSchema.index({ salesOrderId: 1, status: 1, isDraft: 1 });
+InvoiceSchema.index({ issueDate: 1, createdAt: 1 });
+
 InvoiceSchema.pre('validate', async function (next) {
   if (this.items?.length && (this.isNew || this.isModified('items') || this.isModified('discount') || this.isModified('taxRate'))) {
     const financials = calculateDocumentFinancials({

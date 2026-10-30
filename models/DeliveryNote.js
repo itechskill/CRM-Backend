@@ -80,6 +80,9 @@ const DeliveryNoteSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+DeliveryNoteSchema.index({ salesOrder: 1, invoiced: 1, createdAt: -1 });
+DeliveryNoteSchema.index({ invoiceId: 1 });
+
 DeliveryNoteSchema.pre('save', async function () {
   if (!this.deliveryNumber) {
     const num = await allocateDeliveryNoteNumber(this.$session());
