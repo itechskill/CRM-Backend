@@ -52,7 +52,7 @@ const {
 const { getSalesDashboardMetrics } = require('../utils/salesDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
-const { calculateDocumentFinancials, normalizePartNumber } = require('../utils/documentFinancials');
+const { calculateDocumentFinancials, normalizePartNumber, normalizeCommercialItems } = require('../utils/documentFinancials');
 const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
 
 // ─────────────────────────────────────────────
@@ -502,21 +502,23 @@ const normalizeQuotationItems = ({ items, productSummary, totalAmount, netAmount
   });
 };
 
-const quotationFinancials = ({ items, discount, discountPercentage, taxPercentage }) => {
-  const subtotal = Math.round(items.reduce((sum, item) => sum + (Number(item.total) || 0), 0) * 100) / 100;
-  const discountPct = Math.max(0, Math.min(100, Number(discountPercentage) || 0));
-  const requestedDiscount = Math.max(0, Number(discount) || 0);
-  const discountAmount = Math.min(subtotal, requestedDiscount || Math.round(subtotal * discountPct) / 100);
-  const gstPercentage = Math.max(0, Math.min(100, Number(taxPercentage) || 0));
-  const taxableBase = Math.max(0, subtotal - discountAmount);
-  const tax = Math.round(taxableBase * gstPercentage) / 100;
+const quotationFinancials = ({ items, discount, taxPercentage }) => {
+  const financials = calculateDocumentFinancials({
+    items,
+    discount: discount === '' || discount === null ? 0 : discount,
+    taxRate: taxPercentage === '' || taxPercentage === null ? 0 : taxPercentage
+  });
+  const discountPercentage = financials.subtotal > 0
+    ? Math.round((financials.discount / financials.subtotal) * 10000) / 100
+    : 0;
   return {
-    totalAmount: subtotal,
-    discount: discountAmount,
-    discountPercentage: discountPct,
-    tax,
-    taxPercentage: gstPercentage,
-    netAmount: Math.round((taxableBase + tax) * 100) / 100
+    items: financials.items,
+    totalAmount: financials.subtotal,
+    discount: financials.discount,
+    discountPercentage,
+    tax: financials.tax,
+    taxPercentage: financials.taxRate,
+    netAmount: financials.grandTotal
   };
 };
 
@@ -1677,12 +1679,12 @@ const convertProductFileToSalesOrder = async (req, res) => {
       clientEmail: clientEmail || (quoteRef ? quoteRef.clientEmail : '') || '',
       clientPhone: clientPhone || (quoteRef ? quoteRef.clientPhone : '') || '',
       items: orderItems,
-      totalAmount: inheritedFinancials.subtotal || Number(totalAmount) || netAmt,
+      totalAmount: inheritedFinancials.subtotal,
       discount: inheritedFinancials.discount,
       taxRate: inheritedFinancials.taxRate,
       tax: inheritedFinancials.tax,
-      netAmount: inheritedFinancials.grandTotal || netAmt,
-      outstandingBalance: inheritedFinancials.grandTotal || netAmt,
+      netAmount: inheritedFinancials.grandTotal,
+      outstandingBalance: inheritedFinancials.grandTotal,
       totalPaid: 0,
       status: 'Sales Order',
       workflowStatus: 'Draft',
@@ -2005,7 +2007,6 @@ const createMyQuotation = async (req, res) => {
     const financials = quotationFinancials({
       items: normalizedItems,
       discount,
-      discountPercentage,
       taxPercentage: taxPercentage === undefined ? 18 : taxPercentage
     });
 
@@ -2073,13 +2074,6 @@ const updateMyQuotation = async (req, res) => {
       'clientEmail',
       'clientPhone',
       'clientAddress',
-      'items',
-      'totalAmount',
-      'discount',
-      'discountPercentage',
-      'tax',
-      'taxPercentage',
-      'netAmount',
       'status',
       'validUntil',
       'creationDate',
@@ -2104,7 +2098,7 @@ const updateMyQuotation = async (req, res) => {
       quotation.creationDate = new Date(req.body.creationDate);
     }
 
-    const financialFields = ['items', 'discount', 'discountPercentage', 'taxPercentage'];
+    const financialFields = ['items', 'discount', 'taxPercentage'];
     if (financialFields.some(field => req.body[field] !== undefined)) {
       const normalizedItems = normalizeQuotationItems({
         items: req.body.items !== undefined ? req.body.items : quotation.items,
@@ -2115,10 +2109,8 @@ const updateMyQuotation = async (req, res) => {
       const financials = quotationFinancials({
         items: normalizedItems,
         discount: req.body.discount !== undefined ? req.body.discount : quotation.discount,
-        discountPercentage: req.body.discountPercentage !== undefined ? req.body.discountPercentage : quotation.discountPercentage,
         taxPercentage: req.body.taxPercentage !== undefined ? req.body.taxPercentage : quotation.taxPercentage
       });
-      quotation.items = normalizedItems;
       Object.assign(quotation, financials);
       quotation.productSummary = normalizedItems.map(item => item.description).filter(Boolean).join(', ');
     }
@@ -2454,7 +2446,7 @@ const createMyOrder = async (req, res) => {
 
     const sourceOrderItems = items || (productSummary ? [{ description: productSummary, quantity: 1, unitPrice: Number(totalAmount || netAmount) || 0 }] : []);
     const orderFinancials = calculateDocumentFinancials({ items: sourceOrderItems, discount, taxRate });
-    const netAmt = orderFinancials.grandTotal || Number(netAmount) || Number(totalAmount) || 0;
+    const netAmt = orderFinancials.grandTotal;
     const order = await SalesOrder.create({
       orderReference: orderReference?.trim() || '',
       clientName: clientName.trim(),
@@ -2467,7 +2459,7 @@ const createMyOrder = async (req, res) => {
       clientEmail: clientEmail?.trim() || '',
       clientPhone: clientPhone?.trim() || '',
       items: orderFinancials.items,
-      totalAmount: orderFinancials.subtotal || Number(totalAmount) || netAmt,
+      totalAmount: orderFinancials.subtotal,
       discount: orderFinancials.discount,
       taxRate: orderFinancials.taxRate,
       tax: orderFinancials.tax,
@@ -2822,10 +2814,10 @@ const updateMyOrder = async (req, res) => {
     const changes = {};
     const allowedFields = [
       'orderReference', 'orderNumber', 'clientName', 'clientAddress', 'salePerson', 'suggestedFileType',
-      'productSummary', 'clientEmail', 'clientPhone', 'items', 'totalAmount', 'discount',
-      'tax', 'netAmount', 'status', 'deliveryDate', 'creationDate', 'notes',
+      'productSummary', 'clientEmail', 'clientPhone', 'items', 'discount', 'taxRate',
+      'status', 'deliveryDate', 'creationDate', 'notes',
       'stockStatus', 'deliveryStatus', 'invoiceStatus', 'invoiceNumber',
-      'paymentStatus', 'totalPaid', 'outstandingBalance'
+      'paymentStatus', 'totalPaid'
     ];
 
     allowedFields.forEach(field => {
@@ -2850,6 +2842,21 @@ const updateMyOrder = async (req, res) => {
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) order[field] = req.body[field];
     });
+
+    if (req.body.items !== undefined || req.body.discount !== undefined || req.body.taxRate !== undefined) {
+      const financials = calculateDocumentFinancials({
+        items: req.body.items !== undefined ? req.body.items : order.items,
+        discount: req.body.discount !== undefined ? req.body.discount : order.discount,
+        taxRate: req.body.taxRate !== undefined ? req.body.taxRate : order.taxRate
+      });
+      order.items = financials.items;
+      order.totalAmount = financials.subtotal;
+      order.discount = financials.discount;
+      order.taxRate = financials.taxRate;
+      order.tax = financials.tax;
+      order.netAmount = financials.grandTotal;
+      order.outstandingBalance = Math.max(0, financials.grandTotal - (Number(order.totalPaid) || 0));
+    }
 
     if (releasesReservation(req.body.status) || releasesReservation(req.body.workflowStatus)) {
       await releaseOrderReservations({
@@ -4273,6 +4280,19 @@ const updateMyCustomerPO = async (req, res) => {
 
     const allowedFields = ['customerName', 'quotationNumber', 'poDate', 'amount', 'notes', 'uploadedDocument', 'documentName', 'status'];
     allowedFields.forEach(field => { if (req.body[field] !== undefined) po[field] = req.body[field]; });
+    if (req.body.items !== undefined || req.body.discount !== undefined || req.body.taxRate !== undefined) {
+      const financials = calculateDocumentFinancials({
+        items: req.body.items !== undefined ? req.body.items : po.items,
+        discount: req.body.discount !== undefined ? req.body.discount : po.discount,
+        taxRate: req.body.taxRate !== undefined ? req.body.taxRate : po.taxRate
+      });
+      po.items = financials.items;
+      po.subtotal = financials.subtotal;
+      po.discount = financials.discount;
+      po.taxRate = financials.taxRate;
+      po.tax = financials.tax;
+      po.amount = financials.grandTotal;
+    }
     if ((req.body.uploadedDocument !== undefined || req.body.documentName !== undefined) && !hasValidCustomerPOAttachment(po)) {
       return res.status(400).json({ success: false, message: CUSTOMER_PO_ATTACHMENT_MESSAGE });
     }
@@ -4360,7 +4380,7 @@ const createMyProductFile = async (req, res) => {
       customerPONumber: customerPO.poNumber || customerPONumber || '',
       salesOrderId: safeSalesOrderId,
       salesOrderNumber: salesOrderNumber || '',
-      products: (Array.isArray(products) && products.length ? products : (linkedQuotation?.items || []).map(item => ({
+      products: normalizeCommercialItems(Array.isArray(products) && products.length ? products : (linkedQuotation?.items || []).map(item => ({
         name: item.description || 'Item',
         description: item.description || '',
         quantity: item.quantity || 1,
@@ -4412,7 +4432,7 @@ const updateMyProductFile = async (req, res) => {
     allowedFields.forEach(field => {
       if (req.body[field] === undefined) return;
       pf[field] = field === 'products'
-        ? req.body.products.map(item => ({ ...item, partNumber: normalizePartNumber(item) }))
+        ? normalizeCommercialItems(req.body.products).map(item => ({ ...item, partNumber: normalizePartNumber(item) }))
         : req.body[field];
     });
 
