@@ -30,7 +30,12 @@ const { allocateGrnNumber, withGrnDuplicateRecovery } = require('../utils/grnNum
 const { allocateGlobalPoNumber } = require('../utils/globalPoNumber');
 const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
 const { getSupportDashboardMetrics } = require('../utils/departmentDashboardMetrics');
-const { verifyAndConsumeCEOPermission, logCategoryAEdit, hasFieldValueChanged } = require('../utils/editPermissionHelper');
+const {
+  verifyAndConsumeCEOPermission,
+  logCategoryAEdit,
+  hasFieldValueChanged,
+  getInvoiceEditDocumentType
+} = require('../utils/editPermissionHelper');
 const {
   isGlobalSalesUser,
   isSalesUser,
@@ -3931,7 +3936,7 @@ const updateMyInvoice = async (req, res) => {
       }
     });
 
-    const docType = invoice.status === 'Draft' || invoice.type === 'Draft' ? 'Draft Invoice' : 'Final Invoice';
+    const docType = getInvoiceEditDocumentType(invoice);
     const check = await verifyAndConsumeCEOPermission({
       documentType: docType,
       documentId: invoice._id,

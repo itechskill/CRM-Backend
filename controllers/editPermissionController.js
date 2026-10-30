@@ -7,7 +7,15 @@ const Invoice = require('../models/Invoice');
 const Payment = require('../models/Payment');
 const Quotation = require('../models/Quotation');
 const SupplierPO = require('../models/SupplierPO');
-const { notifyRoleHelper, createNotificationHelper } = require('./notificationController');
+const User = require('../models/User');
+const { createNotificationHelper } = require('./notificationController');
+const { requiredApproverFor } = require('../utils/editPermissionHelper');
+const { isDirectEditAllowed } = require('../config/documentTypes');
+
+const notifyExactApproverRole = async (role, payload) => {
+  const users = await User.find({ role, status: 'active', isApproved: true }).select('_id');
+  await Promise.all(users.map(user => createNotificationHelper({ recipient: user._id, ...payload })));
+};
 
 // Helper to resolve document reference number and status
 const getDocumentDetails = async (documentType, documentId) => {
@@ -86,6 +94,7 @@ const requestEditPermission = async (req, res) => {
     const details = await getDocumentDetails(documentType, documentId);
     const docNumber = details.number;
     const docStatus = details.status;
+    const approver = requiredApproverFor(documentType, req.user);
 
     // Check if there is already an active pending request from this user
     const existingPending = await EditPermissionRequest.findOne({
@@ -98,7 +107,7 @@ const requestEditPermission = async (req, res) => {
     if (existingPending) {
       return res.status(400).json({
         success: false,
-        message: `An edit request for ${documentType} (${docNumber}) is already pending CEO approval.`
+        message: `An edit request for ${documentType} (${docNumber}) is already pending ${approver.label} approval.`
       });
     }
 
@@ -137,21 +146,21 @@ const requestEditPermission = async (req, res) => {
       requestType: requestType === 'SpecificField' ? 'SpecificField' : 'General',
       requestedFields: processedFields,
       reason,
+      approverRole: approver.role,
       status: 'Pending'
     });
 
-    // Notify CEO
-    await notifyRoleHelper(['ceo'], {
+    await notifyExactApproverRole(approver.role, {
       type: 'system',
-      title: 'CEO Edit Permission Requested',
+      title: `${approver.label} Edit Permission Requested`,
       message: `${req.user.fullName || 'Staff User'} (${req.user.role}) requested edit permission for ${documentType} ${docNumber}. Reason: ${reason}`,
       sender: req.user._id,
-      link: '/admin/edit-requests'
+      link: approver.role === 'finance' ? '/finance/edit-requests' : '/admin/edit-requests'
     });
 
     return res.status(201).json({
       success: true,
-      message: 'Edit permission request submitted to CEO successfully.',
+      message: `Edit permission request submitted to ${approver.label} successfully.`,
       data: editRequest
     });
   } catch (error) {
@@ -167,9 +176,15 @@ const getEditPermissionRequests = async (req, res) => {
     const query = {};
 
     const userRole = (req.user.role || '').toLowerCase();
-    const isCEOOrAdmin = ['ceo', 'admin'].includes(userRole);
+    const isAdmin = userRole === 'admin';
+    const isCEO = userRole === 'ceo';
+    const isFinance = userRole === 'finance';
 
-    if (!isCEOOrAdmin) {
+    if (isCEO) {
+      query.approverRole = { $in: ['ceo', null] };
+    } else if (isFinance) {
+      query.approverRole = 'finance';
+    } else if (!isAdmin) {
       query.requestedByUserId = req.user._id;
     }
 
@@ -228,15 +243,19 @@ const respondToEditPermissionRequest = async (req, res) => {
     const { id } = req.params;
     const { status, responseNote, permissionScope, allowedFields, expiresInHours } = req.body;
 
-    const userRole = (req.user.role || '').toLowerCase();
-    if (!['ceo', 'admin'].includes(userRole)) {
-      return res.status(403).json({ success: false, message: 'Only CEO or Administrator can review edit requests.' });
-    }
-
     const editRequest = await EditPermissionRequest.findById(id);
     if (!editRequest) {
       return res.status(404).json({ success: false, message: 'Edit permission request not found.' });
     }
+
+    const userRole = (req.user.role || '').toLowerCase();
+    const approverRole = editRequest.approverRole || 'ceo';
+    const allowedReviewers = approverRole === 'finance' ? ['finance', 'admin'] : ['ceo', 'admin'];
+    if (!allowedReviewers.includes(userRole)) {
+      const label = approverRole === 'finance' ? 'Finance' : 'CEO';
+      return res.status(403).json({ success: false, message: `Only ${label} or Administrator can review this edit request.` });
+    }
+    const approverLabel = approverRole === 'finance' ? 'Finance' : 'CEO';
 
     if (editRequest.status !== 'Pending') {
       return res.status(400).json({ success: false, message: `Request has already been ${editRequest.status.toLowerCase()}.` });
@@ -263,13 +282,14 @@ const respondToEditPermissionRequest = async (req, res) => {
       editRequest.expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
 
       // Notify requester
-      await createNotificationHelper(
-        editRequest.requestedByUserId,
-        'CEO Edit Permission Approved',
-        `CEO approved your edit request for ${editRequest.documentType} (${editRequest.documentNumber}). Valid for ${hours} hours.`,
-        'success',
-        '/edit-permissions'
-      );
+      await createNotificationHelper({
+        recipient: editRequest.requestedByUserId,
+        sender: req.user._id,
+        title: `${approverLabel} Edit Permission Approved`,
+        message: `${approverLabel} approved your edit request for ${editRequest.documentType} (${editRequest.documentNumber}). Valid for ${hours} hours.`,
+        type: 'system',
+        link: '/edit-permissions'
+      });
     } else if (status === 'Rejected') {
       editRequest.status = 'Rejected';
       editRequest.rejectedByUserId = req.user._id;
@@ -279,13 +299,14 @@ const respondToEditPermissionRequest = async (req, res) => {
       editRequest.ceoResponseNote = responseNote || '';
 
       // Notify requester
-      await createNotificationHelper(
-        editRequest.requestedByUserId,
-        'CEO Edit Permission Rejected',
-        `CEO rejected your edit request for ${editRequest.documentType} (${editRequest.documentNumber}). Reason: ${editRequest.rejectionReason}`,
-        'warning',
-        '/edit-permissions'
-      );
+      await createNotificationHelper({
+        recipient: editRequest.requestedByUserId,
+        sender: req.user._id,
+        title: `${approverLabel} Edit Permission Rejected`,
+        message: `${approverLabel} rejected your edit request for ${editRequest.documentType} (${editRequest.documentNumber}). Reason: ${editRequest.rejectionReason}`,
+        type: 'system',
+        link: '/edit-permissions'
+      });
     } else {
       return res.status(400).json({ success: false, message: 'Invalid status. Must be Approved or Rejected.' });
     }
@@ -309,13 +330,14 @@ const checkActiveEditPermission = async (req, res) => {
     const { documentType, documentId } = req.params;
     const userIdStr = req.user._id;
 
-    // Direct check for CEO or Admin
+    // Direct-edit roles include Finance for Draft Invoices and Admin/CEO globally.
     const userRole = (req.user.role || '').toLowerCase();
-    if (['ceo', 'admin'].includes(userRole)) {
+    if (isDirectEditAllowed(documentType, userRole)) {
       return res.status(200).json({
         success: true,
         hasPermission: true,
-        isCEOOrAdmin: true,
+        isDirectEditor: true,
+        isCEOOrAdmin: ['ceo', 'admin'].includes(userRole),
         permission: null
       });
     }

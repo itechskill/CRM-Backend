@@ -1,6 +1,37 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
+const ORDER_TRACKER_MUTATION_EXCEPTIONS = [
+  { method: 'PUT', pattern: /^\/api\/auth\/update-password\/?$/ },
+  { method: 'POST', pattern: /^\/api\/auth\/logout\/?$/ },
+  { method: 'PATCH', pattern: /^\/api\/notifications\/read-all\/?$/ },
+  { method: 'PATCH', pattern: /^\/api\/notifications\/[^/]+\/read\/?$/ }
+];
+
+const isOrderTrackerMutationException = req => ORDER_TRACKER_MUTATION_EXCEPTIONS.some(
+  exception => exception.method === req.method && exception.pattern.test(req.path || req.originalUrl.split('?')[0])
+);
+
+const enforceOrderTrackerReadOnly = async (req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) return next();
+  try {
+    const token = header.split(' ')[1]?.trim();
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'nexus_crm_super_secret_jwt_token_key_2026');
+    const user = await User.findById(decoded.id).select('role');
+    if (user?.role === 'order_tracker' && !isOrderTrackerMutationException(req)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Order Tracker is a view-only role and cannot change records or workflow stages.'
+      });
+    }
+  } catch (error) {
+    // Authentication errors remain the responsibility of the route's protect middleware.
+  }
+  return next();
+};
+
 /**
  * Middleware to protect routes and verify JWT token
  */
@@ -103,5 +134,7 @@ module.exports = {
   authorize,
   requireRole,
   requirePermission,
-  requireDepartment
+  requireDepartment,
+  enforceOrderTrackerReadOnly,
+  ORDER_TRACKER_MUTATION_EXCEPTIONS
 };

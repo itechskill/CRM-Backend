@@ -39,7 +39,7 @@ const editAuditLogSchema = new mongoose.Schema(
     },
     permissionType: {
       type: String,
-      enum: ['DIRECT_EDIT', 'CEO_APPROVED'],
+      enum: ['DIRECT_EDIT', 'CEO_APPROVED', 'FINANCE_APPROVED'],
       default: 'CEO_APPROVED'
     },
     editPermissionRequestId: {

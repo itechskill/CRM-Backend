@@ -26,6 +26,8 @@ const priceRequestRoutes = require('./routes/priceRequestRoutes');
 const targetPerformanceRoutes = require('./routes/targetPerformanceRoutes');
 const supportTicketRoutes = require('./routes/supportTicketRoutes');
 const exchangeRateRoutes = require('./routes/exchangeRateRoutes');
+const orderTrackerRoutes = require('./routes/orderTrackerRoutes');
+const { enforceOrderTrackerReadOnly } = require('./middleware/authMiddleware');
 
 // Load environment variables
 dotenv.config();
@@ -89,6 +91,8 @@ app.use(async (req, res, next) => {
   }
 });
 
+app.use(enforceOrderTrackerReadOnly);
+
 // Routes
 app.use('/api', healthRoutes);
 app.use('/api/auth', authRoutes);
@@ -114,6 +118,7 @@ app.use('/api/price-requests', priceRequestRoutes);
 app.use('/api/target-performance', targetPerformanceRoutes);
 app.use('/api/support-tickets', supportTicketRoutes);
 app.use('/api/exchange-rates', exchangeRateRoutes);
+app.use('/api/order-tracker', orderTrackerRoutes);
 
 // Root Fallback Route
 app.get('/', (req, res) => {

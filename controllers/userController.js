@@ -12,6 +12,7 @@ const Campaign = require('../models/Campaign');
 const CompanyResource = require('../models/CompanyResource');
 const Notification = require('../models/Notification');
 const { isSalesUser, ownerScope } = require('../utils/salesOwnership');
+const { sanitizeTrackerData } = require('../utils/orderTracker');
 
 /**
  * @desc    Get current user profile
@@ -30,7 +31,7 @@ const getProfile = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      data: user
+      data: user.role === 'order_tracker' ? sanitizeTrackerData(user) : user
     });
   } catch (error) {
     console.error('[Get Profile Error]:', error);

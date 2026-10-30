@@ -4,7 +4,11 @@ const Payroll = require('../models/Payroll');
 const User = require('../models/User');
 const MaintenanceCharge = require('../models/MaintenanceCharge');
 const InventoryItem = require('../models/InventoryItem');
-const { verifyAndConsumeCEOPermission, hasFieldValueChanged } = require('../utils/editPermissionHelper');
+const {
+  verifyAndConsumeCEOPermission,
+  hasFieldValueChanged,
+  getInvoiceEditDocumentType
+} = require('../utils/editPermissionHelper');
 const { getFinanceDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { calculateDocumentFinancials } = require('../utils/documentFinancials');
 const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
@@ -120,7 +124,7 @@ const updateInvoice = async (req, res) => {
       }
     });
 
-    const docType = invoice.status === 'Draft' || invoice.type === 'Draft' ? 'Draft Invoice' : 'Final Invoice';
+    const docType = getInvoiceEditDocumentType(invoice);
     const check = await verifyAndConsumeCEOPermission({
       documentType: docType,
       documentId: invoice._id,

@@ -67,6 +67,12 @@ const editPermissionRequestSchema = new mongoose.Schema(
       required: true,
       trim: true
     },
+    approverRole: {
+      type: String,
+      enum: ['finance', 'ceo'],
+      default: 'ceo',
+      index: true
+    },
     // CEO Approval Configuration & Scope
     permissionScope: {
       type: String,

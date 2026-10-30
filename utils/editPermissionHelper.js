@@ -2,6 +2,26 @@ const EditPermissionRequest = require('../models/EditPermissionRequest');
 const EditAuditLog = require('../models/EditAuditLog');
 const { isDirectEditAllowed } = require('../config/documentTypes');
 
+const requiredApproverFor = (documentType, requestingUser) => (
+  String(documentType || '').toLowerCase() === 'draft invoice' && requestingUser?.role === 'accountant'
+    ? { role: 'finance', label: 'Finance' }
+    : { role: 'ceo', label: 'CEO' }
+);
+
+const getInvoiceEditDocumentType = (invoice) => {
+  const finalStatuses = new Set([
+    'Approved',
+    'Finalized',
+    'Sent',
+    'Paid',
+    'Partially Paid',
+    'Overdue',
+    'Cancelled'
+  ]);
+  const isFinal = invoice?.isDraft === false || finalStatuses.has(invoice?.status);
+  return isFinal ? 'Final Invoice' : 'Draft Invoice';
+};
+
 /**
  * Checks if user is authorized to edit a controlled document.
  * 1. Checks direct-edit exceptions (Quotation for Sales Person, Supplier PO for Purchasers, CEO/Admin).
@@ -215,7 +235,7 @@ const verifyAndConsumeCEOPermission = async ({ documentType, documentId, documen
   if (!permission) {
     return {
       authorized: false,
-      message: `CEO edit approval required for ${documentType} ${documentNumber || ''}. Please submit an edit permission request.`
+      message: `${requiredApproverFor(documentType, requestingUser).label} edit approval required for ${documentType} ${documentNumber || ''}. Please submit an edit permission request.`
     };
   }
 
@@ -235,7 +255,7 @@ const verifyAndConsumeCEOPermission = async ({ documentType, documentId, documen
     if (unallowedField) {
       return {
         authorized: false,
-        message: `Editing field "${unallowedField.field}" is not allowed under the CEO approval scope for this document.`
+        message: `Editing field "${unallowedField.field}" is not allowed under the ${requiredApproverFor(documentType, requestingUser).label} approval scope for this document.`
       };
     }
   }
@@ -256,7 +276,7 @@ const verifyAndConsumeCEOPermission = async ({ documentType, documentId, documen
       editedByName: requestingUser.fullName || requestingUser.name || 'User',
       editedByRole: requestingUser.role || '',
       editedByDepartment: requestingUser.department || '',
-      permissionType: 'CEO_APPROVED',
+      permissionType: permission.approverRole === 'finance' ? 'FINANCE_APPROVED' : 'CEO_APPROVED',
       editPermissionRequestId: permission._id,
       changes: formattedChanges,
       reason: permission.reason || 'CEO approved edit'
@@ -302,5 +322,7 @@ module.exports = {
   verifyAndConsumeCEOPermission,
   logCategoryAEdit,
   isFieldAllowed,
-  hasFieldValueChanged
+  hasFieldValueChanged,
+  requiredApproverFor,
+  getInvoiceEditDocumentType
 };
