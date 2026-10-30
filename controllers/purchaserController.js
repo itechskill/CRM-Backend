@@ -20,6 +20,7 @@ const { getPurchaserDashboardMetrics } = require('../utils/departmentDashboardMe
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 const { normalizePartNumber } = require('../utils/documentFinancials');
+const { resolveDocumentsPartNumbers } = require('../utils/documentPartNumbers');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const roundMoney = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -237,7 +238,8 @@ exports.getSupplierPOs = async (req, res) => {
       .populate('supportVerifiedGrn', 'grnNumber createdAt')
       .populate('goodsReceiptRecordedBy', 'fullName name')
       .sort({ createdAt: -1 });
-    const visiblePOs = serializeMonetaryVisibility(pos, req.user, 'supplier-pos');
+    const resolvedPOs = await resolveDocumentsPartNumbers(pos, 'supplier-po');
+    const visiblePOs = serializeMonetaryVisibility(resolvedPOs, req.user, 'supplier-pos');
     return res.status(200).json({ success: true, count: pos.length, data: visiblePOs, pos: visiblePOs });
   } catch (error) {
     console.error('Get Supplier POs Error:', error);
@@ -884,7 +886,8 @@ exports.getPurchaserGRNs = async (req, res) => {
       .populate('supplier')
       .populate('salesOrder', 'orderNumber orderReference fileType issuingCompany items')
       .sort({ createdAt: -1 });
-    return res.status(200).json({ success: true, count: grns.length, data: grns, grns });
+    const resolvedGRNs = await resolveDocumentsPartNumbers(grns, 'grn');
+    return res.status(200).json({ success: true, count: grns.length, data: resolvedGRNs, grns: resolvedGRNs });
   } catch (error) {
     console.error('Get GRNs Error:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching Goods Received Notes.' });
@@ -2287,7 +2290,7 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
 
     const InventoryItem = require('../models/InventoryItem');
     const targetId = req.params.id || req.body.id || req.body._id;
-    const { name, productName, sku, productCode, category, unit, quantityOnHand, quantity, minStockLevel, unitPrice, location, description } = req.body;
+    const { name, productName, sku, productCode, partNumber, category, unit, quantityOnHand, quantity, minStockLevel, unitPrice, location, description } = req.body;
 
     const finalName = (name || productName || '').trim();
     if (!finalName && !targetId) {
@@ -2304,6 +2307,7 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
       const updateData = {};
       if (finalName) updateData.name = finalName;
       if (finalSku !== undefined) updateData.sku = finalSku;
+      if (partNumber !== undefined) updateData.partNumber = String(partNumber || '').trim();
       if (category) updateData.category = category;
       if (unit) updateData.unit = unit;
       if (finalQty !== undefined) updateData.quantityOnHand = finalQty;
@@ -2328,6 +2332,7 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
         if (finalPrice !== undefined && finalPrice > 0) item.unitPrice = finalPrice;
         if (location) item.location = location;
         if (finalSku) item.sku = finalSku;
+        if (partNumber !== undefined) item.partNumber = String(partNumber || '').trim();
         if (category) item.category = category;
         if (unit) item.unit = unit;
         if (minStockLevel !== undefined) item.minStockLevel = finalMin;
@@ -2337,6 +2342,7 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
         item = await InventoryItem.create({
           name: finalName,
           sku: finalSku || `SKU-${Date.now().toString().slice(-6)}`,
+          partNumber: String(partNumber || '').trim(),
           category: category || 'General',
           unit: unit || 'pcs',
           quantityOnHand: finalQty !== undefined ? finalQty : 0,

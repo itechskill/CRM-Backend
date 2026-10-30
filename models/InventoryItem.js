@@ -13,6 +13,11 @@ const InventoryItemSchema = new mongoose.Schema(
       trim: true,
       default: ''
     },
+    partNumber: {
+      type: String,
+      trim: true,
+      default: ''
+    },
     category: {
       type: String,
       trim: true,

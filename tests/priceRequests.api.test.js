@@ -10,13 +10,13 @@ process.env.NODE_ENV = 'test';
 process.env.COUNTER_NAMESPACE = 'dev-local';
 mongoose.set('autoIndex', false);
 
-const TEMP_DB_PREFIX = 'fortline_tmp_pricereq_';
+const TEMP_DB_PREFIX = 'f_tmp_pricereq_';
 const runId = randomBytes(8).toString('hex');
 const tempDbName = `${TEMP_DB_PREFIX}${runId}`;
 const sourceMongoUri = process.env.MONGODB_URI;
 
 assert.ok(sourceMongoUri, 'MONGODB_URI is required to run the Price Request API tests.');
-assert.match(tempDbName, /^fortline_tmp_pricereq_[a-z0-9_]+$/);
+assert.match(tempDbName, /^f_tmp_pricereq_[a-z0-9_]+$/);
 
 const useDatabase = (uri, databaseName) => {
   const queryAt = uri.indexOf('?');

@@ -8,6 +8,7 @@ const { createNotificationHelper, notifyRoleHelper } = require('./notificationCo
 const { getLogisticsDashboardMetrics } = require('../utils/departmentDashboardMetrics');
 const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { normalizePartNumber } = require('../utils/documentFinancials');
+const { resolveDocumentsPartNumbers } = require('../utils/documentPartNumbers');
 
 /**
  * @desc    Get real Logistics Dashboard statistics
@@ -651,7 +652,8 @@ const getIncomingOrders = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    return res.status(200).json({ success: true, count: orders.length, data: serializeMonetaryVisibility(orders, req.user, 'sales-orders') });
+    const resolvedOrders = await resolveDocumentsPartNumbers(orders, 'sales-order');
+    return res.status(200).json({ success: true, count: orders.length, data: serializeMonetaryVisibility(resolvedOrders, req.user, 'sales-orders') });
   } catch (error) {
     console.error('[Get Incoming Orders Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error loading incoming orders.' });
@@ -676,7 +678,8 @@ const getLogisticsDeliveryNotes = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    return res.status(200).json({ success: true, count: deliveryNotes.length, data: serializeMonetaryVisibility(deliveryNotes, req.user, 'delivery-notes') });
+    const resolvedNotes = await resolveDocumentsPartNumbers(deliveryNotes, 'delivery-note');
+    return res.status(200).json({ success: true, count: deliveryNotes.length, data: serializeMonetaryVisibility(resolvedNotes, req.user, 'delivery-notes') });
   } catch (error) {
     console.error('[Get Logistics Delivery Notes Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error loading delivery notes.' });
@@ -713,7 +716,8 @@ const getLogisticsGRNs = async (req, res) => {
       .populate('salesOrder', 'orderNumber orderReference fileType issuingCompany items')
       .sort({ createdAt: -1 })
       .lean();
-    return res.status(200).json({ success: true, count: grns.length, grns, data: grns });
+    const resolvedGRNs = await resolveDocumentsPartNumbers(grns, 'grn');
+    return res.status(200).json({ success: true, count: grns.length, grns: resolvedGRNs, data: resolvedGRNs });
   } catch (error) {
     console.error('[Get Logistics GRNs Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error loading GRNs.' });
@@ -734,7 +738,8 @@ const getPendingGRNs = async (req, res) => {
       workflowStatus: 'Pending Logistics GRN'
     }).populate('salesPerson', 'fullName email').sort({ createdAt: -1 }).lean();
 
-    const visibleOrders = serializeMonetaryVisibility(orders, req.user, 'sales-orders');
+    const resolvedOrders = await resolveDocumentsPartNumbers(orders, 'sales-order');
+    const visibleOrders = serializeMonetaryVisibility(resolvedOrders, req.user, 'sales-orders');
     return res.status(200).json({ success: true, count: orders.length, data: visibleOrders, orders: visibleOrders });
   } catch (error) {
     console.error('[Get Pending GRNs Error]:', error);
@@ -934,6 +939,7 @@ const createImportInventoryItem = async (req, res) => {
     const {
       name,
       sku,
+      partNumber,
       unit,
       quantityOnHand,
       minStockLevel,
@@ -952,6 +958,7 @@ const createImportInventoryItem = async (req, res) => {
     const item = await InventoryItem.create({
       name: name.trim(),
       sku: sku ? sku.trim() : `IMP-${Date.now().toString().slice(-6)}`,
+      partNumber: String(partNumber || '').trim(),
       category: 'Imported Goods',
       unit: unit || 'pcs',
       quantityOnHand: Number(quantityOnHand) || 0,
@@ -996,7 +1003,7 @@ const updateImportInventoryItem = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Inventory item not found.' });
     }
 
-    const allowed = ['name', 'sku', 'unit', 'quantityOnHand', 'reservedQuantity', 'minStockLevel', 'unitPrice', 'location', 'description', 'supplierName', 'supplierPoNumber', 'orderReference'];
+    const allowed = ['name', 'sku', 'partNumber', 'unit', 'quantityOnHand', 'reservedQuantity', 'minStockLevel', 'unitPrice', 'location', 'description', 'supplierName', 'supplierPoNumber', 'orderReference'];
     allowed.forEach(field => {
       if (req.body[field] !== undefined) {
         if (field === 'quantityOnHand' || field === 'reservedQuantity' || field === 'minStockLevel' || field === 'unitPrice') {
