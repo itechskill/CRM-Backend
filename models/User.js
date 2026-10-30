@@ -17,7 +17,8 @@ const ALLOWED_ROLES = [
   'support',
   'finance',
   'logistics',
-  'purchaser'
+  'purchaser',
+  'order_tracker'
 ];
 
 const ACCOUNT_STATUSES = ['pending', 'active', 'inactive', 'deactivated', 'rejected', 'suspended'];

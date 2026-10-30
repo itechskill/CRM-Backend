@@ -3,6 +3,7 @@ const generateToken = require('../utils/generateToken');
 const crypto = require('crypto');
 const logAudit = require('../utils/auditLogger');
 const sendEmail = require('../utils/sendEmail');
+const { sanitizeTrackerData } = require('../utils/orderTracker');
 
 const PUBLIC_REGISTRATION_ROLES = [
   'administration',
@@ -297,7 +298,7 @@ const loginUser = async (req, res) => {
     });
 
     // 7. Sanitize output (password stripped via toJSON)
-    const userResponse = user.toJSON();
+    const userResponse = user.role === 'order_tracker' ? sanitizeTrackerData(user) : user.toJSON();
 
     return res.status(200).json({
       success: true,
@@ -342,7 +343,7 @@ const getMe = async (req, res) => {
     }
     return res.status(200).json({
       success: true,
-      data: user
+      data: user.role === 'order_tracker' ? sanitizeTrackerData(user) : user
     });
   } catch (error) {
     console.error('[Get Me Error]:', error);

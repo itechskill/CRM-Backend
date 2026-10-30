@@ -15,7 +15,8 @@ const DOCUMENT_TYPES = {
 
 const DIRECT_EDIT_EXCEPTIONS = [
   { documentType: DOCUMENT_TYPES.QUOTATION, allowedRoles: ['employee', 'sales_person', 'sales_member', 'sales_manager', 'admin', 'ceo'] },
-  { documentType: DOCUMENT_TYPES.SUPPLIER_PO, allowedRoles: ['purchaser', 'local_purchaser', 'global_purchaser', 'admin', 'ceo'] }
+  { documentType: DOCUMENT_TYPES.SUPPLIER_PO, allowedRoles: ['purchaser', 'local_purchaser', 'global_purchaser', 'admin', 'ceo'] },
+  { documentType: DOCUMENT_TYPES.DRAFT_INVOICE, allowedRoles: ['finance', 'admin', 'ceo'] }
 ];
 
 /**
