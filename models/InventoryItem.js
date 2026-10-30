@@ -1,5 +1,36 @@
 const mongoose = require('mongoose');
 
+const InventoryCostHistorySchema = new mongoose.Schema({
+  changedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  changedByName: { type: String, trim: true, default: '' },
+  changedAt: { type: Date, default: Date.now },
+  oldUnitCostPKRCents: { type: Number, default: null },
+  newUnitCostPKRCents: { type: Number, required: true, min: 0 },
+  reason: { type: String, trim: true, default: '' }
+}, { _id: false });
+
+const InventoryCostBatchSchema = new mongoose.Schema({
+  source: {
+    type: String,
+    enum: ['Support Receive Goods from Supplier PO', 'Manual stock entry', 'Inventory IN', 'Opening stock'],
+    required: true
+  },
+  supplierPO: { type: mongoose.Schema.Types.ObjectId, ref: 'SupplierPO', default: null },
+  supplierPONumber: { type: String, trim: true, default: '' },
+  supplierPOLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  grn: { type: mongoose.Schema.Types.ObjectId, ref: 'PurchaserGRN', default: null },
+  grnNumber: { type: String, trim: true, default: '' },
+  receivedAt: { type: Date, default: Date.now },
+  quantityReceived: { type: Number, required: true, min: 0 },
+  quantityRemaining: { type: Number, required: true, min: 0 },
+  unitCostPKRCents: { type: Number, default: null, min: 0 },
+  costStatus: { type: String, enum: ['recorded', 'not recorded'], default: 'not recorded' },
+  enteredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  enteredByName: { type: String, trim: true, default: '' },
+  note: { type: String, trim: true, default: '' },
+  costHistory: { type: [InventoryCostHistorySchema], default: [] }
+}, { timestamps: false });
+
 const InventoryItemSchema = new mongoose.Schema(
   {
     name: {
@@ -85,6 +116,7 @@ const InventoryItemSchema = new mongoose.Schema(
         timestamp: { type: Date, default: Date.now }
       }
     ],
+    costBatches: { type: [InventoryCostBatchSchema], default: [] },
     status: {
       type: String,
       enum: ['In Stock', 'Low Stock', 'Out of Stock'],

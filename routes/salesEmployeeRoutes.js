@@ -94,6 +94,7 @@ const receiptVoucherGuard = [protect, authorize('accountant', 'finance', 'admin'
 const accountsGuard = [protect, authorize('accountant', 'admin', 'ceo')];
 const supportInventoryReadGuard = [protect, authorize('support', 'admin', 'ceo')];
 const supportInventoryWriteGuard = [protect, authorize('support', 'admin')];
+const inventoryStockWriteGuard = [protect, authorize('support', 'finance', 'admin')];
 const financeReviewGuard = [protect, authorize('finance', 'admin', 'ceo')];
 
 // Dashboard stats
@@ -155,8 +156,8 @@ router.delete('/orders/:id', salesGuard, deleteMyOrder);
 // Support & Inventory Department Routes
 router.get('/support/stats', supportInventoryReadGuard, getSupportStats);
 router.get('/inventory', departmentReadGuard, getInventoryItems);
-router.post('/inventory', supportInventoryWriteGuard, createOrUpdateInventoryItem);
-router.post('/inventory/:id/in', supportInventoryWriteGuard, addInventoryStock);
+router.post('/inventory', inventoryStockWriteGuard, createOrUpdateInventoryItem);
+router.post('/inventory/:id/in', inventoryStockWriteGuard, addInventoryStock);
 
 // Proforma Invoices
 router.get('/proforma-invoices', salesGuard, getMyProformaInvoices);

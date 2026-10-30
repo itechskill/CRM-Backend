@@ -3,6 +3,7 @@ const Payment = require('../models/Payment');
 const SalesOrder = require('../models/SalesOrder');
 const SupplierPO = require('../models/SupplierPO');
 const { moneyToCents, totalCostPKR } = require('./purchaseExpenses');
+const { resolveStockInvoiceCost } = require('./inventoryCosting');
 
 const SALES_ROLES = ['employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager'];
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -129,7 +130,7 @@ const analyzeInvoicePerformance = ({ invoice, order, supplierPO, payments = [], 
     costChangedAt,
     costGap: missingExchangeRate
       ? `Supplier PO ${supplierPO.poNumber || ''} uses ${supplierPO.currency} but has no exchange rate to PKR.`
-      : (!supplierPO ? 'No linked Supplier PO; purchase cost is treated as PKR 0.' : ''),
+      : (!supplierPO && costUnavailable ? 'One or more allocated stock batches have no recorded cost.' : ''),
     payments: paymentRows
   };
 };
@@ -161,14 +162,15 @@ const loadPerformanceForUsers = async ({ users, month, asOf = new Date() }) => {
     const ownerId = idString(order?.owner || order?.createdBy);
     if (!rowsByOwner.has(ownerId)) continue;
     const supplierPO = poMap.get(idString(order._id)) || null;
-    const cost = await totalCostPKR(supplierPO || order);
+    const stockCost = supplierPO ? null : await resolveStockInvoiceCost({ invoice, order });
+    const poCost = supplierPO ? await totalCostPKR(supplierPO) : null;
     const invoicePayments = payments.filter(payment => paymentAmountForInvoiceCents(payment, invoice._id) > 0);
     rowsByOwner.get(ownerId).push(analyzeInvoicePerformance({
       invoice,
       order,
       supplierPO,
       payments: invoicePayments,
-      purchaseCostCents: cost === null ? null : moneyToCents(cost),
+      purchaseCostCents: supplierPO ? (poCost === null ? null : moneyToCents(poCost)) : stockCost.cogsCents,
       asOf
     }));
   }
@@ -245,8 +247,12 @@ const addFinanceCostingToInvoices = async invoices => {
     const invoiceAmountExcludingTaxCents = invoiceRevenueExcludingTaxCents(invoice);
     let issue = '';
     let cogsCents = null;
-    if (!order || !supplierPO) {
+    if (!order) {
       issue = 'Cost not recorded';
+    } else if (!supplierPO) {
+      const stockCost = await resolveStockInvoiceCost({ invoice, order });
+      cogsCents = stockCost.cogsCents;
+      issue = stockCost.issue;
     } else if (String(supplierPO.currency || 'PKR').toUpperCase() !== 'PKR' && !(Number(supplierPO.exchangeRateToPKR) > 0)) {
       issue = 'Rate missing';
     } else {
@@ -266,8 +272,8 @@ const addFinanceCostingToInvoices = async invoices => {
         invoiceAmountExcludingTaxCents,
         cogsCents,
         grossProfitCents: cogsCents === null ? null : invoiceAmountExcludingTaxCents - cogsCents,
-        costingStatus: supplierPO?.costingStatus || 'Incomplete',
-        provisional: (supplierPO?.costingStatus || 'Incomplete') !== 'Completed',
+        costingStatus: supplierPO ? (supplierPO.costingStatus || 'Incomplete') : (cogsCents === null ? 'Incomplete' : 'Completed'),
+        provisional: supplierPO ? (supplierPO.costingStatus || 'Incomplete') !== 'Completed' : cogsCents === null,
         issue,
         review,
         reviewReason: review ? `Review: ${reasons.join('; ')}.` : '',

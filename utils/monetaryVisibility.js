@@ -1,6 +1,7 @@
 const QUANTITY_ONLY_ROLES = new Set(['support', 'logistics']);
 const SALARY_RESTRICTED_ROLES = new Set(['hr_manager', 'hr', 'administration']);
 const FINANCE_COSTING_ROLES = new Set(['finance', 'admin', 'ceo']);
+const INVENTORY_COST_ROLES = new Set(['finance', 'admin', 'ceo', 'accountant']);
 
 const plain = value => {
   if (value == null) return value;
@@ -24,7 +25,7 @@ const omit = (source, fields) => {
 
 const stripLineMoney = line => omit(line, [
   'unitPrice', 'price', 'lineTotal', 'total', 'totalAmount', 'amount', 'amountCents', 'amountPKRCents',
-  'cost', 'costPrice', 'purchasePrice', 'sellingPrice'
+  'cost', 'costPrice', 'purchasePrice', 'sellingPrice', 'batchAllocations'
 ]);
 
 const stripDeal = deal => omit(deal, ['value', 'amount', 'totalAmount', 'netAmount', 'estimatedValue']);
@@ -75,7 +76,18 @@ function stripDeliveryNote(note) {
   return result;
 }
 
-const stripInventory = item => omit(item, ['unitPrice', 'totalValue', 'stockValue', 'inventoryValue', 'totalInventoryValue']);
+const stripInventory = item => omit(item, ['unitPrice', 'totalValue', 'stockValue', 'inventoryValue', 'totalInventoryValue', 'costBatches']);
+
+const stripInventoryCostData = value => {
+  if (Array.isArray(value)) return value.map(stripInventoryCostData);
+  if (!value || typeof value !== 'object' || value instanceof Date || Buffer.isBuffer(value) || value._bsontype) return value;
+  const result = {};
+  for (const [key, child] of Object.entries(plain(value))) {
+    if (key === 'costBatches' || key === 'batchAllocations' || key === 'batchAllocationsRestoredAt' || key === 'unitCostPKRCents' || key === 'liveUnitCostPKRCents' || key === 'costHistory') continue;
+    result[key] = stripInventoryCostData(child);
+  }
+  return result;
+};
 
 const stripShipment = shipment => {
   if (!shipment || typeof shipment !== 'object') return shipment;
@@ -120,41 +132,44 @@ const audienceRole = user => {
  */
 const serializeMonetaryVisibility = (value, user, context) => {
   const role = audienceRole(user);
+  const protectInventoryCosts = result => INVENTORY_COST_ROLES.has(role) ? result : stripInventoryCostData(result);
   if (context === 'users') {
-    return SALARY_RESTRICTED_ROLES.has(role) ? map(value, stripSalary) : value;
+    return protectInventoryCosts(SALARY_RESTRICTED_ROLES.has(role) ? map(value, stripSalary) : value);
   }
   if (context === 'invoice' || context === 'invoices') {
     const costingSafeValue = FINANCE_COSTING_ROLES.has(role)
       ? value
       : map(value, invoice => omit(invoice, ['financeCosting']));
-    return QUANTITY_ONLY_ROLES.has(role) ? map(costingSafeValue, stripInvoice) : costingSafeValue;
+    return protectInventoryCosts(QUANTITY_ONLY_ROLES.has(role) ? map(costingSafeValue, stripInvoice) : costingSafeValue);
   }
-  if (!QUANTITY_ONLY_ROLES.has(role)) return value;
+  if (!QUANTITY_ONLY_ROLES.has(role)) return protectInventoryCosts(value);
 
+  let result;
   switch (context) {
     case 'sales-order':
-    case 'sales-orders': return map(value, stripSalesOrder);
+    case 'sales-orders': result = map(value, stripSalesOrder); break;
     case 'delivery-note':
-    case 'delivery-notes': return map(value, stripDeliveryNote);
+    case 'delivery-notes': result = map(value, stripDeliveryNote); break;
     case 'deal':
-    case 'deals': return map(value, stripDeal);
+    case 'deals': result = map(value, stripDeal); break;
     case 'inventory-item':
-    case 'inventory-items': return map(value, stripInventory);
+    case 'inventory-items': result = map(value, stripInventory); break;
     case 'supplier-po':
-    case 'supplier-pos': return map(value, stripSupplierPO);
+    case 'supplier-pos': result = map(value, stripSupplierPO); break;
     case 'shipment':
-    case 'shipments': return map(value, stripShipment);
-    case 'overdue': return stripOverdue(value);
-    case 'document-package': return stripDocumentPackage(value);
+    case 'shipments': result = map(value, stripShipment); break;
+    case 'overdue': result = stripOverdue(value); break;
+    case 'document-package': result = stripDocumentPackage(value); break;
     case 'import-inventory': {
-      const result = clone(value) || {};
+      result = clone(value) || {};
       if (result.stats) result.stats = omit(result.stats, ['totalInventoryValue', 'inventoryValue', 'stockValue']);
       if (Array.isArray(result.data)) result.data = result.data.map(stripInventory);
-      return result;
+      break;
     }
     default:
       throw new Error(`Unknown monetary visibility context: ${context}`);
   }
+  return protectInventoryCosts(result);
 };
 
 module.exports = { serializeMonetaryVisibility };
