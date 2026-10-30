@@ -27,6 +27,7 @@ const targetPerformanceRoutes = require('./routes/targetPerformanceRoutes');
 const supportTicketRoutes = require('./routes/supportTicketRoutes');
 const exchangeRateRoutes = require('./routes/exchangeRateRoutes');
 const orderTrackerRoutes = require('./routes/orderTrackerRoutes');
+const inventoryCostingRoutes = require('./routes/inventoryCostingRoutes');
 const { enforceOrderTrackerReadOnly } = require('./middleware/authMiddleware');
 
 // Load environment variables
@@ -119,6 +120,7 @@ app.use('/api/target-performance', targetPerformanceRoutes);
 app.use('/api/support-tickets', supportTicketRoutes);
 app.use('/api/exchange-rates', exchangeRateRoutes);
 app.use('/api/order-tracker', orderTrackerRoutes);
+app.use('/api/inventory-costing', inventoryCostingRoutes);
 
 // Root Fallback Route
 app.get('/', (req, res) => {

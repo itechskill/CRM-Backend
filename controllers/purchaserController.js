@@ -2299,11 +2299,19 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
     const finalSku = sku || productCode || (targetId ? undefined : `SKU-${Date.now().toString().slice(-6)}`);
     const finalQty = quantityOnHand !== undefined ? Number(quantityOnHand) : (quantity !== undefined ? Number(quantity) : undefined);
     const finalPrice = unitPrice !== undefined ? Number(unitPrice) : undefined;
+    const submittedCost = req.user?.role === 'admin' && req.body.unitCostPKR !== undefined && req.body.unitCostPKR !== ''
+      ? Math.round(Number(req.body.unitCostPKR) * 100)
+      : null;
+    if (submittedCost !== null && (!Number.isFinite(submittedCost) || submittedCost < 0)) {
+      return res.status(400).json({ success: false, message: 'Unit Cost (PKR) must be a valid amount.' });
+    }
     const finalMin = minStockLevel !== undefined ? Number(minStockLevel) : undefined;
 
     let item;
     const mongoose = require('mongoose');
     if (targetId && mongoose.Types.ObjectId.isValid(targetId)) {
+      const existing = await InventoryItem.findById(targetId);
+      if (!existing) return res.status(404).json({ success: false, message: 'Inventory item not found.' });
       const updateData = {};
       if (finalName) updateData.name = finalName;
       if (finalSku !== undefined) updateData.sku = finalSku;
@@ -2316,19 +2324,26 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
       if (location !== undefined) updateData.location = location;
       if (description !== undefined) updateData.description = description;
 
-      item = await InventoryItem.findByIdAndUpdate(
-        targetId,
-        updateData,
-        { new: true, runValidators: true }
-      );
-      if (!item) {
-        return res.status(404).json({ success: false, message: 'Inventory item not found.' });
-      }
+      const addedQuantity = finalQty === undefined ? 0 : finalQty - (Number(existing.quantityOnHand) || 0);
+      if (addedQuantity < 0) return res.status(400).json({ success: false, message: 'Use the stock issue workflow to reduce inventory quantity.' });
+      const update = { $set: updateData };
+      if (addedQuantity > 0) update.$push = { costBatches: {
+        source: 'Manual stock entry', receivedAt: new Date(), quantityReceived: addedQuantity, quantityRemaining: addedQuantity,
+        unitCostPKRCents: submittedCost, costStatus: submittedCost === null ? 'not recorded' : 'recorded',
+        enteredBy: req.user._id, enteredByName: req.user.fullName || '', note: String(req.body.costNote || '').trim()
+      } };
+      item = await InventoryItem.findByIdAndUpdate(targetId, update, { new: true, runValidators: true });
     } else {
       // Check if product with this name already exists
       item = await InventoryItem.findOne({ name: new RegExp('^' + finalName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
       if (item) {
-        item.quantityOnHand = (item.quantityOnHand || 0) + (finalQty !== undefined ? finalQty : 0);
+        const addedQuantity = finalQty !== undefined ? finalQty : 0;
+        item.quantityOnHand = (item.quantityOnHand || 0) + addedQuantity;
+        if (addedQuantity > 0) item.costBatches.push({
+          source: 'Manual stock entry', receivedAt: new Date(), quantityReceived: addedQuantity, quantityRemaining: addedQuantity,
+          unitCostPKRCents: submittedCost, costStatus: submittedCost === null ? 'not recorded' : 'recorded',
+          enteredBy: req.user._id, enteredByName: req.user.fullName || '', note: String(req.body.costNote || '').trim()
+        });
         if (finalPrice !== undefined && finalPrice > 0) item.unitPrice = finalPrice;
         if (location) item.location = location;
         if (finalSku) item.sku = finalSku;
@@ -2350,6 +2365,11 @@ exports.createOrUpdatePurchaserInventory = async (req, res) => {
           unitPrice: finalPrice !== undefined ? finalPrice : 0,
           location: location || '',
           description: description || ''
+          ,costBatches: finalQty > 0 ? [{
+            source: 'Manual stock entry', receivedAt: new Date(), quantityReceived: finalQty, quantityRemaining: finalQty,
+            unitCostPKRCents: submittedCost, costStatus: submittedCost === null ? 'not recorded' : 'recorded',
+            enteredBy: req.user._id, enteredByName: req.user.fullName || '', note: String(req.body.costNote || '').trim()
+          }] : []
         });
       }
     }

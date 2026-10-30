@@ -82,6 +82,7 @@ const deriveOrderTrackerStage = ({ order = {}, supplierPOs = [], grns = [], deli
 const FORBIDDEN_TRACKER_KEYS = new Set([
   'salary', 'salarytarget', 'monthlysalessalarycents', 'monthlysalary', 'basesalary', 'netsalary',
   'purchaseexpenses', 'expenses', 'costingstatus', 'costinghistory', 'financecosting', 'cogs', 'cogscents',
+  'costbatches', 'batchallocations', 'batchallocationsrestoredat', 'unitcostpkrcents', 'liveunitcostpkrcents', 'costhistory',
   'grossprofit', 'grossprofitcents', 'totalcostpkr', 'exchangerate', 'exchangeratetopkr', 'exchangeratehistory'
 ]);
 

@@ -34,6 +34,11 @@ const DeliveryNoteSchema = new mongoose.Schema(
         orderItemId: { type: String, default: '' },
         orderItemIndex: { type: Number, default: 0 },
         inventoryItem: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryItem', default: null },
+        batchAllocations: [{
+          _id: false,
+          batchId: { type: mongoose.Schema.Types.ObjectId, required: true },
+          quantity: { type: Number, required: true, min: 0 }
+        }],
         unitPrice: { type: Number, default: 0 },
         lineTotal: { type: Number, default: 0 }
       }
@@ -63,6 +68,7 @@ const DeliveryNoteSchema = new mongoose.Schema(
     isPartial: { type: Boolean, default: false },
     isStockDeducted: { type: Boolean, default: false },
     stockDeductionClaimedAt: { type: Date, default: null },
+    batchAllocationsRestoredAt: { type: Date, default: null },
     invoiced: { type: Boolean, default: false },
     invoiceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
     invoiceNumber: { type: String, default: '' },

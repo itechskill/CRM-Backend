@@ -60,6 +60,11 @@ const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 const { calculateDocumentFinancials, normalizePartNumber, normalizeCommercialItems } = require('../utils/documentFinancials');
 const { resolveDocumentPartNumbers, resolveDocumentsPartNumbers } = require('../utils/documentPartNumbers');
 const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
+const {
+  allocateInventoryBatches,
+  restoreDeliveryNoteBatches,
+  basePOLineUnitCostCents
+} = require('../utils/inventoryCosting');
 
 // ─────────────────────────────────────────────
 // Helper: Log a sales activity
@@ -3304,7 +3309,16 @@ const createMyDeliveryNote = async (req, res) => {
         });
       }
 
-      const cleanDnItems = dnItems.map(({ reservation, ...line }) => line);
+      const cleanDnItems = [];
+      for (const { reservation, ...line } of dnItems) {
+        line.batchAllocations = await allocateInventoryBatches({
+          inventoryItemId: line.inventoryItem,
+          quantity: line.quantity,
+          user: req.user,
+          session
+        });
+        cleanDnItems.push(line);
+      }
       const remainingQuantity = stock.requirements.reduce((sum, line) => sum + line.requiredQty, 0);
       const deliveryQuantity = cleanDnItems.reduce((sum, line) => sum + line.quantity, 0);
       const subtotal = cleanDnItems.reduce((sum, line) => sum + line.lineTotal, 0);
@@ -4108,6 +4122,7 @@ const updateMyDeliveryNote = async (req, res) => {
             reason: `Delivery Note marked ${req.body.status}.`,
             session
           });
+          await restoreDeliveryNoteBatches({ deliveryNote: currentDeliveryNote, session });
           order.status = req.body.status;
           order.workflowStatus = req.body.status;
           order.currentDepartment = 'Support';
@@ -4168,6 +4183,7 @@ const deleteMyDeliveryNote = async (req, res) => {
             reason: `Delivery Note ${deliveryNote.deliveryNumber || deliveryNote.deliveryNoteNumber} deleted.`,
             session
           });
+          await restoreDeliveryNoteBatches({ deliveryNote, session });
           order.status = 'Pending Delivery Note';
           order.workflowStatus = 'Pending Delivery Note';
           order.currentDepartment = 'Support';
@@ -5520,6 +5536,11 @@ const recordGoodsReceivedInOffice = async (req, res) => {
           }
         }
 
+        const supplierPOLine = (supplierPO?.items || []).find(line =>
+          (line._id && String(line._id) === String(orderItem.supplierPOLineId || '')) ||
+          normalizeInventoryName(line.productName || line.description) === normalizeInventoryName(orderItem.description)
+        );
+        const unitCostPKRCents = basePOLineUnitCostCents(supplierPO, supplierPOLine);
         const movement = {
           type: 'IN',
           quantity: receivedQty,
@@ -5534,7 +5555,27 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         };
         const updatedInventory = await InventoryItem.findByIdAndUpdate(
           inventoryItem._id,
-          { $inc: { quantityOnHand: receivedQty }, $push: { stockMovements: movement } },
+          {
+            $inc: { quantityOnHand: receivedQty },
+            $push: {
+              stockMovements: movement,
+              costBatches: {
+                source: supplierPO ? 'Support Receive Goods from Supplier PO' : 'Inventory IN',
+                supplierPO: supplierPO?._id || null,
+                supplierPONumber: supplierPO?.poNumber || '',
+                supplierPOLineId: supplierPOLine?._id || null,
+                grnNumber,
+                receivedAt: new Date(),
+                quantityReceived: receivedQty,
+                quantityRemaining: receivedQty,
+                unitCostPKRCents,
+                costStatus: unitCostPKRCents === null ? 'not recorded' : 'recorded',
+                enteredBy: req.user._id,
+                enteredByName: req.user.fullName || '',
+                note: String(req.body.remarks || '').trim()
+              }
+            }
+          },
           { new: true, runValidators: true, session }
         );
         const available = Math.max(0, (updatedInventory.quantityOnHand || 0) - (updatedInventory.reservedQuantity || 0));
@@ -5671,6 +5712,12 @@ const recordGoodsReceivedInOffice = async (req, res) => {
         createdBy: req.user._id,
         createdByName: req.user.fullName
       }], { session });
+
+      await InventoryItem.updateMany(
+        { 'costBatches.grnNumber': grnNumber },
+        { $set: { 'costBatches.$[batch].grn': createdGrns[0]._id } },
+        { arrayFilters: [{ 'batch.grnNumber': grnNumber }], session }
+      );
 
       if (order.fileType === 'Green' && supplierPO) {
         await SupplierPO.updateOne(
@@ -6037,19 +6084,37 @@ const createOrUpdateInventoryItem = async (req, res) => {
     }
 
     let item;
-    const maySetPrice = req.user.role === 'admin';
+    const maySetCost = ['finance', 'admin'].includes(req.user.role);
+    const submittedCost = maySetCost && req.body.unitCostPKR !== '' && req.body.unitCostPKR !== null && req.body.unitCostPKR !== undefined
+      ? Math.round(Number(req.body.unitCostPKR) * 100)
+      : null;
+    if (submittedCost !== null && (!Number.isFinite(submittedCost) || submittedCost < 0)) {
+      return res.status(400).json({ success: false, message: 'Unit Cost (PKR) must be a valid amount.' });
+    }
     if (id) {
-      const update = { name, sku, partNumber: String(partNumber || '').trim(), category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5, location, description };
-      if (maySetPrice) update.unitPrice = Number(unitPrice) || 0;
-      item = await InventoryItem.findByIdAndUpdate(
-        id,
-        update,
-        { new: true, runValidators: true }
-      );
+      item = await InventoryItem.findById(id);
+      if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+      const oldQuantity = Number(item.quantityOnHand) || 0;
+      const nextQuantity = Number(quantityOnHand) || 0;
+      if (nextQuantity < oldQuantity) return res.status(400).json({ success: false, message: 'Use the stock issue workflow to reduce inventory quantity.' });
+      Object.assign(item, { name, sku, partNumber: String(partNumber || '').trim(), category, unit, quantityOnHand: nextQuantity, minStockLevel: Number(minStockLevel) || 5, location, description });
+      if (req.user.role === 'admin' && unitPrice !== undefined) item.unitPrice = Number(unitPrice) || 0;
+      const added = nextQuantity - oldQuantity;
+      if (added > 0) item.costBatches.push({
+        source: 'Manual stock entry', receivedAt: new Date(), quantityReceived: added, quantityRemaining: added,
+        unitCostPKRCents: submittedCost, costStatus: submittedCost === null ? 'not recorded' : 'recorded',
+        enteredBy: req.user._id, enteredByName: req.user.fullName || '', note: String(req.body.costNote || '').trim()
+      });
+      await item.save();
     } else {
       item = await InventoryItem.create({
         name, sku, partNumber: String(partNumber || '').trim(), category, unit, quantityOnHand: Number(quantityOnHand) || 0, minStockLevel: Number(minStockLevel) || 5,
-        unitPrice: maySetPrice ? (Number(unitPrice) || 0) : 0, location, description
+        unitPrice: req.user.role === 'admin' ? (Number(unitPrice) || 0) : 0, location, description,
+        costBatches: Number(quantityOnHand) > 0 ? [{
+          source: 'Manual stock entry', receivedAt: new Date(), quantityReceived: Number(quantityOnHand), quantityRemaining: Number(quantityOnHand),
+          unitCostPKRCents: submittedCost, costStatus: submittedCost === null ? 'not recorded' : 'recorded',
+          enteredBy: req.user._id, enteredByName: req.user.fullName || '', note: String(req.body.costNote || '').trim()
+        }] : []
       });
     }
 
@@ -6094,9 +6159,26 @@ const addInventoryStock = async (req, res) => {
         performedByName: req.user.fullName,
         timestamp: new Date()
       };
+      const maySetCost = ['finance', 'admin'].includes(req.user.role);
+      const submittedCost = maySetCost && req.body.unitCostPKR !== '' && req.body.unitCostPKR !== null && req.body.unitCostPKR !== undefined
+        ? Math.round(Number(req.body.unitCostPKR) * 100)
+        : null;
+      if (submittedCost !== null && (!Number.isFinite(submittedCost) || submittedCost < 0)) {
+        throw createHttpError(400, 'Unit Cost (PKR) must be a valid amount.');
+      }
       savedItem = await InventoryItem.findByIdAndUpdate(
         existingItem._id,
-        { $inc: { quantityOnHand: quantity }, $push: { stockMovements: movement } },
+        {
+          $inc: { quantityOnHand: quantity },
+          $push: {
+            stockMovements: movement,
+            costBatches: {
+              source: 'Inventory IN', grnNumber, receivedAt: new Date(), quantityReceived: quantity, quantityRemaining: quantity,
+              unitCostPKRCents: submittedCost, costStatus: submittedCost === null ? 'not recorded' : 'recorded',
+              enteredBy: req.user._id, enteredByName: req.user.fullName || '', note: String(req.body.costNote || req.body.remarks || '').trim()
+            }
+          }
+        },
         { new: true, runValidators: true, session }
       );
       const available = Math.max(0, (savedItem.quantityOnHand || 0) - (savedItem.reservedQuantity || 0));
@@ -6134,6 +6216,12 @@ const addInventoryStock = async (req, res) => {
         createdBy: req.user._id,
         createdByName: req.user.fullName
       }], { session });
+
+      await InventoryItem.updateOne(
+        { _id: savedItem._id, 'costBatches.grnNumber': grnNumber },
+        { $set: { 'costBatches.$[batch].grn': createdGrns[0]._id } },
+        { arrayFilters: [{ 'batch.grnNumber': grnNumber }], session }
+      );
 
       if (order) {
         if (!order.inventoryGrnNumbers.includes(grnNumber)) order.inventoryGrnNumbers.push(grnNumber);
