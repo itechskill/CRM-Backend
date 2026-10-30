@@ -29,6 +29,7 @@ const {
   convertProductFileToSalesOrder,
   checkCustomerOverdueApi,
   getMyOrders,
+  getMyOrderActivity,
   getAvailableOrdersForDelivery,
   checkOrderStock,
   checkDeliveryNoteStock,
@@ -140,6 +141,7 @@ router.delete('/quotations/:id', salesGuard, deleteMyQuotation);
 
 // Sales Orders & Support Handoff
 router.get('/orders', departmentReadGuard, getMyOrders);
+router.get('/orders/:id/activity', salesGuard, getMyOrderActivity);
 router.get('/orders/available-for-delivery', salesAndSupportGuard, getAvailableOrdersForDelivery);
 router.get('/orders/:id/stock-check', salesAndSupportGuard, checkOrderStock);
 router.get('/orders/:id/receiving-preview', supportInventoryReadGuard, getGoodsReceivingPreview);

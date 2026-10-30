@@ -93,12 +93,70 @@ const populateRequest = (query) => query
 const serializeRequest = (request) => {
   const plain = request?.toObject ? request.toObject() : request;
   const created = plain?.createdAt ? new Date(plain.createdAt).getTime() : Date.now();
+  const items = normalizeRequestItems(plain);
+  const grandTotalCents = items.every(item => Number.isSafeInteger(item.totalPriceCents))
+    ? items.reduce((sum, item) => sum + item.totalPriceCents, 0)
+    : null;
   return {
     ...plain,
+    items,
+    itemCount: items.length,
+    firstItemName: items[0]?.requirement || items[0]?.partNumber || items[0]?.brand || '',
+    grandTotalCents,
     pendingAgeDays: plain?.status === 'Pending'
       ? Math.max(0, Math.floor((Date.now() - created) / 86400000))
       : null
   };
+};
+
+function normalizeRequestItems(request = {}) {
+  const source = Array.isArray(request.items) && request.items.length ? request.items : [{
+    brand: request.brand,
+    category: request.category,
+    isBulk: request.isBulk,
+    partNumber: request.partNumber,
+    requirement: request.requirement,
+    quantity: request.quantity,
+    unitPriceCents: request.unitPriceCents,
+    totalPriceCents: request.totalPriceCents
+  }];
+  return source.map((item, index) => {
+    const quantity = Math.max(1, Number(item.quantity) || 1);
+    const unitPriceCents = Number.isSafeInteger(item.unitPriceCents) ? item.unitPriceCents : null;
+    return {
+      ...(item?._id ? { _id: item._id } : { legacyIndex: index }),
+      brand: String(item.brand || '').trim(),
+      category: item.category,
+      isBulk: Boolean(item.isBulk),
+      partNumber: String(item.partNumber || '').trim(),
+      requirement: String(item.requirement || '').trim(),
+      quantity,
+      unitPriceCents,
+      totalPriceCents: unitPriceCents === null ? null : unitPriceCents * quantity
+    };
+  });
+}
+
+const validateRequestItems = body => {
+  const source = Array.isArray(body.items) ? body.items : [body];
+  if (source.length < 1 || source.length > 50) return { error: 'Add between 1 and 50 items.' };
+  const items = [];
+  for (let index = 0; index < source.length; index += 1) {
+    const item = source[index] || {};
+    const brand = String(item.brand || '').trim();
+    const requirement = String(item.requirement || '').trim();
+    const quantity = Number(item.quantity || 1);
+    if (!brand) return { error: `Item ${index + 1}: Brand is required.` };
+    if (!requirement) return { error: `Item ${index + 1}: Product / requirement is required.` };
+    if (!PRICE_REQUEST_CATEGORIES.includes(item.category)) return { error: `Item ${index + 1}: Select a valid category.` };
+    if (!Number.isInteger(quantity) || quantity < 1) return { error: `Item ${index + 1}: Quantity must be a positive whole number.` };
+    items.push({
+      brand, category: item.category, isBulk: Boolean(item.isBulk),
+      partNumber: String(item.partNumber || '').trim(), requirement, quantity,
+      unitPriceCents: null, totalPriceCents: null
+    });
+  }
+  return { items };
 };
 
 const getPriceRequests = async (req, res) => {
@@ -118,7 +176,10 @@ const getPriceRequests = async (req, res) => {
         { brand: regex },
         { customerName: regex },
         { reference: regex },
-        { partNumber: regex }
+        { partNumber: regex },
+        { 'items.requirement': regex },
+        { 'items.brand': regex },
+        { 'items.partNumber': regex }
       ];
     }
 
@@ -164,28 +225,16 @@ const createPriceRequest = async (req, res) => {
   try {
     const {
       requestedFrom,
-      brand,
-      category,
-      isBulk,
       leadSource,
       leadSourceNote,
       customerName,
       reference,
-      partNumber,
-      requirement,
-      quantity,
       pendingNote
     } = req.body;
-
-    if (!String(requirement || '').trim()) {
-      return res.status(400).json({ success: false, message: 'Requirement is required.' });
-    }
-    if (!String(brand || '').trim()) {
-      return res.status(400).json({ success: false, message: 'Brand is required.' });
-    }
-    if (!PRICE_REQUEST_CATEGORIES.includes(category)) {
-      return res.status(400).json({ success: false, message: 'Select a valid category.' });
-    }
+    const validatedItems = validateRequestItems(req.body);
+    if (validatedItems.error) return res.status(400).json({ success: false, message: validatedItems.error });
+    const requestItems = validatedItems.items;
+    const firstItem = requestItems[0];
     if (!PRICE_REQUEST_LEAD_SOURCES.includes(leadSource)) {
       return res.status(400).json({ success: false, message: 'Select a valid lead source.' });
     }
@@ -193,11 +242,6 @@ const createPriceRequest = async (req, res) => {
     if (normalizedLeadSourceNote.length > 200) {
       return res.status(400).json({ success: false, message: 'Lead source note cannot exceed 200 characters.' });
     }
-    const parsedQuantity = Number(quantity || 1);
-    if (!Number.isInteger(parsedQuantity) || parsedQuantity < 1) {
-      return res.status(400).json({ success: false, message: 'Quantity must be a positive whole number.' });
-    }
-
     const recipient = await findEligibleUser(requestedFrom);
     if (!recipient) {
       return res.status(400).json({ success: false, message: 'Select an active Price Requests user.' });
@@ -209,16 +253,17 @@ const createPriceRequest = async (req, res) => {
       requestNumber,
       requestedBy: req.user._id,
       requestedFrom: recipient._id,
-      brand: String(brand).trim(),
-      category,
-      isBulk: Boolean(isBulk),
+      brand: firstItem.brand,
+      category: firstItem.category,
+      isBulk: firstItem.isBulk,
       leadSource,
       leadSourceNote: leadSource === 'Other' ? normalizedLeadSourceNote : '',
       customerName: String(customerName || '').trim(),
       reference: String(reference || '').trim(),
-      partNumber: String(partNumber || '').trim(),
-      requirement: String(requirement).trim(),
-      quantity: parsedQuantity,
+      partNumber: firstItem.partNumber,
+      requirement: firstItem.requirement,
+      quantity: firstItem.quantity,
+      items: requestItems,
       pendingNote: note,
       events: [{
         action: 'Created',
@@ -232,7 +277,7 @@ const createPriceRequest = async (req, res) => {
       recipient: recipient._id,
       sender: req.user._id,
       title: `Price request ${requestNumber}`,
-      message: `${req.user.fullName} requested a price for ${priceRequest.requirement}.`,
+      message: `${req.user.fullName} requested prices for ${requestItems.length} item${requestItems.length === 1 ? '' : 's'}: ${requestItems.map(item => item.requirement).join(', ')}.`,
       type: 'system',
       link: 'price_requests'
     });
@@ -262,11 +307,7 @@ const explainPendingMutationFailure = async (res, requestId, userId, recipientOn
 
 const priceRequest = async (req, res) => {
   try {
-    const unitPriceCents = Number(req.body.unitPriceCents);
     const currency = String(req.body.currency || '').toUpperCase();
-    if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0) {
-      return res.status(400).json({ success: false, message: 'Unit price is required and must be integer cents.' });
-    }
     if (!PRICE_REQUEST_CURRENCIES.includes(currency)) {
       return res.status(400).json({ success: false, message: 'Select a supported currency.' });
     }
@@ -276,12 +317,44 @@ const priceRequest = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Validity date is invalid.' });
     }
 
+    const existing = mongoose.Types.ObjectId.isValid(req.params.id)
+      ? await PriceRequest.findOne({ _id: req.params.id, status: 'Pending', requestedFrom: req.user._id })
+      : null;
+    if (!existing) return explainPendingMutationFailure(res, req.params.id, req.user._id, true);
+    const currentItems = normalizeRequestItems(existing);
+    const submitted = Array.isArray(req.body.items)
+      ? req.body.items
+      : [{ unitPriceCents: req.body.unitPriceCents }];
+    if (submitted.length !== currentItems.length) {
+      return res.status(400).json({ success: false, message: 'Provide a unit price for every requested item.' });
+    }
+    const pricedItems = currentItems.map((item, index) => {
+      const supplied = submitted[index] || {};
+      const unitPriceCents = Number(supplied.unitPriceCents);
+      if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents < 0 || !Number.isSafeInteger(unitPriceCents * item.quantity)) return null;
+      return {
+        brand: item.brand, category: item.category, isBulk: item.isBulk,
+        partNumber: item.partNumber, requirement: item.requirement, quantity: item.quantity,
+        unitPriceCents, totalPriceCents: unitPriceCents * item.quantity
+      };
+    });
+    if (pricedItems.some(item => !item)) {
+      return res.status(400).json({ success: false, message: 'Every item requires a valid unit price in integer cents.' });
+    }
+    const grandTotalCents = pricedItems.reduce((sum, item) => sum + item.totalPriceCents, 0);
+    if (!Number.isSafeInteger(grandTotalCents)) return res.status(400).json({ success: false, message: 'The Price Request grand total is too large.' });
+    const first = pricedItems[0];
+    const priceSummary = pricedItems.map(item => `${item.requirement}: Unit Price ${currency} ${(item.unitPriceCents / 100).toFixed(2)}, Quantity ${item.quantity}, Total Price ${currency} ${(item.totalPriceCents / 100).toFixed(2)}`).join('; ');
+
     const updated = await PriceRequest.findOneAndUpdate(
-      { _id: req.params.id, status: 'Pending', requestedFrom: req.user._id },
+      { _id: existing._id, status: 'Pending', requestedFrom: req.user._id },
       {
         $set: {
           status: 'Priced',
-          unitPriceCents,
+          items: pricedItems,
+          unitPriceCents: first.unitPriceCents,
+          totalPriceCents: first.totalPriceCents,
+          grandTotalCents,
           currency,
           validityDate,
           leadTime: String(req.body.leadTime || '').trim(),
@@ -292,7 +365,7 @@ const priceRequest = async (req, res) => {
           events: {
             action: 'Priced',
             actor: req.user._id,
-            note: `${currency} ${(unitPriceCents / 100).toFixed(2)}`
+            note: priceSummary
           }
         }
       },
@@ -304,7 +377,7 @@ const priceRequest = async (req, res) => {
       recipient: updated.requestedBy,
       sender: req.user._id,
       title: `${updated.requestNumber} priced`,
-      message: `${req.user.fullName} provided ${currency} ${(unitPriceCents / 100).toFixed(2)}.`,
+      message: `${req.user.fullName} priced ${pricedItems.length} item${pricedItems.length === 1 ? '' : 's'}. ${priceSummary}. Grand Total ${currency} ${(grandTotalCents / 100).toFixed(2)}.`,
       type: 'system',
       link: 'price_requests'
     });
@@ -488,32 +561,34 @@ const linkQuotation = async (req, res) => {
 
 const getRoutingSuggestion = async (req, res) => {
   try {
-    const category = String(req.query.category || '');
-    const brand = String(req.query.brand || '');
-    const isBulk = String(req.query.isBulk || '').toLowerCase() === 'true';
-    let ruleType = null;
-    let matchValue = '';
-    if (category === 'Servers') {
-      ruleType = 'category';
-      matchValue = category;
-    } else if (isBulk && category === 'Desktops/Laptops/Workstations') {
-      ruleType = 'bulkCategory';
-      matchValue = category;
-    } else if (brand) {
-      ruleType = 'brand';
-      matchValue = brand;
+    let items = Array.isArray(req.body?.items) ? req.body.items : null;
+    if (!items && req.query.items) {
+      try { items = JSON.parse(String(req.query.items)); } catch { items = null; }
     }
-
-    if (!ruleType) return res.status(200).json({ success: true, data: null });
-    const rule = await PriceRequestRoutingRule.findOne({
-      ruleType,
-      active: true,
-      normalizedMatchValues: normalizeValue(matchValue)
-    }).populate('assignee', 'fullName role priceRequestLabel');
-    if (!rule?.assignee || !isFeatureUser(rule.assignee)) {
+    if (!Array.isArray(items) || !items.length) items = [{
+      category: String(req.query.category || ''),
+      brand: String(req.query.brand || ''),
+      isBulk: String(req.query.isBulk || '').toLowerCase() === 'true'
+    }];
+    const rules = await PriceRequestRoutingRule.find({ active: true })
+      .populate('assignee', 'fullName role priceRequestLabel')
+      .sort({ priority: -1 });
+    const matches = items.map(item => {
+      const category = String(item.category || '');
+      const brand = String(item.brand || '');
+      const isBulk = Boolean(item.isBulk);
+      const ruleType = category === 'Servers'
+        ? 'category'
+        : (isBulk && category === 'Desktops/Laptops/Workstations' ? 'bulkCategory' : 'brand');
+      const matchValue = ruleType === 'brand' ? brand : category;
+      return rules.find(rule => rule.ruleType === ruleType && rule.normalizedMatchValues.includes(normalizeValue(matchValue))) || null;
+    });
+    if (matches.some(rule => !rule?.assignee || !isFeatureUser(rule.assignee))) {
       return res.status(200).json({ success: true, data: null });
     }
-    return res.status(200).json({ success: true, data: { rule, assignee: rule.assignee } });
+    const assigneeIds = new Set(matches.map(rule => String(rule.assignee._id)));
+    if (assigneeIds.size !== 1) return res.status(200).json({ success: true, data: null });
+    return res.status(200).json({ success: true, data: { rule: matches[0], assignee: matches[0].assignee, matchedItems: items.length } });
   } catch (error) {
     console.error('[Routing Suggestion Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error resolving routing suggestion.' });

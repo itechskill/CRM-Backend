@@ -25,12 +25,17 @@ const latestShipmentNote = shipment => {
 const deriveOrderTrackerStage = ({ order = {}, supplierPOs = [], grns = [], deliveryNotes = [], shipments = [], invoices = [] } = {}) => {
   const status = text(order.workflowStatus || order.status);
   const statusLower = lower(status);
+  const department = text(order.currentDepartment || order.departmentResponsible);
+  const departmentLower = lower(department);
   const payment = paymentSummary(invoices);
   const latestInvoice = invoices[0];
   const latestDn = deliveryNotes[0];
   const latestShipment = shipments[0];
   const latestPo = supplierPOs[0];
 
+  if (statusLower.includes('reject') || statusLower.includes('cancel')) {
+    return { department: text(order.currentDepartment || order.departmentResponsible) || 'Sales', stage: status || 'Rejected', why: text(order.financeRejectionReason || order.rejectionReason || order.lastAction) || status, payment };
+  }
   if (payment.key === 'paid') return { department: 'Finance', stage: 'Paid', why: 'Payment received in full', payment };
   if (latestInvoice) {
     const finalized = latestInvoice.isDraft === false || ['finalized', 'approved', 'sent', 'partially paid', 'overdue', 'paid'].includes(lower(latestInvoice.status));
@@ -68,11 +73,27 @@ const deriveOrderTrackerStage = ({ order = {}, supplierPOs = [], grns = [], deli
   if (statusLower.includes('international') || statusLower.includes('global') || (latestPo && lower(latestPo.poType) === 'global')) {
     return { department: text(order.currentDepartment) || 'Global Purchaser', stage: status || 'Global Purchase', why: status || 'Global purchase workflow in progress', payment };
   }
-  if (!order.financeApprovedAt && !order.financeApprovedBy) {
+  if (departmentLower.includes('logistic')) {
+    return { department: department || 'Logistics', stage: text(order.shipmentStatus) || status || 'Logistics', why: text(order.lastAction) || status || 'Shipment is with Logistics', payment };
+  }
+  if (departmentLower.includes('local purchaser')) {
+    const stage = statusLower.includes('finance approved') ? 'Local Purchase' : (status || 'Local Purchase');
+    return { department: department, stage, why: text(order.lastAction) || (stage === 'Local Purchase' ? 'Shortage - Local Purchase handling procurement' : status) || 'Local procurement in progress', payment };
+  }
+  if (departmentLower.includes('global purchaser') || departmentLower.includes('purchaser')) {
+    const stage = statusLower.includes('finance approved') ? 'Global Purchase' : (status || 'Global Purchase');
+    return { department: department || 'Global Purchaser', stage, why: text(order.lastAction) || (stage === 'Global Purchase' ? 'Shortage - Global Purchase handling procurement' : status) || 'Procurement in progress', payment };
+  }
+  const explicitlyPendingFinance = statusLower.includes('pending finance') || departmentLower === 'finance';
+  const explicitlyApproved = statusLower.includes('finance approved') || Boolean(order.financeApprovedAt || order.financeApprovedBy);
+  if (explicitlyPendingFinance || !explicitlyApproved) {
     return { department: 'Finance', stage: 'Pending Finance Approval', why: 'Awaiting Finance approval', payment };
   }
+  if (departmentLower === 'support') {
+    return { department: 'Support', stage: status || 'Finance Approved', why: text(order.lastAction) || 'Finance approved - with Support', payment };
+  }
   return {
-    department: text(order.currentDepartment || order.departmentResponsible) || 'Sales',
+    department: department || 'Sales',
     stage: status || 'In progress',
     why: text(order.lastAction) || status || 'Workflow in progress',
     payment

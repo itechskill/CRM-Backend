@@ -8,6 +8,7 @@ const {
   materializeOpeningBatch,
   resolveBatchUnitCostCents
 } = require('../utils/inventoryCosting');
+const { invalidateTargetPerformanceCache } = require('../utils/targetPerformance');
 
 const inventoryCostReaders = ['finance', 'admin', 'ceo', 'accountant'];
 const inventoryCostEditors = ['finance', 'admin'];
@@ -103,6 +104,7 @@ const setInventoryBatchCost = async (req, res) => {
       output = { item, batch: batch.toObject(), oldCost, newCost, reason };
     });
     await notifyAdmins({ ...output, user: req.user });
+    invalidateTargetPerformanceCache();
     return res.json({ success: true, message: output.oldCost === null ? 'Inventory batch cost recorded.' : 'Inventory batch cost changed.', data: output.batch });
   } catch (error) {
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error updating inventory batch cost.' });

@@ -136,33 +136,68 @@ const resolveBatchUnitCostCents = async (batch, poCache = new Map()) => {
 };
 
 const resolveStockInvoiceCost = async ({ invoice, order }) => {
+  const results = await resolveStockInvoiceCosts({ invoices: [invoice], orders: order ? [order] : [] });
+  return results.get(idString(invoice?._id)) || { cogsCents: null, issue: 'Cost not recorded', source: 'stock' };
+};
+
+const resolveStockInvoiceCosts = async ({ invoices = [], orders = [] }) => {
   const DeliveryNoteModel = require('../models/DeliveryNote');
-  const query = invoice?.deliveryNoteId
-    ? { _id: invoice.deliveryNoteId }
-    : { salesOrder: order?._id || invoice?.salesOrderId, invoiceId: invoice?._id };
-  let notes = await DeliveryNoteModel.find(query).lean();
-  if (!notes.length && order?._id) notes = await DeliveryNoteModel.find({ salesOrder: order._id, invoiced: true }).lean();
+  const orderMap = new Map((orders || []).map(order => [idString(order._id), order]));
+  const explicitIds = invoices.map(invoice => invoice.deliveryNoteId).filter(Boolean);
+  const invoiceIds = invoices.map(invoice => invoice._id).filter(Boolean);
+  const orderIds = [...new Set(invoices.map(invoice => idString(invoice.salesOrderId)).filter(Boolean))];
+  const or = [];
+  if (explicitIds.length) or.push({ _id: { $in: explicitIds } });
+  if (invoiceIds.length) or.push({ invoiceId: { $in: invoiceIds } });
+  if (orderIds.length) or.push({ salesOrder: { $in: orderIds }, invoiced: true });
+  const notes = or.length ? await DeliveryNoteModel.find({ $or: or }).lean() : [];
+  if (!notes.length) {
+    return new Map(invoices.map(invoice => [idString(invoice._id), {
+      cogsCents: null,
+      issue: 'Cost not recorded',
+      source: 'stock'
+    }]));
+  }
   const itemIds = [...new Set(notes.flatMap(note => (note.items || []).map(line => idString(line.inventoryItem))).filter(Boolean))];
   const inventoryItems = await InventoryItem.find({ _id: { $in: itemIds } }).lean();
   const itemMap = new Map(inventoryItems.map(item => [idString(item._id), item]));
-  const poCache = new Map();
-  let cogsCents = 0;
-  let hasAllocation = false;
-  for (const note of notes) {
-    for (const line of note.items || []) {
-      const item = itemMap.get(idString(line.inventoryItem));
-      for (const allocation of line.batchAllocations || []) {
-        hasAllocation = true;
-        const batch = (item?.costBatches || []).find(candidate => idString(candidate._id) === idString(allocation.batchId));
-        const unitCost = await resolveBatchUnitCostCents(batch, poCache);
-        if (unitCost === null) return { cogsCents: null, issue: 'Cost not recorded', source: 'stock' };
-        cogsCents += Math.round((Number(allocation.quantity) || 0) * unitCost);
+  const batchPOIds = [...new Set(inventoryItems.flatMap(item => (item.costBatches || []).map(batch => idString(batch.supplierPO))).filter(Boolean))];
+  const batchPOs = batchPOIds.length ? await SupplierPO.find({ _id: { $in: batchPOIds } }).lean() : [];
+  const poCache = new Map(batchPOs.map(po => [idString(po._id), po]));
+  const results = new Map();
+  for (const invoice of invoices) {
+    const order = orderMap.get(idString(invoice.salesOrderId));
+    let invoiceNotes = invoice.deliveryNoteId ? notes.filter(note => idString(note._id) === idString(invoice.deliveryNoteId)) : [];
+    if (!invoiceNotes.length) invoiceNotes = notes.filter(note => idString(note.invoiceId) === idString(invoice._id));
+    if (!invoiceNotes.length) invoiceNotes = notes.filter(note => idString(note.salesOrder) === idString(order?._id || invoice.salesOrderId) && note.invoiced === true);
+    let cogsCents = 0;
+    let hasAllocation = false;
+    let missing = false;
+    for (const note of invoiceNotes) {
+      for (const line of note.items || []) {
+        const item = itemMap.get(idString(line.inventoryItem));
+        for (const allocation of line.batchAllocations || []) {
+          hasAllocation = true;
+          const batch = (item?.costBatches || []).find(candidate => idString(candidate._id) === idString(allocation.batchId));
+          let unitCost = null;
+          if (batch?.supplierPO) {
+            const po = poCache.get(idString(batch.supplierPO));
+            const poLine = (po?.items || []).find(candidate => idString(candidate._id) === idString(batch.supplierPOLineId));
+            const base = basePOLineUnitCostCents(po, poLine);
+            unitCost = base === null ? null : base + expensePerUnitCents(po);
+          } else if (batch?.costStatus === 'recorded' && Number.isSafeInteger(batch.unitCostPKRCents)) {
+            unitCost = batch.unitCostPKRCents;
+          }
+          if (unitCost === null) missing = true;
+          else cogsCents += Math.round((Number(allocation.quantity) || 0) * unitCost);
+        }
       }
     }
+    results.set(idString(invoice._id), !hasAllocation || missing
+      ? { cogsCents: null, issue: 'Cost not recorded', source: 'stock' }
+      : { cogsCents, issue: '', source: 'stock' });
   }
-  return hasAllocation
-    ? { cogsCents, issue: '', source: 'stock' }
-    : { cogsCents: null, issue: 'Cost not recorded', source: 'stock' };
+  return results;
 };
 
 const virtualOpeningBatch = async (item, session) => {
@@ -186,5 +221,6 @@ module.exports = {
   basePOLineUnitCostCents,
   expensePerUnitCents,
   resolveBatchUnitCostCents,
-  resolveStockInvoiceCost
+  resolveStockInvoiceCost,
+  resolveStockInvoiceCosts
 };

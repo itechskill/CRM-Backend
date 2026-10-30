@@ -25,6 +25,7 @@ router.get('/', getPriceRequests);
 router.get('/labelled-users', getLabelledUsers);
 router.post('/', createPriceRequest);
 router.get('/assignee-suggestion', getRoutingSuggestion);
+router.post('/assignee-suggestion', getRoutingSuggestion);
 router.get('/quotations', getAvailableQuotations);
 router.get('/routing-rules', getRoutingRules);
 router.post('/routing-rules', authorize('admin', 'ceo'), createRoutingRule);

@@ -193,4 +193,7 @@ const supplierPOSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+supplierPOSchema.index({ salesOrderId: 1, createdAt: -1 });
+supplierPOSchema.index({ costingStatus: 1, updatedAt: -1 });
+
 module.exports = mongoose.model('SupplierPO', supplierPOSchema);

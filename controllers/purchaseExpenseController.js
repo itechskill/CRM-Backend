@@ -11,6 +11,7 @@ const {
 } = require('../utils/purchaseExpenses');
 const { assertSupportedCurrency } = require('../config/currencies');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
+const { invalidateTargetPerformanceCache } = require('../utils/targetPerformance');
 
 const ADD_ROLES = new Set(['finance', 'admin']);
 const EDIT_ROLES = new Set(['finance', 'admin']);
@@ -210,6 +211,7 @@ exports.addSupplierPOExpense = async (req, res) => {
       await notifyAdminsOfExpense({ po, expense, action: 'Added', user: req.user, newValues: valuesForHistory(expense), session });
       response = poPayload(po);
     });
+    invalidateTargetPerformanceCache();
     return res.status(201).json({ success: true, data: response });
   } catch (error) {
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error adding Supplier PO expense.' });
@@ -238,6 +240,7 @@ exports.updateSupplierPOExpense = async (req, res) => {
       await notifyAdminsOfExpense({ po, expense, action: 'Edited', user: req.user, oldValues, newValues: valuesForHistory(expense), session });
       response = poPayload(po);
     });
+    invalidateTargetPerformanceCache();
     return res.json({ success: true, data: response });
   } catch (error) {
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error updating Supplier PO expense.' });
@@ -265,6 +268,7 @@ exports.removeSupplierPOExpense = async (req, res) => {
       await notifyAdminsOfExpense({ po, expense, action: 'Removed', user: req.user, oldValues, newValues: { ...oldValues, isDeleted: true }, session });
       response = poPayload(po);
     });
+    invalidateTargetPerformanceCache();
     return res.json({ success: true, data: response });
   } catch (error) {
     return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode ? error.message : 'Server error removing Supplier PO expense.' });
@@ -306,6 +310,7 @@ exports.updateSupplierPOCostingStatus = async (req, res) => {
       changedByName: req.user.fullName || ''
     });
     await po.save();
+    invalidateTargetPerformanceCache();
     return res.json({ success: true, data: poPayload(po) });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Server error updating costing status.' });

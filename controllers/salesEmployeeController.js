@@ -59,7 +59,8 @@ const { serializeMonetaryVisibility } = require('../utils/monetaryVisibility');
 const { getEffectiveExchangeRate } = require('../utils/exchangeRates');
 const { calculateDocumentFinancials, normalizePartNumber, normalizeCommercialItems } = require('../utils/documentFinancials');
 const { resolveDocumentPartNumbers, resolveDocumentsPartNumbers } = require('../utils/documentPartNumbers');
-const { addFinanceCostingToInvoices } = require('../utils/targetPerformance');
+const { loadSalesOrderWorkflow } = require('../utils/salesOrderActivity');
+const { addFinanceCostingToInvoices, invalidateTargetPerformanceCache } = require('../utils/targetPerformance');
 const {
   allocateInventoryBatches,
   restoreDeliveryNoteBatches,
@@ -2403,10 +2404,38 @@ const getMyOrders = async (req, res) => {
     }
 
     responseOrders = await resolveDocumentsPartNumbers(responseOrders, 'sales-order');
+    if (isSalesUser(req.user) || ['admin', 'ceo'].includes(req.user.role)) {
+      const workflowByOrder = await loadSalesOrderWorkflow(responseOrders);
+      responseOrders = responseOrders.map(order => ({
+        ...order,
+        workflowSummary: workflowByOrder.get(String(order._id)) || null
+      }));
+    }
     return res.status(200).json({ success: true, count: orders.length, data: serializeMonetaryVisibility(responseOrders, req.user, 'sales-orders') });
   } catch (error) {
     console.error('[Get Orders Error]:', error);
     return res.status(500).json({ success: false, message: 'Server error fetching orders.' });
+  }
+};
+
+const getMyOrderActivity = async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    }
+    const order = await SalesOrder.findById(req.params.id)
+      .populate('createdBy salesPerson owner financeApprovedBy', 'fullName role department')
+      .lean();
+    if (!order) return res.status(404).json({ success: false, message: 'Sales Order not found.' });
+    if (!ownsSalesRecord(order, req.user)) return ownershipDenied(res, 'sales orders');
+    const workflowByOrder = await loadSalesOrderWorkflow([order]);
+    return res.status(200).json({
+      success: true,
+      data: workflowByOrder.get(String(order._id)) || null
+    });
+  } catch (error) {
+    console.error('[Get Sales Order Activity Error]:', error);
+    return res.status(500).json({ success: false, message: 'Server error loading Sales Order activity.' });
   }
 };
 
@@ -4838,6 +4867,7 @@ const createMyPayment = async (req, res) => {
       link: '/sales/payments'
     });
 
+    invalidateTargetPerformanceCache();
     const responsePayment = paymentForRole(payment, req.user.role);
     return res.status(201).json({ success: true, message: 'Payment recorded successfully.', data: responsePayment });
   } catch (error) {
@@ -4901,6 +4931,7 @@ const updateMyPayment = async (req, res) => {
       await syncInvoiceAndOrderBalances(null, oldSalesOrderId);
     }
 
+    invalidateTargetPerformanceCache();
     return res.status(200).json({ success: true, message: 'Payment updated.', data: payment });
   } catch (error) {
     console.error('[Update Payment Error]:', error);
@@ -4935,6 +4966,7 @@ const deleteMyPayment = async (req, res) => {
       if (orderKey) syncedOrders.add(orderKey);
     }
 
+    invalidateTargetPerformanceCache();
     return res.status(200).json({ success: true, message: 'Payment deleted.' });
   } catch (error) {
     console.error('[Delete Payment Error]:', error);
@@ -7108,6 +7140,7 @@ module.exports = {
   calculateCustomerOverdue,
   checkCustomerOverdueApi,
   getMyOrders,
+  getMyOrderActivity,
   createMyOrder,
   updateMyOrder,
   deleteMyOrder,

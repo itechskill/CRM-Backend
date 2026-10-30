@@ -126,6 +126,8 @@ const InventoryItemSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+InventoryItemSchema.index({ 'costBatches._id': 1 });
+
 InventoryItemSchema.pre('save', function (next) {
   const available = Math.max(0, (this.quantityOnHand || 0) - (this.reservedQuantity || 0));
   if (available <= 0) {

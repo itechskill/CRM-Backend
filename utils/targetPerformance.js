@@ -2,11 +2,15 @@ const Invoice = require('../models/Invoice');
 const Payment = require('../models/Payment');
 const SalesOrder = require('../models/SalesOrder');
 const SupplierPO = require('../models/SupplierPO');
-const { moneyToCents, totalCostPKR } = require('./purchaseExpenses');
-const { resolveStockInvoiceCost } = require('./inventoryCosting');
+const { moneyToCents, summarizeExpenses, totalCostPKR } = require('./purchaseExpenses');
+const { resolveStockInvoiceCost, resolveStockInvoiceCosts } = require('./inventoryCosting');
 
 const SALES_ROLES = ['employee', 'sales_member', 'sales_rep', 'sales_person', 'sales_manager'];
 const DAY_MS = 24 * 60 * 60 * 1000;
+const PERFORMANCE_CACHE_TTL_MS = 45 * 1000;
+const performanceCache = new Map();
+
+const invalidateTargetPerformanceCache = () => performanceCache.clear();
 
 const idString = value => String(value?._id || value || '');
 const safeCents = value => Number.isSafeInteger(value) ? value : 0;
@@ -20,6 +24,15 @@ const creditPercentForDays = days => days <= 30 ? 100 : (days <= 40 ? 20 : 0);
 const performancePercent = (achievedCents, targetCents) => targetCents > 0
   ? Math.round((safeCents(achievedCents) * 10000) / targetCents) / 100
   : 0;
+
+const supplierPOCostCents = supplierPO => {
+  if (!supplierPO) return null;
+  const summary = summarizeExpenses(supplierPO);
+  const currency = String(supplierPO.currency || 'PKR').trim().toUpperCase();
+  const exchangeRateToPKR = currency === 'PKR' ? 1 : Number(supplierPO.exchangeRateToPKR);
+  if (!Number.isFinite(exchangeRateToPKR) || exchangeRateToPKR <= 0) return null;
+  return Math.round(summary.purchaseTotalPKRCents * exchangeRateToPKR) + summary.totalExpensesPKRCents;
+};
 
 const monthRange = value => {
   const match = String(value || '').match(/^(\d{4})-(\d{2})$/);
@@ -135,12 +148,12 @@ const analyzeInvoicePerformance = ({ invoice, order, supplierPO, payments = [], 
   };
 };
 
-const loadPerformanceForUsers = async ({ users, month, asOf = new Date() }) => {
+const loadPerformanceForUsersLegacy = async ({ users, month, asOf = new Date() }) => {
   const range = monthRange(month);
   const userIds = users.map(user => user._id);
   const orders = await SalesOrder.find({
     $or: [{ owner: { $in: userIds } }, { owner: null, createdBy: { $in: userIds } }, { owner: { $exists: false }, createdBy: { $in: userIds } }]
-  }).lean();
+  }).select('_id owner createdBy orderNumber orderReference').lean();
   const orderIds = orders.map(order => order._id);
   const invoices = orderIds.length ? await Invoice.find({
     salesOrderId: { $in: orderIds },
@@ -199,6 +212,113 @@ const loadPerformanceForUsers = async ({ users, month, asOf = new Date() }) => {
       invoices: invoicesForUser
     };
   });
+};
+
+const loadPerformanceForUsers = async ({ users, month, asOf = new Date(), profile = null }) => {
+  const startedAt = Date.now();
+  const mark = name => {
+    if (profile) profile[name] = Date.now() - startedAt;
+  };
+  const range = monthRange(month);
+  const userIds = users.map(user => user._id);
+  const cacheKey = `${range.key}:${users.map(user => `${idString(user._id)}:${safeCents(user.monthlySalesSalaryCents)}`).sort().join('|')}`;
+  const cached = performanceCache.get(cacheKey);
+  if (cached && Date.now() - cached.createdAt < PERFORMANCE_CACHE_TTL_MS) {
+    if (profile) profile.cacheHit = true;
+    return cached.rows;
+  }
+  const orders = await SalesOrder.find({
+    $or: [{ owner: { $in: userIds } }, { owner: null, createdBy: { $in: userIds } }, { owner: { $exists: false }, createdBy: { $in: userIds } }]
+  }).select('_id owner createdBy orderNumber orderReference').lean();
+  mark('ordersMs');
+  const orderIds = orders.map(order => order._id);
+  const [invoices, supplierPOs, orderLinkedPayments] = orderIds.length ? await Promise.all([
+    Invoice.find({ salesOrderId: { $in: orderIds }, status: { $nin: ['Draft', 'Cancelled', 'Rejected'] }, isDraft: { $ne: true } })
+      .select('_id invoiceNumber clientName salesOrderId issueDate createdAt amount tax subtotal discount status isDraft deliveryNoteId').lean(),
+    SupplierPO.find({ salesOrderId: { $in: orderIds } }).sort({ createdAt: -1 })
+      .select('_id salesOrderId poNumber poType currency exchangeRateToPKR subtotal totalAmount total costingStatus updatedAt expenses.amountPKRCents expenses.isDeleted expenses.addedAt expenses.deletedAt expenses.editHistory.changedAt createdAt').lean(),
+    Payment.find({ $or: [{ salesOrderId: { $in: orderIds } }, { 'allocations.salesOrderId': { $in: orderIds } }] })
+      .select('_id invoiceId allocations.invoiceId allocations.amount paymentDate createdAt amount paymentRefNumber').lean()
+  ]) : [[], [], []];
+  mark('invoicesPOsAndOrderPaymentsMs');
+  const invoiceIds = invoices.map(invoice => invoice._id);
+  const foundPaymentInvoiceIds = new Set(orderLinkedPayments.flatMap(payment => (
+    Array.isArray(payment.allocations) && payment.allocations.length
+      ? payment.allocations.map(allocation => idString(allocation.invoiceId))
+      : [idString(payment.invoiceId)]
+  )).filter(Boolean));
+  const fallbackInvoiceIds = invoiceIds.filter(invoiceId => !foundPaymentInvoiceIds.has(idString(invoiceId)));
+  const legacyPayments = fallbackInvoiceIds.length ? await Payment.find({
+    $or: [{ invoiceId: { $in: fallbackInvoiceIds } }, { 'allocations.invoiceId': { $in: fallbackInvoiceIds } }]
+  }).select('_id invoiceId allocations.invoiceId allocations.amount paymentDate createdAt amount paymentRefNumber').lean() : [];
+  const payments = [...orderLinkedPayments, ...legacyPayments];
+  mark('paymentsMs');
+  const paymentsByInvoice = new Map(invoiceIds.map(invoiceId => [idString(invoiceId), []]));
+  for (const payment of payments) {
+    const targetIds = Array.isArray(payment.allocations) && payment.allocations.length
+      ? payment.allocations.map(allocation => idString(allocation.invoiceId))
+      : [idString(payment.invoiceId)];
+    for (const invoiceId of new Set(targetIds.filter(Boolean))) {
+      if (paymentsByInvoice.has(invoiceId) && paymentAmountForInvoiceCents(payment, invoiceId) > 0) {
+        paymentsByInvoice.get(invoiceId).push(payment);
+      }
+    }
+  }
+
+  const orderMap = new Map(orders.map(order => [idString(order._id), order]));
+  const poMap = new Map();
+  for (const po of supplierPOs) if (!poMap.has(idString(po.salesOrderId))) poMap.set(idString(po.salesOrderId), po);
+  const stockInvoices = invoices.filter(invoice => !poMap.has(idString(invoice.salesOrderId)));
+  const stockCosts = stockInvoices.length
+    ? await resolveStockInvoiceCosts({ invoices: stockInvoices, orders })
+    : new Map();
+  mark('stockCostsMs');
+  const rowsByOwner = new Map(users.map(user => [idString(user._id), []]));
+
+  for (const invoice of invoices) {
+    const order = orderMap.get(idString(invoice.salesOrderId));
+    const ownerId = idString(order?.owner || order?.createdBy);
+    if (!rowsByOwner.has(ownerId)) continue;
+    const supplierPO = poMap.get(idString(order._id)) || null;
+    const poCostCents = supplierPO ? supplierPOCostCents(supplierPO) : null;
+    const stockCost = supplierPO ? null : stockCosts.get(idString(invoice._id));
+    rowsByOwner.get(ownerId).push(analyzeInvoicePerformance({
+      invoice,
+      order,
+      supplierPO,
+      payments: paymentsByInvoice.get(idString(invoice._id)) || [],
+      purchaseCostCents: supplierPO ? poCostCents : stockCost?.cogsCents,
+      asOf
+    }));
+  }
+
+  const rows = users.map(user => {
+    const salaryCents = safeCents(user.monthlySalesSalaryCents);
+    const targetCents = salaryCents * 5;
+    const invoicesForUser = rowsByOwner.get(idString(user._id)) || [];
+    const achievedGrossProfitCents = invoicesForUser.reduce((total, invoice) => total + invoice.payments.reduce((sum, payment) => {
+      const clearedAt = new Date(payment.clearedAt);
+      return clearedAt >= range.start && clearedAt < range.end ? sum + payment.creditedGrossProfitCents : sum;
+    }, 0), 0);
+    return {
+      userId: user._id,
+      fullName: user.fullName,
+      email: user.email,
+      role: user.role,
+      month: range.key,
+      salaryCents,
+      targetCents,
+      achievedGrossProfitCents,
+      performancePercent: performancePercent(achievedGrossProfitCents, targetCents),
+      targetStatus: targetCents > 0 && achievedGrossProfitCents >= targetCents ? 'Target met' : 'Target not met',
+      overdueDeals: invoicesForUser.filter(invoice => invoice.needsFinance).length,
+      costRecalculationFlags: invoicesForUser.filter(invoice => invoice.costChangedAfterCredit).length,
+      invoices: invoicesForUser
+    };
+  });
+  mark('totalMs');
+  performanceCache.set(cacheKey, { createdAt: Date.now(), rows });
+  return rows;
 };
 
 const addFinanceCostingToInvoices = async invoices => {
@@ -294,5 +414,7 @@ module.exports = {
   paymentAmountForInvoiceCents,
   analyzeInvoicePerformance,
   addFinanceCostingToInvoices,
-  loadPerformanceForUsers
+  loadPerformanceForUsers,
+  loadPerformanceForUsersLegacy,
+  invalidateTargetPerformanceCache
 };
