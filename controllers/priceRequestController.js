@@ -45,8 +45,8 @@ const getLabelledUsers = async (req, res) => {
   try {
     const users = await User.find({
       status: 'active',
-      role: { $in: PRICE_REQUEST_ROLES },
-      priceRequestLabel: { $type: 'string', $regex: /\S/ }
+      isApproved: true,
+      role: { $in: PRICE_REQUEST_ROLES }
     })
       .select('_id fullName priceRequestLabel')
       .sort({ fullName: 1 })
@@ -58,7 +58,7 @@ const getLabelledUsers = async (req, res) => {
       data: users.map(user => ({
         _id: user._id,
         name: user.fullName,
-        label: user.priceRequestLabel.trim()
+        label: String(user.priceRequestLabel || '').trim()
       }))
     });
   } catch (error) {
@@ -510,7 +510,7 @@ const getRoutingSuggestion = async (req, res) => {
       active: true,
       normalizedMatchValues: normalizeValue(matchValue)
     }).populate('assignee', 'fullName role priceRequestLabel');
-    if (!rule?.assignee || !isFeatureUser(rule.assignee) || !String(rule.assignee.priceRequestLabel || '').trim()) {
+    if (!rule?.assignee || !isFeatureUser(rule.assignee)) {
       return res.status(200).json({ success: true, data: null });
     }
     return res.status(200).json({ success: true, data: { rule, assignee: rule.assignee } });

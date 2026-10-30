@@ -210,12 +210,13 @@ after(async () => {
   await mongoose.disconnect();
 });
 
-test('labelled user endpoint is alphabetical, hides unlabelled/inactive users, and exposes only allowed fields', async () => {
+test('Price Request people endpoint is alphabetical, includes labelled and unlabelled active approved users, and exposes only allowed fields', async () => {
   const result = await request(users.salesA, '/api/price-requests/labelled-users');
   assert.equal(result.response.status, 200, JSON.stringify(result.data));
-  assert.deepEqual(result.data.data.map(item => item.name), ['Alpha Labelled', 'Gamma Manager', 'Release 14 CEO']);
+  assert.deepEqual(result.data.data.map(item => item.name), ['Alpha Labelled', 'Beta Unlabelled', 'Gamma Manager', 'Release 14 Admin', 'Release 14 CEO']);
   result.data.data.forEach(item => assert.deepEqual(Object.keys(item).sort(), ['_id', 'label', 'name']));
   assert.equal(result.data.data[0].label, 'DELL Configurator');
+  assert.equal(result.data.data[1].label, '');
 });
 
 test('only Admin can set, clear and validate a Price Request label', async () => {
